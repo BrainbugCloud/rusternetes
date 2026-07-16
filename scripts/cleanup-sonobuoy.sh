@@ -50,7 +50,7 @@ echo "Using container runtime: $CRT"
 echo ""
 
 # Step 1: Kill any running sonobuoy processes
-echo "[1/3] Killing sonobuoy processes..."
+echo "[1/4] Killing sonobuoy processes..."
 pkill -f "sonobuoy run" 2>/dev/null || true
 pkill -f "run-conformance.sh" 2>/dev/null || true
 sleep 1
