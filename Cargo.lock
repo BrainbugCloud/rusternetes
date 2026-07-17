@@ -872,6 +872,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bollard-cri"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bollard",
+ "clap",
+ "cri-proto",
+ "cri-server",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "bollard-stubs"
 version = "1.45.0-rc.26.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -12,11 +12,12 @@ CRI-on-Docker decision; port the decisions, not the code.
 
 ## Status
 
-- [ ] **B1 — skeleton + runtime info + images**
-  - [ ] Crate scaffold, flags, UDS serving
-  - [ ] `version` / `status` / `update_runtime_config`
-  - [ ] Full `ImageBackend` (list/status/pull with auth/remove/fs-info)
-  - [ ] Acceptance: `crictl info|pull|images|rmi`; critest `Image` focus green
+- [x] **B1 — skeleton + runtime info + images** *(2026-07-17)*
+  - [x] Crate scaffold (`crates/bollard-cri`, bin), all planned flags, UDS serving via `cri-server`
+  - [x] `version` (runtime_name "docker") / `status` (RuntimeReady+NetworkReady from daemon ping) / `update_runtime_config`
+  - [x] Full `ImageBackend`: list (name filter via inspect), status (uid/username from image `User`), pull (streamed, auth mapping, tag/digest ref split), remove (cri-dockerd untag-per-tag, no force, idempotent 404, in-use → FailedPrecondition), fs-info via `df()` + daemon root dir
+  - [x] Acceptance: `crictl info|pull|images|inspecti|rmi|imagefsinfo` green against the podman machine (macOS) and Docker 28.2.2 (lima VM); **critest `Image Manager` focus: 10/10 pass on Docker/Linux** (JUnit in VM `/tmp/critest-bollard-image.xml`)
+  - Lifecycle RPCs answer `Unimplemented` until B2/B3 (lists return empty)
 - [ ] **B2 — sandbox lifecycle**
   - [ ] Pause container mapping, naming scheme, labels
   - [ ] Checkpoint store (port mappings, host-network), create→checkpoint→start order

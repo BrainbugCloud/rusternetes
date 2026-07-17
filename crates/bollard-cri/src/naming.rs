@@ -1,0 +1,114 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Container naming (port of cri-dockerd `naming.go`).
+//!
+//! Docker rejects duplicate names, which gives us create-idempotency for
+//! free; the name also encodes the CRI metadata so state can be recovered
+//! from Docker alone:
+//!
+//! ```text
+//! k8s_POD_<podname>_<namespace>_<uid>_<attempt>          (sandbox)
+//! k8s_<container>_<podname>_<namespace>_<uid>_<attempt>  (app container)
+//! ```
+//!
+//! Kubernetes object names cannot contain `_`, so splitting on it is safe.
+
+use cri_proto::v1::{ContainerMetadata, PodSandboxMetadata};
+use cri_server::error::{Error, Result};
+
+const PREFIX: &str = "k8s";
+const SANDBOX_INFRA_NAME: &str = "POD";
+
+pub fn sandbox_name(meta: &PodSandboxMetadata) -> String {
+    format!(
+        "{PREFIX}_{SANDBOX_INFRA_NAME}_{}_{}_{}_{}",
+        meta.name, meta.namespace, meta.uid, meta.attempt
+    )
+}
+
+pub fn container_name(meta: &ContainerMetadata, sandbox_meta: &PodSandboxMetadata) -> String {
+    format!(
+        "{PREFIX}_{}_{}_{}_{}_{}",
+        meta.name, sandbox_meta.name, sandbox_meta.namespace, sandbox_meta.uid, meta.attempt
+    )
+}
+
+fn parts(name: &str) -> Result<Vec<&str>> {
+    // Docker inspect/list prefixes names with '/'.
+    let name = name.strip_prefix('/').unwrap_or(name);
+    let parts: Vec<&str> = name.split('_').collect();
+    if parts.len() != 6 || parts[0] != PREFIX {
+        return Err(Error::Internal(format!(
+            "container name {name:?} is not CRI-managed"
+        )));
+    }
+    Ok(parts)
+}
+
+pub fn parse_sandbox_name(name: &str) -> Result<PodSandboxMetadata> {
+    let parts = parts(name)?;
+    if parts[1] != SANDBOX_INFRA_NAME {
+        return Err(Error::Internal(format!(
+            "container name {name:?} is not a sandbox"
+        )));
+    }
+    Ok(PodSandboxMetadata {
+        name: parts[2].to_string(),
+        namespace: parts[3].to_string(),
+        uid: parts[4].to_string(),
+        attempt: parts[5].parse().unwrap_or(0),
+    })
+}
+
+pub fn parse_container_name(name: &str) -> Result<ContainerMetadata> {
+    let parts = parts(name)?;
+    if parts[1] == SANDBOX_INFRA_NAME {
+        return Err(Error::Internal(format!(
+            "container name {name:?} is a sandbox, not an app container"
+        )));
+    }
+    Ok(ContainerMetadata {
+        name: parts[1].to_string(),
+        attempt: parts[5].parse().unwrap_or(0),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sandbox_meta() -> PodSandboxMetadata {
+        PodSandboxMetadata {
+            name: "web".into(),
+            namespace: "default".into(),
+            uid: "uid-1234".into(),
+            attempt: 2,
+        }
+    }
+
+    #[test]
+    fn sandbox_name_round_trip() {
+        let name = sandbox_name(&sandbox_meta());
+        assert_eq!(name, "k8s_POD_web_default_uid-1234_2");
+        assert_eq!(parse_sandbox_name(&name).unwrap(), sandbox_meta());
+        assert_eq!(parse_sandbox_name("/k8s_POD_web_default_uid-1234_2").unwrap(), sandbox_meta());
+    }
+
+    #[test]
+    fn container_name_round_trip() {
+        let meta = ContainerMetadata {
+            name: "app".into(),
+            attempt: 0,
+        };
+        let name = container_name(&meta, &sandbox_meta());
+        assert_eq!(name, "k8s_app_web_default_uid-1234_0");
+        assert_eq!(parse_container_name(&name).unwrap(), meta);
+        assert!(parse_sandbox_name(&name).is_err());
+    }
+
+    #[test]
+    fn rejects_foreign_names() {
+        assert!(parse_sandbox_name("random-container").is_err());
+        assert!(parse_container_name("k8s_POD_web_default_uid_0").is_err());
+    }
+}
