@@ -1,5 +1,16 @@
 # CRI Redesign — Plan Overview
 
+## Progress tracker
+
+Checked = stage acceptance criteria met (see per-plan Status sections for detail).
+
+- [x] **01 `cri-proto` / `cri-server`** — [x] S1 · [x] S2 · [x] S3 · [x] S4 *(done 2026-07-17)*
+- [ ] **02 kubelet CRI-only** — [ ] K1 · [ ] K2 · [ ] K3 · [ ] K4 · [ ] K5 · [ ] K6 · [ ] K7
+- [ ] **03 `bollard-cri`** — [ ] B1 · [ ] B2 · [ ] B3 · [ ] B4 · [ ] B5 · [ ] B6
+- [ ] **04 `apple-cri` (CLI)** — [ ] A1 · [ ] A2 · [ ] A3 · [ ] A4 · [ ] A5
+- [ ] **05 `apple-cri` XPC migration** — [ ] X1 · [ ] X2 · [ ] X3 · [ ] X4 · [ ] X5
+- [ ] **06 testing/environments** — [ ] lima VM config checked in · [ ] critest harness scripted · [ ] CI wiring
+
 Rusternetes' kubelet currently drives Docker/Podman directly through bollard.
 This plan set redesigns the kubelet to speak **only the Kubernetes CRI**
 (Container Runtime Interface, gRPC over a unix socket) and introduces reusable

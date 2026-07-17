@@ -6,6 +6,35 @@ CRI client ([02](02-kubelet-cri-only.md)) and for every CRI server we build
 ([03](03-bollard-cri.md), [04](04-apple-containers-cri.md)) — and are designed
 so aurae could adopt them from crates.io later (never as a rusternetes dep).
 
+## Status
+
+- [x] **S1 — `cri-proto` builds and talks to containerd** *(2026-07-17)*
+  - [x] Vendored `proto/release-1.36.proto` (from aurae checkout, identical to upstream) + `scripts/vendor-cri-proto.sh`
+  - [x] tonic-prost-build codegen (client + server, feature-gated via `CARGO_FEATURE_*`); system `protoc` documented in crate README (decision: no `protobuf-src`)
+  - [x] `connect_uds` + `socket_path` helpers (accepts `unix://`, `unix:`, bare paths)
+  - [x] Crate metadata (Apache-2.0, description, repository)
+  - [x] `#[ignore]` containerd smoke test: 3/3 pass in the lima VM (`default`, containerd v2.1.3) — cross-compiled aarch64-musl, run via `limactl copy` + `limactl shell`
+  - [x] Green: fmt + clippy + `cargo test -p cri-proto`; `cargo tree -p cri-proto | grep -c rusternetes-` = 0
+  - [x] `lima/rusternetes-dev.yaml` checked in (per plan 06)
+- [x] **S2 — `cri-server` traits + in-memory fake** *(2026-07-17)*
+  - [x] `backend.rs` (RuntimeBackend + ImageBackend traits, `Error` → CRI status codes)
+  - [x] `service.rs` (`CriService<B>`, all 42 RPCs; `Stream*`/events/metrics/checkpoint → unimplemented)
+  - [x] `uds.rs` (stale-socket cleanup, 0o660, graceful shutdown; `serve()` helper)
+  - [x] `labels.rs` (io.kubernetes.* keys, flatten/split, internal-label stripping), `logfmt.rs` (writer + reader w/ since/tail + partial-line reassembly), `checkpoint.rs` (crc32 checksum, atomic write, corrupt auto-delete)
+  - [x] `MemoryBackend` fake behind `testing` feature + `examples/memory_cri.rs`
+  - [x] Tests: 9 unit + 3 integration (lifecycle over real UDS via cri-proto client, idempotency/NotFound/InvalidArgument semantics, logfmt round-trip incl. partials/tail/since, checkpoint corruption recovery) — all green; fmt/clippy clean; 0 rusternetes deps
+  - [x] Acceptance: crictl v1.36.0 (brew) `version/info/pull/images/runp/create/start/ps/pods/logs/exec -s/stopp/rmp` all work against `memory-cri` on macOS
+- [x] **S3 — streaming server extracted** *(2026-07-17)*
+  - [x] `streaming/` fork of aurae streaming.rs (`mod.rs` registry+upgrade, `spdy.rs` framing, `channels.rs` sessions) behind `StreamingBackend` trait; provenance headers kept
+  - [x] Exec/Attach/PortForward wired in `CriService` (with state validation + TTL'd token registry); ExecSync was wired in S2
+  - [x] `MemoryBackend` implements `StreamingBackend` (scripted echo/stderr/cat/false; portforward dials host localhost)
+  - [x] SPDY framing/dictionary unit tests (header block round-trip over shared zlib contexts, frame encode/decode, truncation)
+  - [x] Acceptance vs crictl v1.36.0 on macOS: `exec` non-tty (stdout, stderr demux, exit code 1 propagates), `exec -i` (stdin piped through cat), `exec -it` (via pty; clean close, exit 0), `attach -i` (greeting + stdin echo), `port-forward` (HTTP 200 through the tunnel)
+- [x] **S4 — critest subsets against the fake** *(2026-07-17)*
+  - [x] Focus set documented in `crates/cri-server/README.md` (focus `runtime info|PodSandbox|Container|Streaming`; skips justified per test)
+  - [x] Focus set green: 33/33 on Linux (lima VM `default`, critest v1.36.0 linux-arm64) and 31/31 on macOS (darwin-arm64); JUnit reports produced (`critest-memory-cri-{linux,macos}.xml`, session scratchpad — CI archiving lands with the CI job per plan 06)
+  - [x] MemoryBackend upgraded along the way: scripted workloads (`echo` one-shots, `echo; sleep` stay-running, `while true; do echo` log loops), CRI-correct forced remove of running containers, execSync `-n` echo semantics + timeout → `DeadlineExceeded`, log rotation on `ReopenContainerLog`
+
 ## `crates/cri-proto`
 
 Bindings for the Kubernetes CRI v1 API, pinned to **cri-api release-1.36**

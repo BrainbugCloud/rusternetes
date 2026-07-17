@@ -6,7 +6,17 @@ behind the `AppleBackend` trait introduced in
 prerequisite: XPC lands as a **second impl**, proven equivalent by a shared
 regression harness before it becomes the default.
 
+## Status
+
+- [ ] X1 — XPC spike: list containers
+- [ ] X2 — read-only ops on XPC
+- [ ] X3 — lifecycle ops
+- [ ] X4 — exec and streams
+- [ ] X5 — default flip
+
 ## Why migrate off the CLI
+
+
 
 - **Performance:** every probe/exec/status today is a spawned `container`
   process; a persistent XPC connection removes per-call process overhead.

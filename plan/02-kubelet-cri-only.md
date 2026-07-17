@@ -6,6 +6,16 @@ No fallback period (decision D3): until [bollard-cri](03-bollard-cri.md) is
 ready, the kubelet is developed and tested against **containerd in a lima VM**
 ([06](06-testing-and-environments.md)).
 
+## Status
+
+- [ ] K1 — inventory + scaffolding (no behavior change)
+- [ ] K2 — sandbox + container lifecycle on CRI
+- [ ] K3 — statuses, init/ephemeral containers, GC
+- [ ] K4 — logs pipeline end to end
+- [ ] K5 — exec / attach / portforward streaming
+- [ ] K6 — stats, eviction, bollard removal
+- [ ] K7 — conformance re-baseline
+
 ## Current state (from coupling analysis)
 
 - `crates/kubelet/src/runtime.rs` (~11.6k lines, 59% of the crate) holds a

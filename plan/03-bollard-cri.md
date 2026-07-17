@@ -10,6 +10,37 @@ Blueprint: **cri-dockerd** (local checkout `../cri-dockerd`, the maintained
 dockershim fork, Go). Its `core/` package (~6k lines) encodes every hard-won
 CRI-on-Docker decision; port the decisions, not the code.
 
+## Status
+
+- [ ] **B1 — skeleton + runtime info + images**
+  - [ ] Crate scaffold, flags, UDS serving
+  - [ ] `version` / `status` / `update_runtime_config`
+  - [ ] Full `ImageBackend` (list/status/pull with auth/remove/fs-info)
+  - [ ] Acceptance: `crictl info|pull|images|rmi`; critest `Image` focus green
+- [ ] **B2 — sandbox lifecycle**
+  - [ ] Pause container mapping, naming scheme, labels
+  - [ ] Checkpoint store (port mappings, host-network), create→checkpoint→start order
+  - [ ] resolv.conf rewrite, host-network mode, pod IP reporting
+  - [ ] Idempotent stop/remove, create-conflict recovery
+  - [ ] Acceptance: critest `PodSandbox` focus green; crictl round-trip; kill -9 recovery test
+- [ ] **B3 — container lifecycle + logs**
+  - [ ] Create/start/stop/remove/list/status with filters
+  - [ ] env/mounts/devices/security-context mapping
+  - [ ] CRI log relay (design a) + `ReopenContainerLog`
+  - [ ] Acceptance: critest `Container` focus green incl. log assertions; `crictl logs` == `docker logs`
+- [ ] **B4 — streaming**
+  - [ ] exec_stream / attach_stream / exec_sync (16 MiB cap, timeout)
+  - [ ] `dial_in_sandbox` via setns (Linux)
+  - [ ] Acceptance: critest `Streaming` focus green; interactive `crictl exec -it`; portforward to localhost-bound server
+- [ ] **B5 — stats + full suite**
+  - [ ] container_stats / list_container_stats with rootfs size cache
+  - [ ] `ImageFsInfo` verified against critest
+  - [ ] Acceptance: full critest v1.36.0 zero failures on Docker/Linux; Podman divergences in PODMAN.md
+- [ ] **B6 — cluster integration (macOS workflow restored)**
+  - [ ] Compose: bollard-cri supervised inside kubelet node containers
+  - [ ] All-in-one binary spawns bollard-cri task when configured for Docker
+  - [ ] Acceptance: compose cluster + bootstrap works on macOS; conformance ≥ containerd baseline minus documented divergences
+
 ## Design
 
 ### Process shape

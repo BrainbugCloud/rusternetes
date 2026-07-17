@@ -14,6 +14,14 @@ mappings (create/start/stop/rm/logs/exec/inspect with JSON output). Reuse the
 command mappings; discard the architecture (its 17-method trait mirrors
 bollard, not CRI).
 
+## Status
+
+- [ ] A1 — CLI probe + backend trait
+- [ ] A2 — CRI surface: images + sandboxes
+- [ ] A3 — containers + logs
+- [ ] A4 — streaming + stats + full matrix
+- [ ] A5 — rusternetes smoke on macOS
+
 ## The hard design problem, stated up front
 
 **apple/container runs one VM per container.** Kubernetes pods assume
