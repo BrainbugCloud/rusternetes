@@ -1,0 +1,89 @@
+# Lima VM for rusternetes CRI development (plan/06-testing-and-environments.md).
+#
+#   limactl start --name rusternetes-dev lima/rusternetes-dev.yaml
+#   limactl shell rusternetes-dev -- sudo crictl info          # smoke check
+#   limactl shell rusternetes-dev -- cargo test -p cri-proto -- --ignored
+#
+# Provisions: containerd + CNI plugins + crictl/critest v1.36.0 + Rust + protoc.
+# The repo is mounted writable at the same path as on the host.
+
+minimumLimaVersion: "1.0.0"
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+  - location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
+
+cpus: 4
+memory: "8GiB"
+disk: "60GiB"
+
+mounts:
+  - location: "~/git/rusternetes"
+    writable: true
+  - location: "/tmp/lima"
+    writable: true
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      command -v containerd >/dev/null && exit 0
+      apt-get update
+      apt-get install -y --no-install-recommends \
+        build-essential protobuf-compiler pkg-config curl ca-certificates \
+        containerd runc jq
+      # CNI plugins (containerd's default CRI config expects /opt/cni/bin)
+      ARCH=$(dpkg --print-architecture)
+      CNI_VERSION=v1.6.2
+      mkdir -p /opt/cni/bin
+      curl -fsSL "https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-${ARCH}-${CNI_VERSION}.tgz" \
+        | tar -xz -C /opt/cni/bin
+      mkdir -p /etc/cni/net.d
+      cat > /etc/cni/net.d/10-rusternetes.conflist <<'EOF'
+      {
+        "cniVersion": "1.0.0",
+        "name": "rusternetes",
+        "plugins": [
+          {
+            "type": "bridge",
+            "bridge": "cni0",
+            "isGateway": true,
+            "ipMasq": true,
+            "ipam": {
+              "type": "host-local",
+              "ranges": [[{ "subnet": "10.88.0.0/16" }]],
+              "routes": [{ "dst": "0.0.0.0/0" }]
+            }
+          },
+          { "type": "portmap", "capabilities": { "portMappings": true } }
+        ]
+      }
+      EOF
+      # crictl + critest v1.36.0 (pinned; see plan/06)
+      CRI_TOOLS_VERSION=v1.36.0
+      for tool in crictl critest; do
+        curl -fsSL "https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRI_TOOLS_VERSION}/${tool}-${CRI_TOOLS_VERSION}-linux-${ARCH}.tar.gz" \
+          | tar -xz -C /usr/local/bin
+      done
+      cat > /etc/crictl.yaml <<'EOF'
+      runtime-endpoint: unix:///run/containerd/containerd.sock
+      image-endpoint: unix:///run/containerd/containerd.sock
+      EOF
+      systemctl enable --now containerd
+  - mode: user
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      command -v cargo >/dev/null && exit 0
+      curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+
+probes:
+  - description: "containerd is ready"
+    script: |
+      #!/bin/bash
+      set -eu
+      until [ -S /run/containerd/containerd.sock ]; do sleep 3; done

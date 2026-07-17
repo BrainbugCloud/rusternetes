@@ -11,6 +11,9 @@ members = [
     "crates/storage",
     "crates/cloud-providers",
     "crates/rusternetes",
+    "crates/cri-proto",
+    "crates/cri-server",
+    "crates/bollard-cri",
 ]
 
 [workspace.package]

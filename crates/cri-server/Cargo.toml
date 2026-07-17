@@ -1,0 +1,42 @@
+[package]
+name = "cri-server"
+version = "0.1.0"
+edition = "2021"
+authors = ["Rusternetes Contributors"]
+license = "Apache-2.0"
+description = "Reusable Kubernetes CRI server harness: backend traits, gRPC plumbing, CRI log format, checkpoint store, unix-socket bootstrap"
+repository = "https://github.com/rusternetes/rusternetes"
+keywords = ["kubernetes", "cri", "grpc", "container", "runtime"]
+categories = ["api-bindings", "virtualization"]
+
+# NOTE: this crate must not depend on any rusternetes-* crate (see plan/01-cri-crates.md).
+
+[features]
+default = []
+# In-memory state-machine backend for tests, examples, and contract testing.
+testing = []
+
+[dependencies]
+cri-proto = { version = "0.1.0", path = "../cri-proto" }
+tonic = "0.14"
+prost = "0.14"
+tokio = { version = "1.40", features = ["net", "fs", "io-util", "rt", "macros", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+async-trait = "0.1"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+crc32fast = "1.4"
+flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
+uuid = { version = "1.10", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.40", features = ["full"] }
+tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[example]]
+name = "memory_cri"
+required-features = ["testing"]
