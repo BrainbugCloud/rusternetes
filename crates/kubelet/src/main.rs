@@ -6,6 +6,7 @@ mod cri;
 mod eviction;
 mod kubelet;
 mod runtime;
+mod server;
 
 use anyhow::Result;
 use axum::{
@@ -232,6 +233,10 @@ async fn main() -> Result<()> {
         metrics_addr
     );
 
+    let cri_client = cri::CriClient::new(
+        &runtime_config.container_runtime_endpoint,
+        &runtime_config.image_service_endpoint,
+    );
     tokio::spawn(async move {
         let app = Router::new()
             .route("/metrics", get(|| async move { metrics_clone.gather() }))
@@ -239,7 +244,8 @@ async fn main() -> Result<()> {
                 "/configz",
                 get(|| async move { Json(kubelet_config_clone.as_ref().clone()) }),
             )
-            .route("/exec/:container_id", post(handle_exec));
+            .route("/exec/:container_id", post(handle_exec))
+            .merge(server::router(cri_client));
 
         let listener = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
         axum::serve(listener, app).await.unwrap();

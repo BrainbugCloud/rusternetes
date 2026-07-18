@@ -190,218 +190,125 @@ pub async fn get_logs(
         )));
     }
 
-    // Get logs from the container runtime
-    let logs = match get_container_logs(&pod, &container_name, &query).await {
-        Ok(logs) => logs,
-        Err(e) => {
-            info!("Failed to get real container logs, using fallback: {}", e);
-            // Fallback to synthetic logs if container runtime is not available
-            generate_pod_logs(&pod, &container_name, &query)
-        }
-    };
+    // Proxy to the kubelet on the pod's node. Errors surface as errors —
+    // there is no fallback.
+    let resp = fetch_kubelet_logs(&state, &pod, &container_name, &query)
+        .await
+        .map_err(|e| Error::Internal(format!("failed to get logs from kubelet: {:#}", e)))?;
 
-    // If WebSocket upgrade requested, send logs over WebSocket
+    // If WebSocket upgrade requested, forward log chunks over WebSocket
     if let Some(ws) = ws {
-        let logs_clone = logs.clone();
         Ok(ws.on_upgrade(move |mut socket| async move {
             use axum::extract::ws::Message;
-            // Send logs as a text message
-            if let Err(e) = socket.send(Message::Text(logs_clone)).await {
-                info!("Failed to send logs over WebSocket: {}", e);
+            use futures::StreamExt;
+            let mut stream = resp.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let Ok(chunk) = chunk else { break };
+                let text = String::from_utf8_lossy(&chunk).to_string();
+                if socket.send(Message::Text(text)).await.is_err() {
+                    break;
+                }
             }
-            // Close the WebSocket
             let _ = socket.close().await;
         }))
     } else {
+        // Stream the kubelet response body through (supports follow)
         Ok(Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/plain; charset=utf-8")
-            .body(Body::from(logs))
+            .body(Body::from_stream(resp.bytes_stream()))
             .unwrap())
     }
 }
 
-/// Get real logs from the container runtime
-async fn get_container_logs(
+/// Base URL (`http://{address}:{port}`) of the kubelet serving the pod's node.
+pub(crate) async fn kubelet_base_url(
+    state: &ApiServerState,
     pod: &rusternetes_common::resources::Pod,
-    container_name: &str,
-    query: &LogsQuery,
 ) -> anyhow::Result<String> {
-    use bollard::container::LogsOptions;
-    use bollard::Docker;
-    use futures::StreamExt;
-
-    // Connect to Docker/Podman
-    let docker = Docker::connect_with_local_defaults()
-        .map_err(|e| anyhow::anyhow!("Failed to connect to container runtime: {}", e))?;
-
-    // Container name format: {pod_name}_{container_name}
-    let full_container_name = format!("{}_{}", pod.metadata.name, container_name);
-
-    // Build log options based on query parameters
-    let mut options = LogsOptions::<String> {
-        stdout: true,
-        stderr: true,
-        timestamps: query.timestamps,
-        tail: query
-            .tail_lines
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| "all".to_string()),
-        ..Default::default()
-    };
-
-    // Handle since_seconds parameter.
-    // K8s sinceSeconds is a relative duration (seconds ago from now).
-    // Bollard's `since` field expects an absolute Unix epoch timestamp.
-    if let Some(since_seconds) = query.since_seconds {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        options.since = now - since_seconds;
-    }
-
-    // Handle sinceTime parameter (RFC3339 timestamp)
-    if let Some(ref since_time) = query.since_time {
-        if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(since_time) {
-            options.since = parsed.timestamp();
-        }
-    }
-
-    // Try to get logs - first by exact name, then search all containers
-    // (the container might have a slightly different name or be stopped)
-    let container_exists = docker
-        .inspect_container(
-            &full_container_name,
-            None::<bollard::container::InspectContainerOptions>,
-        )
+    let node_name = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.node_name.clone())
+        .ok_or_else(|| anyhow::anyhow!("pod {} is not scheduled to a node", pod.metadata.name))?;
+    let node_key = rusternetes_storage::build_key("nodes", None, &node_name);
+    let node: rusternetes_common::resources::Node = state
+        .storage
+        .get(&node_key)
         .await
-        .is_ok();
+        .map_err(|e| anyhow::anyhow!("failed to get node {}: {}", node_name, e))?;
 
-    let effective_name = if container_exists {
-        full_container_name.clone()
-    } else {
-        // Search for the container by listing all (including exited)
-        let mut filters = std::collections::HashMap::new();
-        filters.insert("name".to_string(), vec![full_container_name.clone()]);
-        let list_opts = bollard::container::ListContainersOptions {
-            all: true,
-            filters,
-            ..Default::default()
-        };
-        if let Ok(containers) = docker.list_containers(Some(list_opts)).await {
-            containers
-                .first()
-                .and_then(|c| c.id.clone())
-                .unwrap_or(full_container_name.clone())
-        } else {
-            full_container_name.clone()
-        }
-    };
-
-    let mut log_stream = docker.logs(&effective_name, Some(options));
-
-    let mut log_output = String::new();
-    let mut total_bytes = 0usize;
-    let limit_bytes = query.limit_bytes.map(|l| l as usize);
-
-    // Collect logs from stream
-    while let Some(log_result) = log_stream.next().await {
-        match log_result {
-            Ok(log_output_chunk) => {
-                let chunk = log_output_chunk.to_string();
-                let chunk_len = chunk.len();
-
-                // Check if we've hit the byte limit
-                if let Some(limit) = limit_bytes {
-                    if total_bytes + chunk_len > limit {
-                        let remaining = limit - total_bytes;
-                        log_output.push_str(&chunk[..remaining]);
-                        break;
-                    }
-                }
-
-                log_output.push_str(&chunk);
-                total_bytes += chunk_len;
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!("Error reading logs: {}", e));
-            }
-        }
-    }
-
-    Ok(log_output)
-}
-
-/// Generate synthetic logs for a pod container
-fn generate_pod_logs(
-    pod: &rusternetes_common::resources::Pod,
-    container_name: &str,
-    query: &LogsQuery,
-) -> String {
-    use chrono::Utc;
-
-    let mut lines = vec![];
-
-    // Get pod status phase
-    let phase = pod
+    let address = node
         .status
         .as_ref()
-        .map(|s| format!("{:?}", s.phase))
-        .unwrap_or_else(|| "Unknown".to_string());
+        .and_then(|s| s.addresses.as_ref())
+        .and_then(|addrs| {
+            addrs
+                .iter()
+                .find(|a| a.address_type == "InternalIP")
+                .or_else(|| addrs.iter().find(|a| a.address_type == "ExternalIP"))
+        })
+        .map(|a| a.address.clone())
+        .ok_or_else(|| anyhow::anyhow!("no address found for node {}", node_name))?;
+    let port = node
+        .status
+        .as_ref()
+        .and_then(|s| s.daemon_endpoints.as_ref())
+        .and_then(|d| d.kubelet_endpoint.as_ref())
+        .map(|k| k.port)
+        .filter(|p| *p > 0)
+        .unwrap_or(10250);
+    Ok(format!("http://{}:{}", address, port))
+}
 
-    // Generate log entries
-    let base_time = pod.metadata.creation_timestamp.unwrap_or_else(Utc::now);
+/// Fetch container logs from the kubelet's /containerLogs endpoint.
+async fn fetch_kubelet_logs(
+    state: &ApiServerState,
+    pod: &rusternetes_common::resources::Pod,
+    container_name: &str,
+    query: &LogsQuery,
+) -> anyhow::Result<reqwest::Response> {
+    let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
+    let base = kubelet_base_url(state, pod).await?;
+    let url = format!(
+        "{}/containerLogs/{}/{}/{}",
+        base, namespace, pod.metadata.name, container_name
+    );
 
-    let mut log_lines = vec![
-        format!(
-            "Container {} starting in pod {}",
-            container_name, pod.metadata.name
-        ),
-        format!("Pod phase: {}", phase),
-        format!("Environment initialized"),
-        format!("Starting application process"),
-        format!("Application ready to serve traffic"),
-        format!("Health check passed"),
-        format!("Serving requests"),
-    ];
-
-    // Apply tail_lines if specified
+    let mut params: Vec<(&str, String)> = Vec::new();
+    if query.follow {
+        params.push(("follow", "true".to_string()));
+    }
+    if query.previous {
+        params.push(("previous", "true".to_string()));
+    }
+    if query.timestamps {
+        params.push(("timestamps", "true".to_string()));
+    }
     if let Some(tail) = query.tail_lines {
-        let tail = tail as usize;
-        if tail < log_lines.len() {
-            log_lines = log_lines.drain(log_lines.len() - tail..).collect();
-        }
+        params.push(("tailLines", tail.to_string()));
     }
-
-    // Format log lines with timestamps if requested
-    for (i, line) in log_lines.iter().enumerate() {
-        let log_time = base_time + chrono::Duration::seconds(i as i64 * 5);
-
-        let formatted_line = if query.timestamps {
-            format!("{} {}", log_time.to_rfc3339(), line)
-        } else {
-            line.clone()
-        };
-
-        lines.push(formatted_line);
-    }
-
-    let result = if lines.is_empty() {
-        String::new()
-    } else {
-        lines.join("\n")
-    };
-
-    // Apply limit_bytes if specified
     if let Some(limit) = query.limit_bytes {
-        let limit = limit as usize;
-        if result.len() > limit {
-            return result[..limit].to_string();
-        }
+        params.push(("limitBytes", limit.to_string()));
+    }
+    if let Some(since) = query.since_seconds {
+        params.push(("sinceSeconds", since.to_string()));
+    }
+    if let Some(ref since_time) = query.since_time {
+        params.push(("sinceTime", since_time.clone()));
     }
 
-    result
+    // No overall timeout: follow streams stay open until the client goes away.
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    let resp = client.get(&url).query(&params).send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("kubelet returned {}: {}", status, body);
+    }
+    Ok(resp)
 }
 
 /// GET/POST /api/v1/namespaces/{namespace}/pods/{name}/exec

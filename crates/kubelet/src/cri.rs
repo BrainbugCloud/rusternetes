@@ -249,6 +249,33 @@ impl CriClient {
         .await
     }
 
+    /// Find one container by namespace + pod-name + container-name labels,
+    /// preferring the newest attempt.
+    pub async fn find_container_scoped(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        container_name: &str,
+    ) -> Result<Option<v1::Container>> {
+        let mut found = self
+            .list_containers(Some(v1::ContainerFilter {
+                id: String::new(),
+                state: None,
+                pod_sandbox_id: String::new(),
+                label_selector: std::collections::HashMap::from([
+                    (labels::POD_NAMESPACE.to_string(), namespace.to_string()),
+                    (labels::POD_NAME.to_string(), pod_name.to_string()),
+                    (
+                        labels::CONTAINER_NAME.to_string(),
+                        container_name.to_string(),
+                    ),
+                ]),
+            }))
+            .await?;
+        found.sort_by_key(|c| std::cmp::Reverse(c.created_at));
+        Ok(found.into_iter().next())
+    }
+
     /// Find one container by pod-name + container-name labels.
     pub async fn find_container(
         &self,

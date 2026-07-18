@@ -6,6 +6,7 @@ pub mod cri;
 pub mod eviction;
 pub mod kubelet;
 pub mod runtime;
+pub mod server;
 
 pub use kubelet::PodWorkerState;
 
@@ -101,6 +102,10 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
         metrics_addr
     );
 
+    let cri_client = cri::CriClient::new(
+        &config.container_runtime_endpoint,
+        &config.image_service_endpoint,
+    );
     tokio::spawn(async move {
         use axum::{routing::get, Json, Router};
         let app = Router::new()
@@ -108,7 +113,8 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
             .route(
                 "/configz",
                 get(|| async move { Json(kubelet_config_clone.as_ref().clone()) }),
-            );
+            )
+            .merge(server::router(cri_client));
         let listener = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
         axum::serve(listener, app).await.unwrap();
     });

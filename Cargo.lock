@@ -4097,6 +4097,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tonic 0.14.6",
  "tonic-prost",
  "tower 0.5.3",
