@@ -137,6 +137,20 @@ impl LogRelays {
         path: PathBuf,
         resume_after: Option<DateTime<Utc>>,
     ) {
+        // The file must exist the moment StartContainer returns — critest
+        // (and the kubelet) open it right away, ahead of the relay task's
+        // first write.
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(err) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            tracing::warn!(container = %id, path = %path.display(), %err, "cannot pre-create CRI log file");
+        }
+
         let mut inner = self.inner.lock().expect("log relay lock poisoned");
         if let Some(handle) = inner.get(&id) {
             if !handle.task.is_finished() {

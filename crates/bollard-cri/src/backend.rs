@@ -42,6 +42,10 @@ pub struct BollardBackend {
     /// The daemon's root directory (`docker info`), cached: it is the
     /// filesystem id stats and image-fs info report.
     pub(crate) docker_root: tokio::sync::OnceCell<String>,
+    /// Serializes `RemoveImage`: dockerd 404s a concurrent delete as soon
+    /// as the winner untags, before the image record is purged — a remover
+    /// must not report success while the image still resolves by ID.
+    pub(crate) image_remove_lock: Mutex<()>,
 }
 
 /// Connect to a Docker Engine API endpoint (unix socket path or `unix://`).
@@ -87,6 +91,7 @@ impl BollardBackend {
             pod_cidr: Mutex::new(None),
             disk_usage: std::sync::Arc::new(crate::stats::DiskUsageCache::default()),
             docker_root: tokio::sync::OnceCell::new(),
+            image_remove_lock: Mutex::new(()),
         })
     }
 

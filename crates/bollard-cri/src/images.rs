@@ -160,9 +160,16 @@ impl ImageBackend for BollardBackend {
     }
 
     async fn remove_image(&self, image: &ImageSpec) -> Result<()> {
-        // cri-dockerd behavior: untag every repo tag (no force — an image in
-        // use by a container must stay an error for the kubelet's image GC),
-        // falling back to the given ref when the image carries no tags.
+        // cri-dockerd behavior: with multiple repo tags, untag each; with at
+        // most one, remove by image ID (force + prune children) so the image
+        // record is gone the moment the call returns. Removing by tag
+        // instead opens a window where the tag is deleted but the image
+        // still resolves by ID — a concurrent remover sees 404, reports
+        // success, and critest's simultaneous-RemoveImage spec then finds
+        // the image alive right after that success. The lock makes
+        // concurrent removers wait out the winner's daemon-side deletion
+        // before they inspect (see `image_remove_lock`).
+        let _serialized = self.image_remove_lock.lock().await;
         let inspect = match self.docker.inspect_image(&image.image).await {
             Ok(inspect) => inspect,
             // Idempotent: absent image is a success.
@@ -172,14 +179,26 @@ impl ImageBackend for BollardBackend {
             Err(e) => return Err(docker_err("inspect image for removal", e)),
         };
 
-        let mut refs = real_repo_tags(inspect.repo_tags.unwrap_or_default());
-        if refs.is_empty() {
-            refs.push(image.image.clone());
-        }
+        let tags = real_repo_tags(inspect.repo_tags.unwrap_or_default());
+        let (refs, force) = if tags.len() > 1 {
+            (tags, false)
+        } else {
+            (
+                vec![inspect.id.unwrap_or_else(|| image.image.clone())],
+                true,
+            )
+        };
         for reference in refs {
             match self
                 .docker
-                .remove_image(&reference, None::<RemoveImageOptions>, None)
+                .remove_image(
+                    &reference,
+                    Some(RemoveImageOptions {
+                        force,
+                        noprune: false,
+                    }),
+                    None,
+                )
                 .await
             {
                 Ok(_) => {}
