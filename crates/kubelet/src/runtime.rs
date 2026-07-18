@@ -638,6 +638,29 @@ impl ContainerRuntime {
         v1::ContainerState::try_from(state).unwrap_or(v1::ContainerState::ContainerUnknown)
     }
 
+    /// Newest CRI container status for (pod, container): the raw status plus
+    /// the prefixed containerID (`containerd://{id}`) and imageID. None if
+    /// the container doesn't exist in the runtime.
+    async fn cri_status_for(
+        &self,
+        pod_name: &str,
+        container_name: &str,
+    ) -> Option<(v1::ContainerStatus, Option<String>, Option<String>)> {
+        let container = self
+            .cri
+            .find_container(pod_name, container_name)
+            .await
+            .ok()??;
+        let status = self.cri.container_status(&container.id).await.ok()?;
+        let cid = Some(format!("{}://{}", self.runtime_prefix().await, container.id));
+        let iid = if status.image_ref.is_empty() {
+            None
+        } else {
+            Some(status.image_ref.clone())
+        };
+        Some((status, cid, iid))
+    }
+
     /// Setup CNI networking for a pod
     /// Creates a network namespace and configures CNI networking
     /// Returns None if CNI setup fails (will fall back to Podman networking)
@@ -4295,40 +4318,20 @@ impl ContainerRuntime {
         for ic in init_containers {
             let container_name = format!("{}_{}", pod_name, ic.name);
 
-            let container_state_info = self
-                .docker
-                .inspect_container(&container_name, None::<InspectContainerOptions>)
-                .await;
+            let cri_status = self.cri_status_for(pod_name, &ic.name).await;
 
             let (state, container_id, image_id): (ContainerState, Option<String>, Option<String>) =
-                match container_state_info {
-                    Ok(inspect) => {
-                        let ds = inspect.state.unwrap_or_default();
-                        let cid = inspect.id.clone().map(|id| format!("docker://{}", id));
-                        let iid = inspect.image.clone().map(|img| {
-                            if img.starts_with("sha256:") {
-                                format!("docker-pullable://{}", img)
-                            } else {
-                                img
-                            }
-                        });
-                        let running = ds.running.unwrap_or(false);
-
-                        if running {
-                            (
-                                ContainerState::Running {
-                                    started_at: ds.started_at,
-                                },
-                                cid,
-                                iid,
-                            )
-                        } else if ds.finished_at.is_some()
-                            || matches!(
-                                ds.status,
-                                Some(bollard::secret::ContainerStateStatusEnum::EXITED)
-                            )
-                        {
-                            let code = ds.exit_code.unwrap_or(0) as i32;
+                match cri_status {
+                    Some((cs, cid, iid)) => match Self::cri_state(cs.state) {
+                        v1::ContainerState::ContainerRunning => (
+                            ContainerState::Running {
+                                started_at: Self::nanos_to_rfc3339(cs.started_at),
+                            },
+                            cid,
+                            iid,
+                        ),
+                        v1::ContainerState::ContainerExited => {
+                            let code = cs.exit_code;
                             let term_msg = self
                                 .read_termination_message(&container_name, ic, code as i64)
                                 .await;
@@ -4337,15 +4340,14 @@ impl ContainerRuntime {
                                 signal: None,
                                 reason: Some(if code == 0 {
                                     "Completed".to_string()
+                                } else if !cs.reason.is_empty() {
+                                    cs.reason.clone()
                                 } else {
-                                    ds.error
-                                        .clone()
-                                        .filter(|e| !e.is_empty())
-                                        .unwrap_or_else(|| "Error".to_string())
+                                    "Error".to_string()
                                 }),
                                 message: term_msg,
-                                started_at: ds.started_at.clone(),
-                                finished_at: ds.finished_at.clone(),
+                                started_at: Self::nanos_to_rfc3339(cs.started_at),
+                                finished_at: Self::nanos_to_rfc3339(cs.finished_at),
                                 container_id: cid.clone(),
                             };
                             // Keep the Terminated state as-is — K8s shows the actual
@@ -4353,19 +4355,18 @@ impl ContainerRuntime {
                             // CrashLoopBackOff reason is only shown when the container
                             // has been removed and the kubelet is waiting to restart it.
                             (terminated, cid, iid)
-                        } else {
-                            (
-                                ContainerState::Waiting {
-                                    reason: Some("PodInitializing".to_string()),
-                                    message: None,
-                                },
-                                cid,
-                                iid,
-                            )
                         }
-                    }
-                    Err(_) => {
-                        // Container doesn't exist in Docker — it may have been removed
+                        _ => (
+                            ContainerState::Waiting {
+                                reason: Some("PodInitializing".to_string()),
+                                message: None,
+                            },
+                            cid,
+                            iid,
+                        ),
+                    },
+                    None => {
+                        // Container doesn't exist in the runtime — it may have been removed
                         // after successful completion or for restart.
                         // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go
                         let prev = pod
@@ -4634,47 +4635,30 @@ impl ContainerRuntime {
                 continue; // Sidecar init containers are handled separately
             }
 
-            let container_name = format!("{}_{}", pod_name, ic.name);
-            let inspect = self
-                .docker
-                .inspect_container(&container_name, None::<InspectContainerOptions>)
-                .await;
-
-            match inspect {
-                Ok(info) => {
-                    let state = info.state.unwrap_or_default();
-                    let running = state.running.unwrap_or(false);
-                    let exit_code = state.exit_code.unwrap_or(-1);
-                    let status = state.status;
-
-                    if running {
+            match self.cri_status_for(pod_name, &ic.name).await {
+                Some((cs, _, _)) => match Self::cri_state(cs.state) {
+                    v1::ContainerState::ContainerRunning => {
                         // Init container is still running — wait for it
                         return (false, None, false);
                     }
-
-                    if matches!(
-                        status,
-                        Some(bollard::secret::ContainerStateStatusEnum::EXITED)
-                    ) {
-                        if exit_code == 0 {
+                    v1::ContainerState::ContainerExited => {
+                        if cs.exit_code == 0 {
                             // This init container completed successfully — check next
                             continue;
+                        } else if restart_on_failure {
+                            // Should retry this init container
+                            return (false, Some(i), true);
                         } else {
-                            // Failed with non-zero exit code
-                            if restart_on_failure {
-                                // Should retry this init container
-                                return (false, Some(i), true);
-                            } else {
-                                // RestartPolicy=Never — pod is terminal
-                                return (false, None, false);
-                            }
+                            // RestartPolicy=Never — pod is terminal
+                            return (false, None, false);
                         }
                     }
-
-                    // Container exists but in unknown state — treat as not started
-                    return (false, Some(i), false);
-                }
-                Err(_) => {
+                    _ => {
+                        // Container exists but created/unknown — treat as not started
+                        return (false, Some(i), false);
+                    }
+                },
+                None => {
                     // Container doesn't exist — need to start this init container
                     return (false, Some(i), false);
                 }
@@ -4700,43 +4684,36 @@ impl ContainerRuntime {
         let mut statuses = Vec::new();
 
         for ec in ecs {
-            let container_name = format!("{}_{}", pod_name, ec.name);
-            let status = match self
-                .docker
-                .inspect_container(&container_name, None::<InspectContainerOptions>)
-                .await
-            {
-                Ok(inspect) => {
-                    let state = inspect.state.unwrap_or_default();
-                    let running = state.running.unwrap_or(false);
-                    let exit_code = state.exit_code.unwrap_or(0);
+            let status = match self.cri_status_for(pod_name, &ec.name).await {
+                Some((cs, cid, iid)) => {
+                    let running =
+                        Self::cri_state(cs.state) == v1::ContainerState::ContainerRunning;
 
-                    // Capture started_at before state fields are consumed
-                    let ec_started_at = state.started_at.clone();
-
-                    let container_state = if running {
-                        Some(ContainerState::Running {
-                            started_at: state.started_at,
-                        })
-                    } else if state.finished_at.is_some() {
-                        Some(ContainerState::Terminated {
-                            exit_code: exit_code as i32,
-                            signal: None,
-                            reason: Some(if exit_code == 0 {
-                                "Completed".to_string()
-                            } else {
-                                "Error".to_string()
-                            }),
-                            message: None,
-                            started_at: ec_started_at,
-                            finished_at: state.finished_at,
-                            container_id: inspect.id.clone().map(|id| format!("docker://{}", id)),
-                        })
-                    } else {
-                        Some(ContainerState::Waiting {
+                    let container_state = match Self::cri_state(cs.state) {
+                        v1::ContainerState::ContainerRunning => Some(ContainerState::Running {
+                            started_at: Self::nanos_to_rfc3339(cs.started_at),
+                        }),
+                        v1::ContainerState::ContainerExited => {
+                            Some(ContainerState::Terminated {
+                                exit_code: cs.exit_code,
+                                signal: None,
+                                reason: Some(if cs.exit_code == 0 {
+                                    "Completed".to_string()
+                                } else if !cs.reason.is_empty() {
+                                    cs.reason.clone()
+                                } else {
+                                    "Error".to_string()
+                                }),
+                                message: None,
+                                started_at: Self::nanos_to_rfc3339(cs.started_at),
+                                finished_at: Self::nanos_to_rfc3339(cs.finished_at),
+                                container_id: cid.clone(),
+                            })
+                        }
+                        _ => Some(ContainerState::Waiting {
                             reason: Some("ContainerCreating".to_string()),
                             message: None,
-                        })
+                        }),
                     };
 
                     ContainerStatus {
@@ -4746,11 +4723,8 @@ impl ContainerRuntime {
                         state: container_state,
                         last_state: None,
                         image: Some(ec.image.clone()),
-                        image_id: inspect
-                            .image
-                            .clone()
-                            .map(|id| format!("docker-pullable://{}", id)),
-                        container_id: inspect.id.map(|id| format!("docker://{}", id)),
+                        image_id: iid,
+                        container_id: cid,
                         started: Some(running),
                         allocated_resources: None,
                         allocated_resources_status: None,
@@ -4760,7 +4734,7 @@ impl ContainerRuntime {
                         stop_signal: None,
                     }
                 }
-                Err(_) => ContainerStatus {
+                None => ContainerStatus {
                     name: ec.name.clone(),
                     ready: false,
                     restart_count: 0,
@@ -4794,20 +4768,16 @@ impl ContainerRuntime {
         for container in &pod.spec.as_ref().unwrap().containers {
             let container_name = format!("{}_{}", pod_name, container.name);
 
-            let status = match self
-                .docker
-                .inspect_container(&container_name, None::<InspectContainerOptions>)
-                .await
-            {
-                Ok(inspect) => {
-                    let state = inspect.state.unwrap_or_default();
-                    let running = state.running.unwrap_or(false);
-                    let exit_code = state.exit_code.unwrap_or(0);
+            let status = match self.cri_status_for(pod_name, &container.name).await {
+                Some((cs, cid, iid)) => {
+                    let cri_state = Self::cri_state(cs.state);
+                    let running = cri_state == v1::ContainerState::ContainerRunning;
+                    let exit_code = cs.exit_code as i64;
 
-                    // Get restart count: use the MAX of Docker's count and the
-                    // previously reported count. Docker's count resets when a
-                    // container is recreated, so we must never decrease.
-                    let docker_count = inspect.restart_count.map(|c| c as u32).unwrap_or(0);
+                    // Get restart count: use the MAX of the CRI attempt counter
+                    // and the previously reported count. The attempt resets when
+                    // a container is recreated, so we must never decrease.
+                    let attempt = cs.metadata.as_ref().map(|m| m.attempt).unwrap_or(0);
                     let prev_count = pod
                         .status
                         .as_ref()
@@ -4819,10 +4789,9 @@ impl ContainerRuntime {
                                 .map(|cs| cs.restart_count)
                         })
                         .unwrap_or(0);
-                    let restart_count = docker_count.max(prev_count);
+                    let restart_count = attempt.max(prev_count);
 
-                    // Capture started_at before state fields are consumed by branches
-                    let docker_started_at = state.started_at.clone();
+                    let started_at = Self::nanos_to_rfc3339(cs.started_at);
 
                     // Preserve last_state from existing pod status for restart tracking
                     let prev_last_state = pod
@@ -4834,13 +4803,9 @@ impl ContainerRuntime {
 
                     let container_state = if running {
                         Some(ContainerState::Running {
-                            started_at: state.started_at,
+                            started_at: started_at.clone(),
                         })
-                    } else if matches!(
-                        state.status,
-                        Some(bollard::secret::ContainerStateStatusEnum::EXITED)
-                    ) || state.finished_at.is_some()
-                    {
+                    } else if cri_state == v1::ContainerState::ContainerExited {
                         // Read termination message based on terminationMessagePolicy:
                         // - "File" (default): always read from file
                         // - "FallbackToLogsOnError": read from file first; if file is
@@ -4856,21 +4821,17 @@ impl ContainerRuntime {
                             signal: None,
                             reason: Some(if exit_code == 0 {
                                 "Completed".to_string()
+                            } else if !cs.reason.is_empty() {
+                                cs.reason.clone()
                             } else if exit_code == 137 {
-                                state
-                                    .error
-                                    .filter(|e| !e.is_empty())
-                                    .unwrap_or_else(|| "OOMKilled".to_string())
+                                "OOMKilled".to_string()
                             } else {
-                                state
-                                    .error
-                                    .filter(|e| !e.is_empty())
-                                    .unwrap_or_else(|| "Error".to_string())
+                                "Error".to_string()
                             }),
                             message: termination_msg,
-                            started_at: docker_started_at,
-                            finished_at: state.finished_at,
-                            container_id: inspect.id.clone().map(|id| format!("docker://{}", id)),
+                            started_at: started_at.clone(),
+                            finished_at: Self::nanos_to_rfc3339(cs.finished_at),
+                            container_id: cid.clone(),
                         })
                     } else {
                         Some(ContainerState::Waiting {
@@ -4974,14 +4935,8 @@ impl ContainerRuntime {
                         state: container_state,
                         last_state: prev_last_state,
                         image: Some(container.image.clone()),
-                        image_id: inspect.image.clone().map(|img| {
-                            if img.starts_with("sha256:") {
-                                format!("docker-pullable://{}", img)
-                            } else {
-                                img
-                            }
-                        }),
-                        container_id: inspect.id.map(|id| format!("docker://{}", id)),
+                        image_id: iid,
+                        container_id: cid,
                         started: Some(startup_passed),
                         allocated_resources: container
                             .resources
@@ -4994,7 +4949,7 @@ impl ContainerRuntime {
                         stop_signal: None,
                     }
                 }
-                Err(_) => {
+                None => {
                     // If pod already has a container status (from a previous sync),
                     // preserve it. This handles containers that exit and are removed
                     // before the kubelet can inspect them.
@@ -5139,22 +5094,14 @@ impl ContainerRuntime {
                 let initial_delay = probe.initial_delay_seconds.unwrap_or(0);
                 if initial_delay > 0 {
                     // Check container start time
-                    if let Ok(inspect) = self
-                        .docker
-                        .inspect_container(&container_name, None::<InspectContainerOptions>)
-                        .await
+                    if let Some((cs, _, _)) = self.cri_status_for(pod_name, &container.name).await
                     {
-                        if let Some(state) = inspect.state {
-                            if let Some(started_at) = state.started_at {
-                                if let Ok(started) =
-                                    chrono::DateTime::parse_from_rfc3339(&started_at)
-                                {
-                                    let elapsed = Utc::now().signed_duration_since(started);
-                                    if elapsed.num_seconds() < initial_delay as i64 {
-                                        debug!("Skipping liveness check, within initial delay");
-                                        continue;
-                                    }
-                                }
+                        if cs.started_at > 0 {
+                            let now_nanos = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+                            let elapsed_secs = (now_nanos - cs.started_at) / 1_000_000_000;
+                            if elapsed_secs < initial_delay as i64 {
+                                debug!("Skipping liveness check, within initial delay");
+                                continue;
                             }
                         }
                     }
@@ -5311,70 +5258,12 @@ impl ContainerRuntime {
             return None;
         }
 
-        // Fall back to docker cp for containers created before the bind-mount fix
-        let mut stream = self.docker.download_from_container(
-            container_name,
-            Some(bollard::container::DownloadFromContainerOptions {
-                path: msg_path.to_string(),
-            }),
-        );
-        let mut all_bytes = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(bytes) => all_bytes.extend_from_slice(&bytes),
-                Err(e) => {
-                    debug!(
-                        "Error reading termination message from {}: {}",
-                        container_name, e
-                    );
-                    if container.termination_message_policy.as_deref()
-                        == Some("FallbackToLogsOnError")
-                        && exit_code != 0
-                    {
-                        return self.read_container_logs_tail(container_name, 80).await;
-                    }
-                    return None;
-                }
-            }
-        }
-
-        if all_bytes.is_empty() {
-            debug!(
-                "Termination message file empty or not found in {}",
-                container_name
-            );
-            if container.termination_message_policy.as_deref() == Some("FallbackToLogsOnError")
-                && exit_code != 0
-            {
-                return self.read_container_logs_tail(container_name, 80).await;
-            }
-            return None;
-        }
-
-        // Docker returns a tar archive; extract the file content
-        let mut archive = tar::Archive::new(&all_bytes[..]);
-        if let Ok(mut entries) = archive.entries() {
-            while let Some(Ok(mut entry)) = entries.next() {
-                let mut content = String::new();
-                if std::io::Read::read_to_string(&mut entry, &mut content).is_ok()
-                    && !content.is_empty()
-                {
-                    if content.len() > 4096 {
-                        content.truncate(4096);
-                    }
-                    debug!(
-                        "Read termination message ({} bytes) from {}",
-                        content.len(),
-                        container_name
-                    );
-                    return Some(content);
-                }
-            }
-        }
-
+        // No host-side file (kubelet always bind-mounts terminationMessagePath;
+        // CRI has no file-download API). Fall back to logs when the policy
+        // allows it, otherwise there is no termination message.
         debug!(
-            "Failed to extract termination message from tar archive for {}",
-            container_name
+            "Termination message file not found for {} (path {})",
+            container_name, msg_path
         );
         if container.termination_message_policy.as_deref() == Some("FallbackToLogsOnError")
             && exit_code != 0
@@ -5384,22 +5273,28 @@ impl ContainerRuntime {
         None
     }
 
-    /// Read the last N lines of container logs (for FallbackToLogsOnError)
+    /// Read the last N lines of container logs (for FallbackToLogsOnError),
+    /// from the CRI log file the runtime writes for the container.
     async fn read_container_logs_tail(&self, container_name: &str, lines: usize) -> Option<String> {
-        use bollard::container::LogsOptions;
-        let options = LogsOptions::<String> {
-            stdout: true,
-            stderr: true,
-            tail: lines.to_string(),
-            ..Default::default()
-        };
-        let mut stream = self.docker.logs(container_name, Some(options));
+        let (pod_name, name) = Self::split_compound_name(container_name);
+        let container = self.cri.find_container(pod_name, name).await.ok()??;
+        let status = self.cri.container_status(&container.id).await.ok()?;
+        if status.log_path.is_empty() {
+            return None;
+        }
+        let log_lines = cri_server::logfmt::read_log_file(
+            &status.log_path,
+            &cri_server::logfmt::ReadOptions {
+                since: None,
+                tail_lines: Some(lines),
+            },
+        )
+        .await
+        .ok()?;
         let mut output = String::new();
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(log) => output.push_str(&log.to_string()),
-                Err(_) => break,
-            }
+        for line in log_lines {
+            output.push_str(&String::from_utf8_lossy(&line.message));
+            output.push('\n');
         }
         if output.is_empty() {
             None
@@ -5412,74 +5307,14 @@ impl ContainerRuntime {
         }
     }
 
-    /// Extract the best available IP from container network settings.
-    /// Tries the specific network first, then default ip_address, then 127.0.0.1.
-    fn extract_container_ip(
-        &self,
-        network_settings: Option<bollard::secret::NetworkSettings>,
-    ) -> String {
-        if let Some(ns) = network_settings {
-            // First try the specific network we're using
-            if let Some(networks) = &ns.networks {
-                if let Some(net_info) = networks.get(&self.network) {
-                    if let Some(ip) = &net_info.ip_address {
-                        if !ip.is_empty() && ip != "0.0.0.0" {
-                            return ip.clone();
-                        }
-                    }
-                }
-                // Try any network with a valid IP
-                for net_info in networks.values() {
-                    if let Some(ip) = &net_info.ip_address {
-                        if !ip.is_empty() && ip != "0.0.0.0" {
-                            return ip.clone();
-                        }
-                    }
-                }
-            }
-            // Fallback to top-level ip_address
-            if let Some(ip) = ns.ip_address {
-                if !ip.is_empty() && ip != "0.0.0.0" {
-                    return ip;
-                }
-            }
-        }
-        "127.0.0.1".to_string()
-    }
-
-    /// Get the effective IP for a container, resolving through pause containers
-    /// when the app container uses NetworkMode=container:pause.
+    /// Get the effective IP for a container: the pod's sandbox IP (all
+    /// containers share the sandbox network namespace under CRI).
     async fn get_effective_container_ip(&self, container_name: &str) -> String {
-        let inspect = match self
-            .docker
-            .inspect_container(container_name, None::<InspectContainerOptions>)
-            .await
-        {
-            Ok(i) => i,
-            Err(_) => return "127.0.0.1".to_string(),
-        };
-
-        // Check if this container uses another container's network
-        if let Some(ref hc) = inspect.host_config {
-            if let Some(ref net_mode) = hc.network_mode {
-                if net_mode.starts_with("container:") {
-                    // Get the pause container's IP instead
-                    let pause_id = net_mode.trim_start_matches("container:");
-                    if let Ok(pause_inspect) = self
-                        .docker
-                        .inspect_container(pause_id, None::<InspectContainerOptions>)
-                        .await
-                    {
-                        let ip = self.extract_container_ip(pause_inspect.network_settings);
-                        if ip != "127.0.0.1" {
-                            return ip;
-                        }
-                    }
-                }
-            }
+        let (pod_name, _) = Self::split_compound_name(container_name);
+        match self.get_pod_ip(pod_name).await {
+            Ok(Some(ip)) => ip,
+            _ => "127.0.0.1".to_string(),
         }
-
-        self.extract_container_ip(inspect.network_settings)
     }
 
     async fn check_http_probe(
@@ -6719,12 +6554,7 @@ impl ContainerRuntime {
         &self,
         existing_pods: &std::collections::HashSet<String>,
     ) -> Result<usize> {
-        let options = ListContainersOptions::<String> {
-            all: true,
-            ..Default::default()
-        };
-
-        let containers = self.docker.list_containers(Some(options)).await?;
+        let containers = self.cri.list_containers(None).await?;
 
         // Group exited containers by pod name, track which pods have running containers
         let mut exited_by_pod: HashMap<String, Vec<(String, i64)>> = HashMap::new();
@@ -6733,47 +6563,27 @@ impl ContainerRuntime {
         let mut stale_created: Vec<String> = Vec::new();
 
         for container in &containers {
-            let names = match &container.names {
-                Some(n) => n,
-                None => continue,
-            };
-            let name = names
-                .first()
-                .map(|n| n.trim_start_matches('/'))
-                .unwrap_or("");
-
-            // Skip infrastructure containers (compose services)
-            if name.starts_with("rusternetes-") {
-                continue;
-            }
-
-            let pod_name = match name.split('_').next() {
-                Some(p) => p.to_string(),
-                None => continue,
+            let pod_name = match container.labels.get(cri_labels::POD_NAME) {
+                Some(p) => p.clone(),
+                None => continue, // not one of ours
             };
 
-            let state = container.state.as_deref().unwrap_or("");
-            let container_id = match &container.id {
-                Some(id) => id.clone(),
-                None => continue,
-            };
-            let created = container.created.unwrap_or(0);
-
-            match state {
-                "running" => {
+            match Self::cri_state(container.state) {
+                v1::ContainerState::ContainerRunning => {
                     pods_with_running.insert(pod_name);
                 }
-                "exited" | "dead" | "stopped" => {
+                v1::ContainerState::ContainerExited => {
                     exited_by_pod
                         .entry(pod_name)
                         .or_default()
-                        .push((container_id, created));
+                        .push((container.id.clone(), container.created_at));
                 }
-                "created" => {
+                v1::ContainerState::ContainerCreated => {
                     // Containers stuck in "created" for more than 5 minutes
-                    let age_secs = chrono::Utc::now().timestamp() - created;
+                    let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                    let age_secs = (now_nanos - container.created_at) / 1_000_000_000;
                     if age_secs > 300 {
-                        stale_created.push(container_id);
+                        stale_created.push(container.id.clone());
                     }
                 }
                 _ => {}
@@ -6797,54 +6607,27 @@ impl ContainerRuntime {
                 0
             };
             for (container_id, _) in exited.iter().skip(keep_count) {
-                let opts = RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                };
-                if self
-                    .docker
-                    .remove_container(container_id, Some(opts))
-                    .await
-                    .is_ok()
-                {
+                if self.cri.remove_container(container_id).await.is_ok() {
                     removed += 1;
                 }
             }
 
             // If the pod has no running containers, remove the last dead one too
-            // and clean up the pause container (orphaned sandbox)
+            // and clean up the orphaned sandbox
             if !pods_with_running.contains(&pod_name) {
-                for (container_id, _) in exited.iter().take(1) {
-                    let opts = RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    };
-                    if self
-                        .docker
-                        .remove_container(container_id, Some(opts))
-                        .await
-                        .is_ok()
-                    {
+                for (container_id, _) in exited.iter().take(keep_count) {
+                    if self.cri.remove_container(container_id).await.is_ok() {
                         removed += 1;
                     }
                 }
-                // Remove orphaned pause container
-                let pause_name = format!("{}_pause", pod_name);
-                let _ = self
-                    .docker
-                    .stop_container(&pause_name, Some(StopContainerOptions { t: 0 }))
-                    .await;
-                let opts = RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                };
-                if self
-                    .docker
-                    .remove_container(&pause_name, Some(opts))
-                    .await
-                    .is_ok()
-                {
-                    removed += 1;
+                // Remove orphaned sandboxes
+                if let Ok(sandboxes) = self.cri.sandboxes_for_pod(&pod_name).await {
+                    for sandbox in sandboxes {
+                        let _ = self.cri.stop_pod_sandbox(&sandbox.id).await;
+                        if self.cri.remove_pod_sandbox(&sandbox.id).await.is_ok() {
+                            removed += 1;
+                        }
+                    }
                 }
                 // Clean up volumes
                 let _ = self.cleanup_pod_volumes(&pod_name).await;
@@ -6853,17 +6636,31 @@ impl ContainerRuntime {
 
         // 2. Remove stale "created" containers
         for container_id in &stale_created {
-            let opts = RemoveContainerOptions {
-                force: true,
-                ..Default::default()
-            };
-            if self
-                .docker
-                .remove_container(container_id, Some(opts))
-                .await
-                .is_ok()
-            {
+            if self.cri.remove_container(container_id).await.is_ok() {
                 removed += 1;
+            }
+        }
+
+        // 3. Remove orphaned sandboxes for pods with no containers at all
+        // (e.g. sandbox created but containers never started).
+        if let Ok(sandboxes) = self.cri.list_pod_sandbox(None).await {
+            for sandbox in sandboxes {
+                let Some(pod_name) = sandbox.labels.get(cri_labels::POD_NAME) else {
+                    continue;
+                };
+                if existing_pods.contains(pod_name) {
+                    continue;
+                }
+                if containers
+                    .iter()
+                    .any(|c| c.labels.get(cri_labels::POD_NAME) == Some(pod_name))
+                {
+                    continue; // handled above
+                }
+                let _ = self.cri.stop_pod_sandbox(&sandbox.id).await;
+                if self.cri.remove_pod_sandbox(&sandbox.id).await.is_ok() {
+                    removed += 1;
+                }
             }
         }
 
