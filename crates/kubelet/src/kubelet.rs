@@ -1741,10 +1741,9 @@ impl Kubelet {
                     // For pods with init containers, use the state machine approach.
                     // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go — computeInitContainerActions
                     // Check if the pause container exists (pod sandbox created).
-                    let pause_name = format!("{}_pause", pod_name);
                     let sandbox_exists = self
                         .runtime
-                        .is_container_running(&pause_name)
+                        .is_sandbox_ready(pod_name)
                         .await
                         .unwrap_or(false);
 
@@ -1822,7 +1821,7 @@ impl Kubelet {
                                 let pod_ip = pod.status.as_ref().and_then(|s| s.pod_ip.as_deref());
                                 if let Err(e) = self
                                     .runtime
-                                    .start_container(pod, ic, &volume_paths, None, None, pod_ip)
+                                    .start_container_for_pod(pod, ic, &volume_paths, None, pod_ip)
                                     .await
                                 {
                                     warn!(
@@ -2592,11 +2591,10 @@ impl Kubelet {
                             let empty_binds = std::collections::HashMap::new();
                             if let Err(e) = self
                                 .runtime
-                                .start_container(
+                                .start_container_for_pod(
                                     pod,
                                     container,
                                     &empty_binds,
-                                    None, // netns — pod already has networking via pause
                                     None, // hosts file
                                     pod.status.as_ref().and_then(|s| s.pod_ip.as_deref()),
                                 )
@@ -2886,11 +2884,10 @@ impl Kubelet {
                                                 .and_then(|s| s.pod_ip.as_deref());
                                             if let Err(e) = self
                                                 .runtime
-                                                .start_container(
+                                                .start_container_for_pod(
                                                     pod,
                                                     c,
                                                     &volume_paths,
-                                                    None,
                                                     None,
                                                     pod_ip,
                                                 )
@@ -2996,11 +2993,10 @@ impl Kubelet {
                                     .unwrap_or_default();
                                 if let Err(e) = self
                                     .runtime
-                                    .start_container(
+                                    .start_container_for_pod(
                                         &ec_pod,
                                         &container,
                                         &volume_paths,
-                                        None,
                                         None,
                                         None,
                                     )

@@ -599,6 +599,31 @@ impl ContainerRuntime {
         Ok((sandbox_id, config))
     }
 
+    /// Start a single container in a pod whose sandbox already exists,
+    /// resolving the sandbox by pod name. Used by reconcile paths that
+    /// (re)start individual containers (init progression, restarts,
+    /// ephemeral containers) outside the full `start_pod` flow.
+    pub async fn start_container_for_pod(
+        &self,
+        pod: &Pod,
+        container: &Container,
+        volume_paths: &HashMap<String, String>,
+        hosts_file_path: Option<&str>,
+        pod_ip: Option<&str>,
+    ) -> Result<()> {
+        let (sandbox_id, sandbox_config) = self.ensure_sandbox(pod).await?;
+        self.start_container(
+            pod,
+            container,
+            volume_paths,
+            &sandbox_id,
+            &sandbox_config,
+            hosts_file_path,
+            pod_ip,
+        )
+        .await
+    }
+
     /// Pod IP from the sandbox status (runtime-owned networking).
     async fn sandbox_ip(&self, sandbox_id: &str) -> Result<Option<String>> {
         let status = self.cri.pod_sandbox_status(sandbox_id).await?;
@@ -3598,7 +3623,7 @@ impl ContainerRuntime {
                 let mut parts = entry.splitn(2, '=');
                 v1::KeyValue {
                     key: parts.next().unwrap_or("").to_string(),
-                    value: parts.next().unwrap_or("").to_string(),
+                    value: parts.next().unwrap_or("").as_bytes().to_vec(),
                 }
             })
             .collect();
@@ -4089,30 +4114,13 @@ impl ContainerRuntime {
     pub async fn stop_and_remove_pod(&self, pod_name: &str) -> Result<()> {
         self.clear_probe_states_for_pod(pod_name);
 
-        let mut filters = HashMap::new();
-        filters.insert("name".to_string(), vec![format!("{}_", pod_name)]);
-        let options = ListContainersOptions {
-            all: true,
-            filters,
-            ..Default::default()
-        };
-        let containers = self.docker.list_containers(Some(options)).await?;
-
-        for container in containers {
-            if let Some(id) = container.id {
-                let _ = self
-                    .docker
-                    .stop_container(&id, Some(StopContainerOptions { t: 0 }))
-                    .await;
-                let remove_options = RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                };
-                let _ = self
-                    .docker
-                    .remove_container(&id, Some(remove_options))
-                    .await;
-            }
+        for container in self.cri.containers_for_pod(pod_name).await? {
+            let _ = self.cri.stop_container(&container.id, 0).await;
+            let _ = self.cri.remove_container(&container.id).await;
+        }
+        for sandbox in self.cri.sandboxes_for_pod(pod_name).await? {
+            let _ = self.cri.stop_pod_sandbox(&sandbox.id).await;
+            let _ = self.cri.remove_pod_sandbox(&sandbox.id).await;
         }
 
         if self.use_cni {
@@ -4134,66 +4142,39 @@ impl ContainerRuntime {
             pod_name, grace_period_seconds
         );
 
-        // List all containers with this pod prefix
-        let mut filters = HashMap::new();
-        filters.insert("name".to_string(), vec![format!("{}_", pod_name)]);
-
-        let options = ListContainersOptions {
-            all: true,
-            filters,
-            ..Default::default()
-        };
-
-        let containers = self.docker.list_containers(Some(options)).await?;
-
-        // Stop app containers first, then the pause container last.
-        // The pause container owns the network namespace — stopping it first
-        // would destroy networking for containers still shutting down.
-        let mut pause_container_id: Option<String> = None;
-
-        for container in &containers {
-            if let Some(ref id) = container.id {
-                let names = container.names.clone().unwrap_or_default();
-                let container_name = names
-                    .first()
-                    .map(|n| n.trim_start_matches('/').to_string())
-                    .unwrap_or_default();
-
-                if container_name.ends_with("_pause") {
-                    pause_container_id = Some(id.clone());
-                    continue;
-                }
-
-                info!("Stopping container: {}", id);
-
-                // Stop the container gracefully using the pod's terminationGracePeriodSeconds
-                let stop_options = StopContainerOptions {
-                    t: grace_period_seconds,
-                };
-                if let Err(e) = self.docker.stop_container(id, Some(stop_options)).await {
-                    warn!("Failed to stop container {}: {}", id, e);
-                }
-
-                // Do NOT remove containers here — keep them stopped for log
-                // retrieval. Conformance tests read logs from completed/deleted
-                // pods after the pod has been deleted from the API. The orphaned
-                // container cleanup will remove them on the next cycle.
-                debug!("Container {} stopped, keeping for log access", id);
+        // Stop app containers first, then the sandbox last. The sandbox owns
+        // the network namespace — stopping it first would destroy networking
+        // for containers still shutting down.
+        for container in self.cri.containers_for_pod(pod_name).await? {
+            if Self::cri_state(container.state) != v1::ContainerState::ContainerRunning {
+                continue;
             }
-        }
-
-        // Stop the pause container last
-        if let Some(ref pause_id) = pause_container_id {
-            info!("Stopping pause container: {} (last)", pause_id);
-            let stop_options = StopContainerOptions {
-                t: grace_period_seconds,
-            };
+            info!("Stopping container: {}", container.id);
             if let Err(e) = self
-                .docker
-                .stop_container(pause_id, Some(stop_options))
+                .cri
+                .stop_container(&container.id, grace_period_seconds)
                 .await
             {
-                warn!("Failed to stop pause container {}: {}", pause_id, e);
+                warn!("Failed to stop container {}: {}", container.id, e);
+            }
+
+            // Do NOT remove containers here — keep them stopped for log
+            // retrieval. Conformance tests read logs from completed/deleted
+            // pods after the pod has been deleted from the API. The orphaned
+            // container cleanup will remove them on the next cycle.
+            debug!(
+                "Container {} stopped, keeping for log access",
+                container.id
+            );
+        }
+
+        // Stop the sandbox last
+        for sandbox in self.cri.sandboxes_for_pod(pod_name).await? {
+            if sandbox.state == v1::PodSandboxState::SandboxReady as i32 {
+                info!("Stopping sandbox: {} (last)", sandbox.id);
+                if let Err(e) = self.cri.stop_pod_sandbox(&sandbox.id).await {
+                    warn!("Failed to stop sandbox {}: {}", sandbox.id, e);
+                }
             }
         }
 
@@ -4226,49 +4207,37 @@ impl ContainerRuntime {
             }
         }
 
-        // Clean up Docker named volumes created for emptyDir volumes.
-        // These are named rusternetes-emptydir-{pod_name}-{volume_name}.
-        let prefix = format!("rusternetes-emptydir-{}-", pod_name);
-        if let Ok(volumes) = self.docker.list_volumes::<String>(None).await {
-            if let Some(volume_list) = volumes.volumes {
-                for vol in volume_list {
-                    if vol.name.starts_with(&prefix) {
-                        if let Err(e) = self.docker.remove_volume(&vol.name, None).await {
-                            warn!("Failed to remove Docker volume {}: {}", vol.name, e);
-                        } else {
-                            info!("Removed Docker volume {}", vol.name);
-                        }
-                    }
-                }
-            }
-        }
-
         Ok(())
     }
 
-    /// Check if a specific container is running
+    /// Split a legacy compound container name (`{pod}_{container}`) into its
+    /// parts. K8s names cannot contain `_`, so the first `_` is the separator.
+    fn split_compound_name(container_name: &str) -> (&str, &str) {
+        container_name
+            .split_once('_')
+            .unwrap_or((container_name, ""))
+    }
+
+    /// Check if a specific container is running (name in `{pod}_{container}` form)
     pub async fn is_container_running(&self, container_name: &str) -> Result<bool> {
-        match self
-            .docker
-            .inspect_container(container_name, None::<InspectContainerOptions>)
-            .await
-        {
-            Ok(inspect) => Ok(inspect
-                .state
-                .as_ref()
-                .and_then(|s| s.running)
-                .unwrap_or(false)),
-            Err(_) => Ok(false),
+        let (pod_name, name) = Self::split_compound_name(container_name);
+        match self.cri.find_container(pod_name, name).await {
+            Ok(Some(c)) => Ok(Self::cri_state(c.state) == v1::ContainerState::ContainerRunning),
+            _ => Ok(false),
         }
     }
 
-    /// Check if a container exists in Docker (in any state: running, exited, created, etc.).
-    /// Returns true if the container can be inspected, false if it doesn't exist.
+    /// Check if the pod has a READY sandbox (the CRI equivalent of the old
+    /// "pause container is running" check).
+    pub async fn is_sandbox_ready(&self, pod_name: &str) -> Result<bool> {
+        Ok(self.get_ready_sandbox(pod_name).await?.is_some())
+    }
+
+    /// Check if a container exists in the runtime (in any state: running,
+    /// exited, created, etc.). Name in `{pod}_{container}` form.
     pub async fn container_exists(&self, container_name: &str) -> bool {
-        self.docker
-            .inspect_container(container_name, None::<InspectContainerOptions>)
-            .await
-            .is_ok()
+        let (pod_name, name) = Self::split_compound_name(container_name);
+        matches!(self.cri.find_container(pod_name, name).await, Ok(Some(_)))
     }
 
     /// Check if any spec container in a pod has terminated (exited).
@@ -4278,32 +4247,10 @@ impl ContainerRuntime {
         let pod_name = &pod.metadata.name;
         if let Some(spec) = &pod.spec {
             for container in &spec.containers {
-                let container_name = format!("{}_{}", pod_name, container.name);
-                match self
-                    .docker
-                    .inspect_container(&container_name, None::<InspectContainerOptions>)
-                    .await
-                {
-                    Ok(inspect) => {
-                        let state = inspect.state.unwrap_or_default();
-                        let running = state.running.unwrap_or(false);
-                        if !running {
-                            // Container is not running — check if it has exited
-                            if state.exit_code.is_some()
-                                || matches!(
-                                    state.status,
-                                    Some(
-                                        bollard::secret::ContainerStateStatusEnum::EXITED
-                                            | bollard::secret::ContainerStateStatusEnum::DEAD
-                                    )
-                                )
-                            {
-                                return true;
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        // Container doesn't exist or can't be inspected
+                // find_container returns the newest attempt for that name
+                if let Ok(Some(c)) = self.cri.find_container(pod_name, &container.name).await {
+                    if Self::cri_state(c.state) == v1::ContainerState::ContainerExited {
+                        return true;
                     }
                 }
             }
@@ -4313,70 +4260,25 @@ impl ContainerRuntime {
 
     /// Check if a pod's containers are running
     pub async fn is_pod_running(&self, pod_name: &str) -> Result<bool> {
-        let mut filters = HashMap::new();
-        filters.insert("name".to_string(), vec![format!("{}_", pod_name)]);
-
-        let options = ListContainersOptions {
-            all: false, // Only running containers
-            filters,
-            ..Default::default()
-        };
-
-        let containers = self.docker.list_containers(Some(options)).await?;
-        // Check that at least one non-pause container is running.
-        // Just the pause container running doesn't count — the app containers may have
-        // failed to start (e.g., CreateContainerConfigError from subpath validation).
-        let pause_suffix = format!("{}_pause", pod_name);
-        let has_app_container = containers.iter().any(|c| {
-            c.names
-                .as_ref()
-                .map(|names| names.iter().any(|n| !n.contains(&pause_suffix)))
-                .unwrap_or(false)
-        });
-        Ok(has_app_container)
+        // At least one running container counts. A bare READY sandbox does
+        // not — the app containers may have failed to start (e.g.,
+        // CreateContainerConfigError from subpath validation).
+        let containers = self.cri.containers_for_pod(pod_name).await?;
+        Ok(containers
+            .iter()
+            .any(|c| Self::cri_state(c.state) == v1::ContainerState::ContainerRunning))
     }
 
     /// Check if any app (non-init, non-pause) container has been created for a pod.
     /// K8s ref: kubelet_pods.go:2689 — HasAnyRegularContainerCreated.
     /// If app containers exist, all init containers must have completed successfully.
     async fn has_any_app_container(&self, pod: &Pod) -> bool {
-        let pod_name = &pod.metadata.name;
-        let mut filters = HashMap::new();
-        filters.insert("name".to_string(), vec![format!("{}_", pod_name)]);
-
-        let options = ListContainersOptions {
-            all: true, // Include exited/created containers
-            filters,
-            ..Default::default()
-        };
-
-        let containers = match self.docker.list_containers(Some(options)).await {
+        let containers = match self.cri.containers_for_pod(&pod.metadata.name).await {
             Ok(c) => c,
             Err(_) => return false,
         };
-
-        let init_names: Vec<String> = pod
-            .spec
-            .as_ref()
-            .and_then(|s| s.init_containers.as_ref())
-            .map(|ics| {
-                ics.iter()
-                    .map(|ic| format!("{}_{}", pod_name, ic.name))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let pause_name = format!("{}_pause", pod_name);
-
         containers.iter().any(|c| {
-            c.names
-                .as_ref()
-                .map(|names| {
-                    names.iter().any(|n| {
-                        let clean = n.trim_start_matches('/');
-                        clean != pause_name && !init_names.iter().any(|init| clean == init)
-                    })
-                })
-                .unwrap_or(false)
+            c.labels.get(cri_labels::CONTAINER_TYPE).map(String::as_str) == Some("regular")
         })
     }
 
@@ -6138,17 +6040,7 @@ impl ContainerRuntime {
             );
         }
 
-        // List all containers with this pod prefix
-        let mut filters = HashMap::new();
-        filters.insert("name".to_string(), vec![format!("{}_", pod_name)]);
-
-        let options = ListContainersOptions {
-            all: true,
-            filters,
-            ..Default::default()
-        };
-
-        let containers = self.docker.list_containers(Some(options)).await?;
+        let containers = self.cri.containers_for_pod(pod_name).await?;
 
         // First pass: execute preStop hooks on all running containers.
         // We must run ALL preStop hooks before stopping ANY containers, because
@@ -6176,45 +6068,33 @@ impl ContainerRuntime {
             .unwrap_or_default();
 
         // Collect (container_name, pre_stop_handler, container) for all running
-        // containers that have a preStop hook. Match exact name first, falling
-        // back to suffix match if Docker returns a different name shape.
+        // containers that have a preStop hook. The K8s container name comes
+        // from the CRI container-name label.
         let mut hooks_to_run: Vec<(
             String,
             rusternetes_common::resources::LifecycleHandler,
             Container,
         )> = Vec::new();
         for container in &containers {
-            let names = container.names.clone().unwrap_or_default();
-            let container_name = names
-                .first()
-                .map(|n| n.trim_start_matches('/').to_string())
-                .unwrap_or_default();
-            if container.state.as_deref() != Some("running") {
+            if Self::cri_state(container.state) != v1::ContainerState::ContainerRunning {
                 continue;
             }
-            let lifecycle = lifecycle_map.get(&container_name).or_else(|| {
-                lifecycle_map.iter().find_map(|(key, val)| {
-                    if container_name.ends_with(&key[pod_name.len()..]) {
-                        Some(val)
-                    } else {
-                        None
-                    }
-                })
-            });
-            if let Some(lifecycle) = lifecycle {
+            let k8s_name = container
+                .labels
+                .get(cri_labels::CONTAINER_NAME)
+                .cloned()
+                .unwrap_or_default();
+            let container_name = format!("{}_{}", pod_name, k8s_name);
+            if let Some(lifecycle) = lifecycle_map.get(&container_name) {
                 if let Some(ref pre_stop) = lifecycle.pre_stop {
-                    // Derive the K8s container name (strip `{pod_name}_` prefix).
-                    let k8s_name = container_name
-                        .strip_prefix(&format!("{}_", pod_name))
-                        .unwrap_or(&container_name);
                     let spec_container = spec_containers
-                        .get(k8s_name)
+                        .get(k8s_name.as_str())
                         .copied()
                         .cloned()
                         .unwrap_or_else(Container::default);
                     hooks_to_run.push((container_name, pre_stop.clone(), spec_container));
                 }
-            } else if !container_name.ends_with("_pause") {
+            } else {
                 debug!(
                     "No preStop hook for running container {} (lifecycle_map keys: {:?})",
                     container_name,
@@ -6286,49 +6166,35 @@ impl ContainerRuntime {
         // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go —
         //   killContainersWithSyncResult stops app containers first, then
         //   StopPodSandbox tears down the sandbox (pause) container.
-        let pause_suffix = format!("{}_pause", pod_name);
-        let mut pause_container_id: Option<String> = None;
-
         for container in &containers {
-            if let Some(ref id) = container.id {
-                let is_running = container.state.as_deref() == Some("running");
-                if !is_running {
-                    continue;
-                }
-
-                // Check if this is the pause container — defer stopping it
-                let names = container.names.clone().unwrap_or_default();
-                let container_name = names
-                    .first()
-                    .map(|n| n.trim_start_matches('/').to_string())
-                    .unwrap_or_default();
-                if container_name == pause_suffix || container_name.ends_with("_pause") {
-                    pause_container_id = Some(id.clone());
-                    continue;
-                }
-
-                info!("Stopping container: {}", id);
-
-                // Stop the container with remaining grace period (after preStop).
-                let stop_options = StopContainerOptions { t: remaining_grace };
-                if let Err(e) = self.docker.stop_container(id, Some(stop_options)).await {
-                    warn!("Failed to stop container {}: {}", id, e);
-                }
-
-                debug!("Container {} stopped, keeping for log access", id);
+            if Self::cri_state(container.state) != v1::ContainerState::ContainerRunning {
+                continue;
             }
-        }
 
-        // Stop the pause container last — the network namespace dies with it
-        if let Some(ref pause_id) = pause_container_id {
-            info!("Stopping pause container: {} (last)", pause_id);
-            let stop_options = StopContainerOptions { t: remaining_grace };
+            info!("Stopping container: {}", container.id);
+
+            // Stop the container with remaining grace period (after preStop).
             if let Err(e) = self
-                .docker
-                .stop_container(pause_id, Some(stop_options))
+                .cri
+                .stop_container(&container.id, remaining_grace)
                 .await
             {
-                warn!("Failed to stop pause container {}: {}", pause_id, e);
+                warn!("Failed to stop container {}: {}", container.id, e);
+            }
+
+            debug!(
+                "Container {} stopped, keeping for log access",
+                container.id
+            );
+        }
+
+        // Stop the sandbox last — the network namespace dies with it
+        for sandbox in self.cri.sandboxes_for_pod(pod_name).await? {
+            if sandbox.state == v1::PodSandboxState::SandboxReady as i32 {
+                info!("Stopping sandbox: {} (last)", sandbox.id);
+                if let Err(e) = self.cri.stop_pod_sandbox(&sandbox.id).await {
+                    warn!("Failed to stop sandbox {}: {}", sandbox.id, e);
+                }
             }
         }
 
@@ -6352,29 +6218,22 @@ impl ContainerRuntime {
     /// Get the exit code of a terminated container.
     /// Returns the exit code or an error if the container doesn't exist.
     pub async fn get_container_exit_code(&self, container_name: &str) -> Result<i64> {
-        let inspect = self
-            .docker
-            .inspect_container(container_name, None::<InspectContainerOptions>)
-            .await?;
-        Ok(inspect.state.and_then(|s| s.exit_code).unwrap_or(1))
+        let (pod_name, name) = Self::split_compound_name(container_name);
+        let container = self
+            .cri
+            .find_container(pod_name, name)
+            .await?
+            .with_context(|| format!("container {} not found", container_name))?;
+        let status = self.cri.container_status(&container.id).await?;
+        Ok(status.exit_code as i64)
     }
 
     /// Remove a terminated container so it can be recreated for restart.
     pub async fn remove_terminated_container(&self, container_name: &str) -> Result<()> {
-        if let Ok(info) = self
-            .docker
-            .inspect_container(container_name, None::<InspectContainerOptions>)
-            .await
-        {
-            let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
-            if !running {
-                let opts = bollard::container::RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                };
-                self.docker
-                    .remove_container(container_name, Some(opts))
-                    .await?;
+        let (pod_name, name) = Self::split_compound_name(container_name);
+        if let Ok(Some(container)) = self.cri.find_container(pod_name, name).await {
+            if Self::cri_state(container.state) != v1::ContainerState::ContainerRunning {
+                self.cri.remove_container(&container.id).await?;
                 debug!(
                     "Removed terminated container {} for restart",
                     container_name
@@ -6534,67 +6393,12 @@ impl ContainerRuntime {
             }
         }
 
-        // Fallback to Docker/Podman network inspection
-        // Look specifically for the pause container which owns the network namespace
-        let pause_name = format!("{}_pause", pod_name);
-        let mut filters = HashMap::new();
-        filters.insert("name".to_string(), vec![pause_name.clone()]);
-
-        let options = ListContainersOptions {
-            all: false, // Only running containers
-            filters,
-            ..Default::default()
-        };
-
-        let mut containers = self.docker.list_containers(Some(options)).await?;
-
-        // If no pause container, try any container matching the pod name
-        if containers.is_empty() {
-            let mut filters2 = HashMap::new();
-            filters2.insert("name".to_string(), vec![format!("{}_", pod_name)]);
-            let options2 = ListContainersOptions {
-                all: false,
-                filters: filters2,
-                ..Default::default()
-            };
-            containers = self.docker.list_containers(Some(options2)).await?;
-        }
-
-        // Get the IP from the pause container (or first matching)
-        if let Some(container) = containers.first() {
-            if let Some(id) = &container.id {
-                let inspect = self
-                    .docker
-                    .inspect_container(id, None::<InspectContainerOptions>)
-                    .await?;
-
-                if let Some(network_settings) = inspect.network_settings {
-                    // First try to get IP from the specific network we're using
-                    if let Some(networks) = network_settings.networks {
-                        if let Some(network_info) = networks.get(&self.network) {
-                            if let Some(ip) = &network_info.ip_address {
-                                if !ip.is_empty() && ip != "0.0.0.0" {
-                                    debug!(
-                                        "Retrieved pod IP {} from network {} for pod {}",
-                                        ip, self.network, pod_name
-                                    );
-                                    return Ok(Some(ip.clone()));
-                                }
-                            }
-                        }
-                    }
-
-                    // Fallback to default network IP
-                    if let Some(ip) = network_settings.ip_address {
-                        if !ip.is_empty() && ip != "0.0.0.0" {
-                            debug!(
-                                "Retrieved pod IP {} from default network for pod {}",
-                                ip, pod_name
-                            );
-                            return Ok(Some(ip));
-                        }
-                    }
-                }
+        // Sandbox networking is the runtime's job under CRI: the pod IP
+        // comes from PodSandboxStatus.network.ip of the READY sandbox.
+        if let Some(sandbox) = self.get_ready_sandbox(pod_name).await? {
+            if let Some(ip) = self.sandbox_ip(&sandbox.id).await? {
+                debug!("Retrieved pod IP {} from sandbox for pod {}", ip, pod_name);
+                return Ok(Some(ip));
             }
         }
 
@@ -6856,20 +6660,24 @@ impl ContainerRuntime {
         cpu_shares: Option<i64>,
         memory: Option<i64>,
     ) -> Result<()> {
-        // Docker requires memory_swap >= memory. If we set memory without
-        // memory_swap, Docker rejects: "Memory limit should be smaller than
-        // already set memoryswap limit". Set memory_swap = memory (no swap).
-        let memory_swap = memory;
-        let update = bollard::container::UpdateContainerOptions::<String> {
-            cpu_period,
-            cpu_quota,
-            cpu_shares: cpu_shares.map(|s| s as isize),
-            memory,
-            memory_swap,
+        let (pod_name, name) = Self::split_compound_name(container_name);
+        let container = self
+            .cri
+            .find_container(pod_name, name)
+            .await?
+            .with_context(|| format!("container {} not found", container_name))?;
+        // memory_swap_limit = memory limit (no swap), matching the previous
+        // Docker behavior.
+        let linux = v1::LinuxContainerResources {
+            cpu_period: cpu_period.unwrap_or(0),
+            cpu_quota: cpu_quota.unwrap_or(0),
+            cpu_shares: cpu_shares.unwrap_or(0),
+            memory_limit_in_bytes: memory.unwrap_or(0),
+            memory_swap_limit_in_bytes: memory.unwrap_or(0),
             ..Default::default()
         };
-        self.docker
-            .update_container(container_name, update)
+        self.cri
+            .update_container_resources(&container.id, linux)
             .await
             .context("Failed to update container resources")?;
         Ok(())
@@ -6878,26 +6686,20 @@ impl ContainerRuntime {
     /// List all running pod names from the container runtime
     #[allow(dead_code)]
     pub async fn list_running_pods(&self) -> Result<Vec<String>> {
-        let options = ListContainersOptions::<String> {
-            all: false, // Only running containers
-            ..Default::default()
-        };
-
-        let containers = self.docker.list_containers(Some(options)).await?;
+        let containers = self
+            .cri
+            .list_containers(Some(v1::ContainerFilter {
+                state: Some(v1::ContainerStateValue {
+                    state: v1::ContainerState::ContainerRunning as i32,
+                }),
+                ..Default::default()
+            }))
+            .await?;
 
         let mut pod_names = std::collections::HashSet::new();
         for container in containers {
-            if let Some(names) = container.names {
-                for name in names {
-                    // Container names are in format: /{pod_name}_{container_name}
-                    let name = name.trim_start_matches('/');
-                    if let Some(pod_name) = name.split('_').next() {
-                        // Skip Rusternetes control plane containers
-                        if !pod_name.starts_with("rusternetes-") {
-                            pod_names.insert(pod_name.to_string());
-                        }
-                    }
-                }
+            if let Some(pod_name) = container.labels.get(cri_labels::POD_NAME) {
+                pod_names.insert(pod_name.clone());
             }
         }
 
@@ -7072,49 +6874,35 @@ impl ContainerRuntime {
     /// Used by orphan cleanup to find and remove stopped containers from
     /// pods that have been deleted from storage.
     pub async fn list_all_pods(&self) -> Result<Vec<String>> {
-        let options = ListContainersOptions::<String> {
-            all: true,
-            ..Default::default()
-        };
-
-        let containers = self.docker.list_containers(Some(options)).await?;
-
+        // Union of sandbox and container labels: containers can outlive
+        // their sandbox (kept for logs after the sandbox is stopped).
         let mut pod_names = std::collections::HashSet::new();
-        for container in containers {
-            if let Some(names) = container.names {
-                for name in names {
-                    let name = name.trim_start_matches('/');
-                    if let Some(pod_name) = name.split('_').next() {
-                        if !pod_name.starts_with("rusternetes-") {
-                            pod_names.insert(pod_name.to_string());
-                        }
-                    }
-                }
+        for sandbox in self.cri.list_pod_sandbox(None).await? {
+            if let Some(pod_name) = sandbox.labels.get(cri_labels::POD_NAME) {
+                pod_names.insert(pod_name.clone());
+            }
+        }
+        for container in self.cri.list_containers(None).await? {
+            if let Some(pod_name) = container.labels.get(cri_labels::POD_NAME) {
+                pod_names.insert(pod_name.clone());
             }
         }
 
         Ok(pod_names.into_iter().collect())
     }
 
-    /// Get the age of a pod's pause container (time since creation).
-    /// Returns Duration::ZERO if the container can't be found.
+    /// Get the age of a pod's sandbox (time since creation).
+    /// Returns Duration::ZERO if no sandbox can be found.
     pub async fn get_container_age(&self, pod_name: &str) -> Result<std::time::Duration> {
-        let pause_name = format!("{}_pause", pod_name);
-        match self.docker.inspect_container(&pause_name, None).await {
-            Ok(info) => {
-                if let Some(state) = info.state {
-                    if let Some(started_at) = state.started_at {
-                        if let Ok(started) = chrono::DateTime::parse_from_rfc3339(&started_at) {
-                            let age = chrono::Utc::now().signed_duration_since(started);
-                            return Ok(std::time::Duration::from_secs(
-                                age.num_seconds().max(0) as u64
-                            ));
-                        }
-                    }
-                }
-                Ok(std::time::Duration::from_secs(0))
+        match self.get_any_sandbox(pod_name).await {
+            Ok(Some(sandbox)) if sandbox.created_at > 0 => {
+                let now_nanos = chrono::Utc::now()
+                    .timestamp_nanos_opt()
+                    .unwrap_or(i64::MAX);
+                let age_nanos = (now_nanos - sandbox.created_at).max(0);
+                Ok(std::time::Duration::from_nanos(age_nanos as u64))
             }
-            Err(_) => Ok(std::time::Duration::from_secs(0)),
+            _ => Ok(std::time::Duration::from_secs(0)),
         }
     }
 
