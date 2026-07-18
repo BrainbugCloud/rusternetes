@@ -1,6 +1,7 @@
 #[allow(dead_code)]
 pub mod cni;
 pub mod config;
+pub mod cri;
 #[allow(dead_code)]
 pub mod eviction;
 pub mod kubelet;
@@ -23,6 +24,8 @@ pub struct KubeletConfig {
     pub sync_interval: u64,
     pub metrics_port: u16,
     pub kubernetes_service_host: String,
+    pub container_runtime_endpoint: String,
+    pub image_service_endpoint: String,
 }
 
 impl Default for KubeletConfig {
@@ -36,6 +39,8 @@ impl Default for KubeletConfig {
             sync_interval: 3,
             metrics_port: 10250,
             kubernetes_service_host: "127.0.0.1".to_string(),
+            container_runtime_endpoint: config::DEFAULT_CONTAINER_RUNTIME_ENDPOINT.to_string(),
+            image_service_endpoint: config::DEFAULT_CONTAINER_RUNTIME_ENDPOINT.to_string(),
         }
     }
 }
@@ -84,6 +89,8 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
         metrics_bind_port: Some(config.metrics_port),
         log_level: Some("info".to_string()),
         cluster_service_cidr: None,
+        container_runtime_endpoint: Some(config.container_runtime_endpoint.clone()),
+        image_service_endpoint: Some(config.image_service_endpoint.clone()),
     };
     let kubelet_config = Arc::new(kubelet_config);
     let kubelet_config_clone = kubelet_config.clone();
@@ -116,6 +123,8 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
             config.cluster_domain,
             config.network,
             config.kubernetes_service_host,
+            config.container_runtime_endpoint,
+            config.image_service_endpoint,
         )
         .await?,
     );

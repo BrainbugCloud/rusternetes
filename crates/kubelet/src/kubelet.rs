@@ -89,6 +89,8 @@ impl Kubelet {
         cluster_domain: String,
         network: String,
         kubernetes_service_host: String,
+        container_runtime_endpoint: String,
+        image_service_endpoint: String,
     ) -> Result<Self> {
         let runtime = ContainerRuntime::new(
             volume_dir,
@@ -96,6 +98,8 @@ impl Kubelet {
             cluster_domain,
             network,
             kubernetes_service_host,
+            container_runtime_endpoint,
+            image_service_endpoint,
         )
         .await?
         .with_storage(storage.clone());

@@ -21,6 +21,8 @@ redis = ["rusternetes-storage/redis"]
 [dependencies]
 rusternetes-common = { path = "../common" }
 rusternetes-storage = { path = "../storage" }
+cri-proto = { path = "../cri-proto", default-features = false, features = ["client"] }
+cri-server = { path = "../cri-server" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -35,9 +37,14 @@ chrono.workspace = true
 axum.workspace = true
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-tonic.workspace = true
-prost.workspace = true
+# cri-proto is generated with tonic 0.14 / prost 0.14; the kubelet must use
+# matching versions (the workspace still pins tonic 0.12 for other crates).
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
 http = "1"
+tower = { version = "0.5", features = ["util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 tar = "0.4"
 sysinfo = "0.32"
 

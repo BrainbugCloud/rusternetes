@@ -21,6 +21,7 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::cni::CniRuntime;
+use crate::cri::CriClient;
 
 /// Wrapper for pre-encoded protobuf bytes (gRPC health check request).
 #[derive(Clone, Debug, Default)]
@@ -85,6 +86,14 @@ struct ProbeState {
 /// ContainerRuntime manages containers using Docker/Podman with CNI networking
 pub struct ContainerRuntime {
     docker: Docker,
+    /// CRI runtime + image service clients (K1 scaffolding; call sites are
+    /// migrated off bollard stage by stage, see plan/02-kubelet-cri-only.md).
+    #[allow(dead_code)]
+    cri: CriClient,
+    /// Runtime name from CRI `Version()` (e.g. "containerd"), used for
+    /// containerID prefixes. Cached on first use.
+    #[allow(dead_code)]
+    runtime_name: tokio::sync::OnceCell<String>,
     storage: Option<Arc<rusternetes_storage::StorageBackend>>,
     volumes_base_path: String,
     cluster_dns: String,
@@ -185,9 +194,16 @@ impl ContainerRuntime {
         cluster_domain: String,
         network: String,
         kubernetes_service_host: String,
+        container_runtime_endpoint: String,
+        image_service_endpoint: String,
     ) -> Result<Self> {
         let docker = Docker::connect_with_local_defaults()?;
+        let cri = CriClient::new(&container_runtime_endpoint, &image_service_endpoint);
 
+        info!(
+            "CRI runtime endpoint: {}, image endpoint: {}",
+            container_runtime_endpoint, image_service_endpoint
+        );
         info!("Using volumes base path: {}", volumes_base_path);
         info!(
             "Cluster DNS: {}, domain: {}, network: {}",
@@ -217,6 +233,8 @@ impl ContainerRuntime {
 
         Ok(Self {
             docker,
+            cri,
+            runtime_name: tokio::sync::OnceCell::new(),
             storage: None,
             volumes_base_path,
             cluster_dns,
@@ -6625,7 +6643,7 @@ impl ContainerRuntime {
             request_bytes.extend_from_slice(service_name.as_bytes());
         }
 
-        let codec = tonic::codec::ProstCodec::default();
+        let codec = tonic_prost::ProstCodec::default();
         let path = http::uri::PathAndQuery::from_static("/grpc.health.v1.Health/Check");
 
         // Use EncodedBytes to wrap our pre-encoded protobuf message
@@ -7832,7 +7850,7 @@ impl ContainerRuntime {
         // For existing pods, keep at most MaxPerPodContainerCount (default 1).
         for (pod_name, mut exited) in exited_by_pod {
             // Sort by created time descending — keep the newest
-            exited.sort_by(|a, b| b.1.cmp(&a.1));
+            exited.sort_by_key(|e| std::cmp::Reverse(e.1));
 
             // For pods still in etcd, keep 1 dead container for log access.
             // For deleted pods, remove ALL dead containers.

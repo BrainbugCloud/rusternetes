@@ -1,6 +1,7 @@
 #[allow(dead_code)]
 mod cni;
 mod config;
+mod cri;
 #[allow(dead_code)]
 mod eviction;
 mod kubelet;
@@ -79,6 +80,14 @@ struct Args {
     #[arg(long, default_value = "rusternetes-network")]
     network: String,
 
+    /// CRI runtime service endpoint (e.g. unix:///run/containerd/containerd.sock)
+    #[arg(long, value_name = "ENDPOINT")]
+    container_runtime_endpoint: Option<String>,
+
+    /// CRI image service endpoint (defaults to --container-runtime-endpoint)
+    #[arg(long, value_name = "ENDPOINT")]
+    image_service_endpoint: Option<String>,
+
     /// Storage backend: "etcd" or "sqlite"
     #[arg(long, default_value = "etcd")]
     storage_backend: String,
@@ -118,6 +127,8 @@ async fn main() -> Result<()> {
         config_file,
         args.node_name,
         etcd_endpoints,
+        args.container_runtime_endpoint,
+        args.image_service_endpoint,
     )?;
 
     // Initialize tracing
@@ -208,6 +219,8 @@ async fn main() -> Result<()> {
         metrics_bind_port: Some(runtime_config.metrics_bind_port),
         log_level: Some(runtime_config.log_level.clone()),
         cluster_service_cidr: None, // Not exposed in config endpoint
+        container_runtime_endpoint: Some(runtime_config.container_runtime_endpoint.clone()),
+        image_service_endpoint: Some(runtime_config.image_service_endpoint.clone()),
     };
     let kubelet_config = Arc::new(kubelet_config);
     let kubelet_config_clone = kubelet_config.clone();
@@ -243,6 +256,8 @@ async fn main() -> Result<()> {
             args.cluster_domain,
             args.network,
             runtime_config.kubernetes_service_host.clone(),
+            runtime_config.container_runtime_endpoint.clone(),
+            runtime_config.image_service_endpoint.clone(),
         )
         .await?,
     );

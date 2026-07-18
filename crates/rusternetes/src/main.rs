@@ -226,6 +226,14 @@ async fn main() -> Result<()> {
             .clone()
             .or_else(|| std::env::var("KUBERNETES_SERVICE_HOST_OVERRIDE").ok())
             .unwrap_or_else(|| "127.0.0.1".to_string()),
+        container_runtime_endpoint: std::env::var("CONTAINER_RUNTIME_ENDPOINT").unwrap_or_else(
+            |_| rusternetes_kubelet::config::DEFAULT_CONTAINER_RUNTIME_ENDPOINT.to_string(),
+        ),
+        image_service_endpoint: std::env::var("IMAGE_SERVICE_ENDPOINT").unwrap_or_else(|_| {
+            std::env::var("CONTAINER_RUNTIME_ENDPOINT").unwrap_or_else(|_| {
+                rusternetes_kubelet::config::DEFAULT_CONTAINER_RUNTIME_ENDPOINT.to_string()
+            })
+        }),
     };
     tokio::spawn(async move {
         if let Err(e) = rusternetes_kubelet::run(kubelet_storage, kubelet_config).await {
