@@ -5,6 +5,8 @@
 
 mod backend;
 mod images;
+mod naming;
+mod sandbox;
 
 use std::sync::Arc;
 

@@ -2,30 +2,36 @@
 
 //! `BollardBackend`: the CRI backend over the Docker Engine API.
 //!
-//! Stage B1 (plan 03): runtime info + full image manager. The sandbox and
-//! container lifecycle land in B2/B3 and currently answer `Unimplemented`
-//! (lists return empty so read-only clients keep working).
+//! Stages B1–B2 (plan 03): runtime info, full image manager, and the pod
+//! sandbox lifecycle (see [`crate::sandbox`]). The container lifecycle lands
+//! in B3 and currently answers `Unimplemented` (lists return empty so
+//! read-only clients keep working).
 
 use std::path::PathBuf;
 
 use async_trait::async_trait;
 use bollard::Docker;
 use cri_proto::v1::*;
+use cri_server::checkpoint::CheckpointStore;
 use cri_server::error::{Error, Result};
 use cri_server::{ExecSyncResult, RuntimeBackend};
 use tokio::sync::Mutex;
 
 /// Runtime configuration from the command line.
 pub struct Config {
-    #[allow(dead_code)] // consumed from B2 on (pause container)
     pub pod_infra_container_image: String,
     pub root_dir: PathBuf,
 }
 
 pub struct BollardBackend {
     pub(crate) docker: Docker,
-    #[allow(dead_code)] // used from B2 on (pause image, checkpoints)
     pub(crate) config: Config,
+    /// Per-sandbox state Docker cannot hold (port mappings, host-network
+    /// flag), rooted at `--root-dir/sandbox/`.
+    pub(crate) checkpoints: CheckpointStore,
+    /// Whether the daemon uses the systemd cgroup driver (cached from the
+    /// first `docker info`); decides the cgroup-parent syntax.
+    pub(crate) systemd_cgroup: tokio::sync::OnceCell<bool>,
     pub(crate) pod_cidr: Mutex<Option<String>>,
 }
 
@@ -62,9 +68,12 @@ pub(crate) fn docker_err(context: &str, err: bollard::errors::Error) -> Error {
 impl BollardBackend {
     pub fn new(docker: Docker, config: Config) -> Result<Self> {
         std::fs::create_dir_all(&config.root_dir)?;
+        let checkpoints = CheckpointStore::open(config.root_dir.join("sandbox"))?;
         Ok(Self {
             docker,
             config,
+            checkpoints,
+            systemd_cgroup: tokio::sync::OnceCell::new(),
             pod_cidr: Mutex::new(None),
         })
     }
@@ -85,7 +94,7 @@ impl BollardBackend {
 
     fn unimplemented<T>(what: &str) -> Result<T> {
         Err(Error::Unimplemented(format!(
-            "{what} is not implemented yet (bollard-cri plan 03 B2/B3)"
+            "{what} is not implemented yet (bollard-cri plan 03 B3+)"
         )))
     }
 }
@@ -141,30 +150,30 @@ impl RuntimeBackend for BollardBackend {
         Ok(())
     }
 
-    // ---- sandbox lifecycle: B2 ------------------------------------------
+    // ---- sandbox lifecycle (B2, see sandbox.rs) ---------------------------
 
     async fn run_pod_sandbox(
         &self,
-        _config: PodSandboxConfig,
-        _runtime_handler: &str,
+        config: PodSandboxConfig,
+        runtime_handler: &str,
     ) -> Result<String> {
-        Self::unimplemented("RunPodSandbox")
+        self.run_sandbox(config, runtime_handler).await
     }
 
-    async fn stop_pod_sandbox(&self, _id: &str) -> Result<()> {
-        Self::unimplemented("StopPodSandbox")
+    async fn stop_pod_sandbox(&self, id: &str) -> Result<()> {
+        self.stop_sandbox(id).await
     }
 
-    async fn remove_pod_sandbox(&self, _id: &str) -> Result<()> {
-        Self::unimplemented("RemovePodSandbox")
+    async fn remove_pod_sandbox(&self, id: &str) -> Result<()> {
+        self.remove_sandbox(id).await
     }
 
     async fn pod_sandbox_status(&self, id: &str) -> Result<PodSandboxStatus> {
-        Err(Error::NotFound(format!("sandbox {id} not found")))
+        self.sandbox_status(id).await
     }
 
-    async fn list_pod_sandbox(&self, _filter: Option<PodSandboxFilter>) -> Result<Vec<PodSandbox>> {
-        Ok(Vec::new())
+    async fn list_pod_sandbox(&self, filter: Option<PodSandboxFilter>) -> Result<Vec<PodSandbox>> {
+        self.list_sandboxes(filter).await
     }
 
     // ---- container lifecycle: B3 ----------------------------------------

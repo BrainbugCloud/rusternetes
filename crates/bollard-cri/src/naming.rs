@@ -12,12 +12,15 @@
 //! ```
 //!
 //! Kubernetes object names cannot contain `_`, so splitting on it is safe.
+//! A 7th part is tolerated when parsing: [`randomize_name`] appends a random
+//! suffix to work around Docker's stale-name-index bug (cri-dockerd
+//! `randomizeName`).
 
 use cri_proto::v1::{ContainerMetadata, PodSandboxMetadata};
 use cri_server::error::{Error, Result};
 
 const PREFIX: &str = "k8s";
-const SANDBOX_INFRA_NAME: &str = "POD";
+pub const SANDBOX_INFRA_NAME: &str = "POD";
 
 pub fn sandbox_name(meta: &PodSandboxMetadata) -> String {
     format!(
@@ -26,6 +29,7 @@ pub fn sandbox_name(meta: &PodSandboxMetadata) -> String {
     )
 }
 
+#[allow(dead_code)] // used from B3 on (app containers)
 pub fn container_name(meta: &ContainerMetadata, sandbox_meta: &PodSandboxMetadata) -> String {
     format!(
         "{PREFIX}_{}_{}_{}_{}_{}",
@@ -33,11 +37,22 @@ pub fn container_name(meta: &ContainerMetadata, sandbox_meta: &PodSandboxMetadat
     )
 }
 
+/// Randomize a container name after a create conflict against a container
+/// that no longer exists (Docker name-index bug).
+pub fn randomize_name(name: &str) -> String {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("{name}_{nonce:08x}")
+}
+
 fn parts(name: &str) -> Result<Vec<&str>> {
     // Docker inspect/list prefixes names with '/'.
     let name = name.strip_prefix('/').unwrap_or(name);
     let parts: Vec<&str> = name.split('_').collect();
-    if parts.len() != 6 || parts[0] != PREFIX {
+    // 7 parts = randomized suffix (tolerated, see randomize_name).
+    if !(parts.len() == 6 || parts.len() == 7) || parts[0] != PREFIX {
         return Err(Error::Internal(format!(
             "container name {name:?} is not CRI-managed"
         )));
@@ -60,6 +75,7 @@ pub fn parse_sandbox_name(name: &str) -> Result<PodSandboxMetadata> {
     })
 }
 
+#[allow(dead_code)] // used from B3 on (app containers)
 pub fn parse_container_name(name: &str) -> Result<ContainerMetadata> {
     let parts = parts(name)?;
     if parts[1] == SANDBOX_INFRA_NAME {
@@ -91,7 +107,10 @@ mod tests {
         let name = sandbox_name(&sandbox_meta());
         assert_eq!(name, "k8s_POD_web_default_uid-1234_2");
         assert_eq!(parse_sandbox_name(&name).unwrap(), sandbox_meta());
-        assert_eq!(parse_sandbox_name("/k8s_POD_web_default_uid-1234_2").unwrap(), sandbox_meta());
+        assert_eq!(
+            parse_sandbox_name("/k8s_POD_web_default_uid-1234_2").unwrap(),
+            sandbox_meta()
+        );
     }
 
     #[test]
@@ -104,6 +123,12 @@ mod tests {
         assert_eq!(name, "k8s_app_web_default_uid-1234_0");
         assert_eq!(parse_container_name(&name).unwrap(), meta);
         assert!(parse_sandbox_name(&name).is_err());
+    }
+
+    #[test]
+    fn tolerates_randomized_suffix() {
+        let name = randomize_name(&sandbox_name(&sandbox_meta()));
+        assert_eq!(parse_sandbox_name(&name).unwrap(), sandbox_meta());
     }
 
     #[test]

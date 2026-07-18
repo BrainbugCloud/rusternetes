@@ -18,12 +18,13 @@ CRI-on-Docker decision; port the decisions, not the code.
   - [x] Full `ImageBackend`: list (name filter via inspect), status (uid/username from image `User`), pull (streamed, auth mapping, tag/digest ref split), remove (cri-dockerd untag-per-tag, no force, idempotent 404, in-use → FailedPrecondition), fs-info via `df()` + daemon root dir
   - [x] Acceptance: `crictl info|pull|images|inspecti|rmi|imagefsinfo` green against the podman machine (macOS) and Docker 28.2.2 (lima VM); **critest `Image Manager` focus: 10/10 pass on Docker/Linux** (JUnit in VM `/tmp/critest-bollard-image.xml`)
   - Lifecycle RPCs answer `Unimplemented` until B2/B3 (lists return empty)
-- [ ] **B2 — sandbox lifecycle**
-  - [ ] Pause container mapping, naming scheme, labels
-  - [ ] Checkpoint store (port mappings, host-network), create→checkpoint→start order
-  - [ ] resolv.conf rewrite, host-network mode, pod IP reporting
-  - [ ] Idempotent stop/remove, create-conflict recovery
-  - [ ] Acceptance: critest `PodSandbox` focus green; crictl round-trip; kill -9 recovery test
+- [x] **B2 — sandbox lifecycle** *(2026-07-18)*
+  - [x] Pause container mapping, naming scheme (randomized-suffix tolerant), labels; cgroup-driver-aware cgroup parent (`GenerateExpectedCgroupParent` port — systemd driver gets the bare slice name)
+  - [x] Checkpoint store at `--root-dir/sandbox/` (port mappings, host-network, pod metadata), create→checkpoint→start order; checkpoint-only sandboxes listed NOTREADY, reaped on stop/remove
+  - [x] resolv.conf rewrite (verified: host-network sandbox + cluster DNS), host-network mode (no IP reported, NODE namespaces), pod IP from `NetworkSettings` (top-level, then per-network endpoints, IPv4 first)
+  - [x] Idempotent stop/remove (404→Ok, 304 already-stopped→Ok); create-conflict recovery verified against a squatting stale container (Docker + Podman conflict-message parsing)
+  - [x] Acceptance: **critest `PodSandbox` focus 7/7 green** on Docker 28.2.2 (lima VM, JUnit `/tmp/critest-bollard-podsandbox.xml` + session scratchpad) — the 2 `sysctls` specs are skipped: they exec `sysctl` in an app container and land with B3; crictl runp/pods/inspectp/stopp/rmp round-trip; kill -9 mid-lifecycle + restart → `crictl pods` consistent, rmp cleans container **and** checkpoint
+  - Note: `crictl rmp` on a checkpoint-only sandbox fails in crictl itself (it calls PodSandboxStatus first → NotFound; cri-dockerd behaves identically). The kubelet path (List→Stop→Remove) works: `stopp` of a vanished sandbox drops the checkpoint.
 - [ ] **B3 — container lifecycle + logs**
   - [ ] Create/start/stop/remove/list/status with filters
   - [ ] env/mounts/devices/security-context mapping

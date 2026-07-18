@@ -7,8 +7,8 @@
 //! pulls stream (progress discarded), removal is idempotent.
 
 use async_trait::async_trait;
-use bollard::image::{CreateImageOptions, ListImagesOptions, RemoveImageOptions};
 use bollard::auth::DockerCredentials;
+use bollard::image::{CreateImageOptions, ListImagesOptions, RemoveImageOptions};
 use cri_proto::v1::*;
 use cri_server::error::{Error, Result};
 use cri_server::ImageBackend;
@@ -46,9 +46,7 @@ fn parse_image_user(user: &str) -> (Option<Int64Value>, String) {
 }
 
 fn real_repo_tags(tags: Vec<String>) -> Vec<String> {
-    tags.into_iter()
-        .filter(|t| !t.contains("<none>"))
-        .collect()
+    tags.into_iter().filter(|t| !t.contains("<none>")).collect()
 }
 
 impl BollardBackend {
@@ -84,7 +82,11 @@ impl ImageBackend for BollardBackend {
         // A name filter is served through inspect so the result carries
         // uid/username like ImageStatus does.
         if let Some(spec) = filter.and_then(|f| f.image).filter(|s| !s.image.is_empty()) {
-            return Ok(self.inspect_to_cri_image(&spec.image).await?.into_iter().collect());
+            return Ok(self
+                .inspect_to_cri_image(&spec.image)
+                .await?
+                .into_iter()
+                .collect());
         }
         let summaries = self
             .docker
@@ -182,8 +184,7 @@ impl ImageBackend for BollardBackend {
             {
                 Ok(_) => {}
                 Err(bollard::errors::Error::DockerResponseServerError {
-                    status_code: 404,
-                    ..
+                    status_code: 404, ..
                 }) => {}
                 Err(bollard::errors::Error::DockerResponseServerError {
                     status_code: 409,
@@ -202,8 +203,14 @@ impl ImageBackend for BollardBackend {
     async fn image_fs_info(&self) -> Result<Vec<FilesystemUsage>> {
         // Best effort (plan 03): total image bytes from the daemon's data
         // usage, mountpoint from the daemon's root dir.
-        let info = self.docker.info().await.map_err(|e| docker_err("info", e))?;
-        let mountpoint = info.docker_root_dir.unwrap_or_else(|| "/var/lib/docker".to_string());
+        let info = self
+            .docker
+            .info()
+            .await
+            .map_err(|e| docker_err("info", e))?;
+        let mountpoint = info
+            .docker_root_dir
+            .unwrap_or_else(|| "/var/lib/docker".to_string());
         let df = self.docker.df().await.map_err(|e| docker_err("df", e))?;
         let (used, inodes) = df
             .images
