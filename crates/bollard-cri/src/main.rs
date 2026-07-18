@@ -9,6 +9,8 @@ mod images;
 mod logs;
 mod naming;
 mod sandbox;
+mod stats;
+mod streaming;
 
 use std::sync::Arc;
 
@@ -68,9 +70,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // containers from each CRI log file's last record.
     backend.resume_log_relays().await;
 
-    // Streaming (exec/attach/portforward) is wired in plan 03-B4; until then
-    // the RPCs answer Unimplemented (no registry configured).
-    let service = CriService::new(backend);
+    // Writable-layer sizes for container stats are refreshed off the hot
+    // path (Docker's size inspection is slow — cri-dockerd caches too).
+    backend.spawn_disk_usage_refresh();
+
+    let streaming = cri_server::streaming::start(&args.streaming_bind, backend.clone()).await?;
+    let service = CriService::new(backend).with_streaming(streaming);
 
     let shutdown = async {
         let _ = tokio::signal::ctrl_c().await;

@@ -54,6 +54,26 @@ fn container_mode(sandbox_id: &str) -> String {
     format!("container:{sandbox_id}")
 }
 
+/// `inspect_exec` can briefly report `Running` after the stream closes;
+/// retry a few times, then give up with exit code 0 (cri-dockerd). Shared by
+/// `ExecSync` here and the streaming `Exec` (see [`crate::streaming`]).
+pub(crate) async fn exec_exit_code(docker: &bollard::Docker, exec_id: &str) -> Result<i32> {
+    for attempt in 0..EXEC_INSPECT_RETRIES {
+        let inspect = docker
+            .inspect_exec(exec_id)
+            .await
+            .map_err(|e| docker_err("inspect exec", e))?;
+        if inspect.running != Some(true) {
+            return Ok(inspect.exit_code.unwrap_or_default() as i32);
+        }
+        if attempt + 1 < EXEC_INSPECT_RETRIES {
+            tokio::time::sleep(EXEC_INSPECT_INTERVAL).await;
+        }
+    }
+    tracing::error!(exec = %exec_id, "exec stream ended but process still running");
+    Ok(0)
+}
+
 /// CRI env `KeyValue`s → Docker `K=V` strings (values are bytes on the wire
 /// since CRI v1.36; Docker env wants UTF-8).
 fn env_list(envs: &[KeyValue]) -> Vec<String> {
@@ -312,6 +332,19 @@ fn propagation_from_docker(propagation: Option<&str>) -> MountPropagation {
         Some("rslave") | Some("slave") => MountPropagation::PropagationHostToContainer,
         _ => MountPropagation::PropagationPrivate,
     }
+}
+
+/// Kubernetes working set: memory usage minus the inactive (reclaimable)
+/// file cache, clamped at zero — the number the kubelet evicts on. The
+/// inactive-file counter's name differs between cgroup v1 and v2 stats.
+fn working_set_bytes(memory: &bollard::container::MemoryStats) -> u64 {
+    let usage = memory.usage.unwrap_or_default();
+    let inactive_file = match &memory.stats {
+        Some(bollard::container::MemoryStatsStats::V1(v1)) => v1.total_inactive_file,
+        Some(bollard::container::MemoryStatsStats::V2(v2)) => v2.inactive_file,
+        None => 0,
+    };
+    usage.saturating_sub(inactive_file)
 }
 
 fn summary_state(state: Option<&str>) -> ContainerState {
@@ -798,7 +831,7 @@ impl BollardBackend {
             collect.await?
         };
 
-        let exit_code = self.exec_exit_code(&exec.id).await?;
+        let exit_code = exec_exit_code(&self.docker, &exec.id).await?;
         Ok(ExecSyncResult {
             stdout,
             stderr,
@@ -820,27 +853,7 @@ impl BollardBackend {
         }
     }
 
-    /// `inspect_exec` can briefly report `Running` after the stream closes;
-    /// retry a few times, then give up with exit code 0 (cri-dockerd).
-    async fn exec_exit_code(&self, exec_id: &str) -> Result<i32> {
-        for attempt in 0..EXEC_INSPECT_RETRIES {
-            let inspect = self
-                .docker
-                .inspect_exec(exec_id)
-                .await
-                .map_err(|e| docker_err("inspect exec", e))?;
-            if inspect.running != Some(true) {
-                return Ok(inspect.exit_code.unwrap_or_default() as i32);
-            }
-            if attempt + 1 < EXEC_INSPECT_RETRIES {
-                tokio::time::sleep(EXEC_INSPECT_INTERVAL).await;
-            }
-        }
-        tracing::error!(exec = %exec_id, "exec stream ended but process still running");
-        Ok(0)
-    }
-
-    // ---- stats (basic; the rootfs size cache is plan 03 B5) ----------------
+    // ---- stats (see also the rootfs size cache in stats.rs, plan 03 B5) ----
 
     pub(crate) async fn app_container_stats(&self, id: &str) -> Result<ContainerStats> {
         let containers = self
@@ -901,6 +914,15 @@ impl BollardBackend {
             .ok_or_else(|| Error::Internal(format!("no stats for container {}", container.id)))?
             .map_err(|e| docker_err("container stats", e))?;
 
+        // The writable-layer size comes from the cache (Docker's size
+        // inspection is too slow for the stats cadence); a fresh container
+        // pays one inline fetch that also primes its entry.
+        let writable_layer = match self.disk_usage.get(&container.id) {
+            Some(layer) => layer,
+            None => self.disk_usage.fetch(&self.docker, &container.id).await,
+        };
+        let mountpoint = self.docker_root_dir().await;
+
         let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
         Ok(ContainerStats {
             attributes: Some(ContainerAttributes {
@@ -911,6 +933,8 @@ impl BollardBackend {
             }),
             cpu: Some(CpuUsage {
                 timestamp,
+                // Docker reports total_usage in nanoseconds on both cgroup
+                // v1 and v2 (v2's usage_usec is scaled by the daemon).
                 usage_core_nano_seconds: Some(UInt64Value {
                     value: stats.cpu_stats.cpu_usage.total_usage,
                 }),
@@ -919,7 +943,15 @@ impl BollardBackend {
             memory: Some(MemoryUsage {
                 timestamp,
                 working_set_bytes: Some(UInt64Value {
-                    value: stats.memory_stats.usage.unwrap_or_default(),
+                    value: working_set_bytes(&stats.memory_stats),
+                }),
+                ..Default::default()
+            }),
+            writable_layer: Some(FilesystemUsage {
+                timestamp: writable_layer.timestamp,
+                fs_id: Some(FilesystemIdentifier { mountpoint }),
+                used_bytes: Some(UInt64Value {
+                    value: writable_layer.used_bytes,
                 }),
                 ..Default::default()
             }),
@@ -1230,6 +1262,31 @@ mod tests {
             propagation_from_docker(None),
             MountPropagation::PropagationPrivate
         );
+    }
+
+    #[test]
+    fn working_set_subtracts_inactive_file() {
+        // MemoryStatsStats has no Default; deserialize the daemon's wire
+        // shapes instead (the enum is untagged, keyed on the field names).
+        let v2: bollard::container::MemoryStats = serde_json::from_value(serde_json::json!({
+            "usage": 1000u64,
+            "stats": { "anon": 1, "file": 2, "kernel_stack": 0, "slab": 0, "sock": 0,
+                       "shmem": 0, "file_mapped": 0, "file_dirty": 0, "file_writeback": 0,
+                       "anon_thp": 0, "inactive_anon": 0, "active_anon": 0,
+                       "inactive_file": 300u64, "active_file": 0, "unevictable": 0,
+                       "slab_reclaimable": 0, "slab_unreclaimable": 0, "pgfault": 0,
+                       "pgmajfault": 0, "workingset_refault": 0, "workingset_activate": 0,
+                       "workingset_nodereclaim": 0, "pgrefill": 0, "pgscan": 0, "pgsteal": 0,
+                       "pgactivate": 0, "pgdeactivate": 0, "pglazyfree": 0, "pglazyfreed": 0,
+                       "thp_fault_alloc": 0, "thp_collapse_alloc": 0 }
+        }))
+        .unwrap();
+        assert_eq!(working_set_bytes(&v2), 700);
+
+        // Inactive file larger than usage clamps at zero.
+        let no_stats: bollard::container::MemoryStats =
+            serde_json::from_value(serde_json::json!({ "usage": 42u64 })).unwrap();
+        assert_eq!(working_set_bytes(&no_stats), 42);
     }
 
     #[test]

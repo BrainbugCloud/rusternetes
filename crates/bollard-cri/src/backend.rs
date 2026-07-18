@@ -36,6 +36,12 @@ pub struct BollardBackend {
     /// Live CRI log relays, one per started container.
     pub(crate) log_relays: crate::logs::LogRelays,
     pub(crate) pod_cidr: Mutex<Option<String>>,
+    /// Writable-layer sizes for container stats, refreshed in the
+    /// background (see [`crate::stats`], plan 03 B5).
+    pub(crate) disk_usage: std::sync::Arc<crate::stats::DiskUsageCache>,
+    /// The daemon's root directory (`docker info`), cached: it is the
+    /// filesystem id stats and image-fs info report.
+    pub(crate) docker_root: tokio::sync::OnceCell<String>,
 }
 
 /// Connect to a Docker Engine API endpoint (unix socket path or `unix://`).
@@ -79,7 +85,30 @@ impl BollardBackend {
             systemd_cgroup: tokio::sync::OnceCell::new(),
             log_relays: crate::logs::LogRelays::new(),
             pod_cidr: Mutex::new(None),
+            disk_usage: std::sync::Arc::new(crate::stats::DiskUsageCache::default()),
+            docker_root: tokio::sync::OnceCell::new(),
         })
+    }
+
+    /// Start the background writable-layer size sweep (see [`crate::stats`]).
+    pub(crate) fn spawn_disk_usage_refresh(&self) {
+        self.disk_usage.spawn_refresh(self.docker.clone());
+    }
+
+    /// The daemon's root directory, fetched once; the conventional default
+    /// when `docker info` is unavailable.
+    pub(crate) async fn docker_root_dir(&self) -> String {
+        self.docker_root
+            .get_or_init(|| async {
+                self.docker
+                    .info()
+                    .await
+                    .ok()
+                    .and_then(|info| info.docker_root_dir)
+                    .unwrap_or_else(|| "/var/lib/docker".to_string())
+            })
+            .await
+            .clone()
     }
 
     pub async fn docker_version_banner(&self) -> Result<String> {
