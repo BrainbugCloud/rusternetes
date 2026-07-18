@@ -4,7 +4,9 @@
 //! bollard — the cri-dockerd shape in Rust (see `plan/03-bollard-cri.md`).
 
 mod backend;
+mod container;
 mod images;
+mod logs;
 mod naming;
 mod sandbox;
 
@@ -61,6 +63,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(banner) => tracing::info!(docker = %banner, "connected to Docker Engine API"),
         Err(e) => tracing::warn!("Docker Engine API not reachable yet: {e}"),
     }
+
+    // Log relays don't survive a shim restart; resume them for running
+    // containers from each CRI log file's last record.
+    backend.resume_log_relays().await;
 
     // Streaming (exec/attach/portforward) is wired in plan 03-B4; until then
     // the RPCs answer Unimplemented (no registry configured).

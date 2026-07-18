@@ -2,10 +2,11 @@
 
 //! `BollardBackend`: the CRI backend over the Docker Engine API.
 //!
-//! Stages B1–B2 (plan 03): runtime info, full image manager, and the pod
-//! sandbox lifecycle (see [`crate::sandbox`]). The container lifecycle lands
-//! in B3 and currently answers `Unimplemented` (lists return empty so
-//! read-only clients keep working).
+//! Stages B1–B3 (plan 03): runtime info, full image manager, the pod sandbox
+//! lifecycle (see [`crate::sandbox`]), and the container lifecycle with the
+//! CRI log relay (see [`crate::container`], [`crate::logs`]). Streaming
+//! exec/attach/portforward land in B4; until then those RPCs answer
+//! `Unimplemented`.
 
 use std::path::PathBuf;
 
@@ -32,6 +33,8 @@ pub struct BollardBackend {
     /// Whether the daemon uses the systemd cgroup driver (cached from the
     /// first `docker info`); decides the cgroup-parent syntax.
     pub(crate) systemd_cgroup: tokio::sync::OnceCell<bool>,
+    /// Live CRI log relays, one per started container.
+    pub(crate) log_relays: crate::logs::LogRelays,
     pub(crate) pod_cidr: Mutex<Option<String>>,
 }
 
@@ -74,6 +77,7 @@ impl BollardBackend {
             config,
             checkpoints,
             systemd_cgroup: tokio::sync::OnceCell::new(),
+            log_relays: crate::logs::LogRelays::new(),
             pod_cidr: Mutex::new(None),
         })
     }
@@ -90,12 +94,6 @@ impl BollardBackend {
             version.version.unwrap_or_default(),
             version.api_version.unwrap_or_default(),
         ))
-    }
-
-    fn unimplemented<T>(what: &str) -> Result<T> {
-        Err(Error::Unimplemented(format!(
-            "{what} is not implemented yet (bollard-cri plan 03 B3+)"
-        )))
     }
 }
 
@@ -176,68 +174,69 @@ impl RuntimeBackend for BollardBackend {
         self.list_sandboxes(filter).await
     }
 
-    // ---- container lifecycle: B3 ----------------------------------------
+    // ---- container lifecycle (B3, see container.rs) -----------------------
 
     async fn create_container(
         &self,
-        _sandbox_id: &str,
-        _config: ContainerConfig,
-        _sandbox_config: PodSandboxConfig,
+        sandbox_id: &str,
+        config: ContainerConfig,
+        sandbox_config: PodSandboxConfig,
     ) -> Result<String> {
-        Self::unimplemented("CreateContainer")
+        self.create_app_container(sandbox_id, config, sandbox_config)
+            .await
     }
 
-    async fn start_container(&self, _id: &str) -> Result<()> {
-        Self::unimplemented("StartContainer")
+    async fn start_container(&self, id: &str) -> Result<()> {
+        self.start_app_container(id).await
     }
 
-    async fn stop_container(&self, _id: &str, _timeout_secs: i64) -> Result<()> {
-        Self::unimplemented("StopContainer")
+    async fn stop_container(&self, id: &str, timeout_secs: i64) -> Result<()> {
+        self.stop_app_container(id, timeout_secs).await
     }
 
-    async fn remove_container(&self, _id: &str) -> Result<()> {
-        Self::unimplemented("RemoveContainer")
+    async fn remove_container(&self, id: &str) -> Result<()> {
+        self.remove_app_container(id).await
     }
 
-    async fn list_containers(&self, _filter: Option<ContainerFilter>) -> Result<Vec<Container>> {
-        Ok(Vec::new())
+    async fn list_containers(&self, filter: Option<ContainerFilter>) -> Result<Vec<Container>> {
+        self.list_app_containers(filter).await
     }
 
     async fn container_status(&self, id: &str) -> Result<ContainerStatus> {
-        Err(Error::NotFound(format!("container {id} not found")))
+        self.app_container_status(id).await
     }
 
     async fn update_container_resources(
         &self,
-        _id: &str,
-        _resources: LinuxContainerResources,
+        id: &str,
+        resources: LinuxContainerResources,
     ) -> Result<()> {
-        Self::unimplemented("UpdateContainerResources")
+        self.update_app_container_resources(id, resources).await
     }
 
     async fn exec_sync(
         &self,
-        _id: &str,
-        _cmd: &[String],
-        _timeout_secs: i64,
+        id: &str,
+        cmd: &[String],
+        timeout_secs: i64,
     ) -> Result<ExecSyncResult> {
-        Self::unimplemented("ExecSync")
+        self.exec_sync_in_container(id, cmd, timeout_secs).await
     }
 
-    // ---- stats: B5 --------------------------------------------------------
+    // ---- stats (basic in B3; rootfs size cache in B5) ----------------------
 
-    async fn container_stats(&self, _id: &str) -> Result<ContainerStats> {
-        Self::unimplemented("ContainerStats")
+    async fn container_stats(&self, id: &str) -> Result<ContainerStats> {
+        self.app_container_stats(id).await
     }
 
     async fn list_container_stats(
         &self,
-        _filter: Option<ContainerStatsFilter>,
+        filter: Option<ContainerStatsFilter>,
     ) -> Result<Vec<ContainerStats>> {
-        Ok(Vec::new())
+        self.list_app_container_stats(filter).await
     }
 
-    async fn reopen_container_log(&self, _id: &str) -> Result<()> {
-        Self::unimplemented("ReopenContainerLog")
+    async fn reopen_container_log(&self, id: &str) -> Result<()> {
+        self.reopen_app_container_log(id).await
     }
 }

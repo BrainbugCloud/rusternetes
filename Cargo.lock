@@ -882,6 +882,7 @@ dependencies = [
  "cri-proto",
  "cri-server",
  "futures-util",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

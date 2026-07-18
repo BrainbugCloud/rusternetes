@@ -45,7 +45,7 @@ const SANDBOX_OOM_SCORE_ADJ: i64 = -998;
 /// Termination grace for the pause container (cri-dockerd).
 const SANDBOX_STOP_GRACE_SECS: i64 = 10;
 /// Docker namespace-mode value for host namespaces.
-const MODE_HOST: &str = "host";
+pub(crate) const MODE_HOST: &str = "host";
 
 /// Per-sandbox state Docker cannot hold for us, persisted at RunPodSandbox
 /// (before start) and read back for list/teardown after a shim restart.
@@ -157,7 +157,7 @@ fn conflicting_container_id(message: &str) -> Option<&str> {
         .find(|token| token.len() >= 12)
 }
 
-fn rfc3339_to_nanos(ts: Option<&str>) -> i64 {
+pub(crate) fn rfc3339_to_nanos(ts: Option<&str>) -> i64 {
     ts.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .and_then(|dt| dt.timestamp_nanos_opt())
         .unwrap_or_default()
@@ -310,7 +310,7 @@ impl BollardBackend {
 
         let name = naming::sandbox_name(&metadata);
         let id = self
-            .create_with_conflict_recovery(&name, create_config)
+            .create_with_conflict_recovery(&name, create_config, "sandbox")
             .await?;
 
         // Order matters: create → checkpoint → start, so a crash between
@@ -376,6 +376,7 @@ impl BollardBackend {
             .map_err(|e| docker_err("list sandbox containers", e))?;
         for member in members {
             if let Some(cid) = member.id {
+                self.log_relays.stop(&cid);
                 self.remove_container_force(&cid).await?;
             }
         }
@@ -579,7 +580,10 @@ impl BollardBackend {
     /// Cgroup parent in the syntax the daemon's cgroup driver expects (port
     /// of cri-dockerd `GenerateExpectedCgroupParent`): the systemd driver
     /// wants a bare `*.slice` name, not a cgroupfs path like `/test.slice`.
-    async fn expected_cgroup_parent(&self, cgroup_parent: &str) -> Result<Option<String>> {
+    pub(crate) async fn expected_cgroup_parent(
+        &self,
+        cgroup_parent: &str,
+    ) -> Result<Option<String>> {
         if cgroup_parent.is_empty() {
             return Ok(None);
         }
@@ -630,10 +634,12 @@ impl BollardBackend {
     /// Create a container; on a name conflict remove the stale holder and
     /// retry, randomizing the name if Docker's name index is out of sync
     /// (port of cri-dockerd `recoverFromCreationConflictIfNeeded`).
-    async fn create_with_conflict_recovery(
+    /// `what` labels errors ("sandbox" / "container").
+    pub(crate) async fn create_with_conflict_recovery(
         &self,
         name: &str,
         config: DockerConfig<String>,
+        what: &str,
     ) -> Result<String> {
         let create = |name: String, config: DockerConfig<String>| {
             let docker = self.docker.clone();
@@ -656,12 +662,12 @@ impl BollardBackend {
                 status_code: 409,
                 message,
             }) => message,
-            Err(e) => return Err(docker_err("create sandbox", e)),
+            Err(e) => return Err(docker_err(&format!("create {what}"), e)),
         };
 
         let Some(stale) = conflicting_container_id(&message) else {
             return Err(Error::Internal(format!(
-                "create sandbox: docker 409: {message}"
+                "create {what}: docker 409: {message}"
             )));
         };
         tracing::warn!(container = %stale, name, "create conflict; removing stale container");
@@ -693,10 +699,10 @@ impl BollardBackend {
         create(retry_name, config)
             .await
             .map(|resp| resp.id)
-            .map_err(|e| docker_err("create sandbox (retry)", e))
+            .map_err(|e| docker_err(&format!("create {what} (retry)"), e))
     }
 
-    async fn remove_container_force(&self, id: &str) -> Result<()> {
+    pub(crate) async fn remove_container_force(&self, id: &str) -> Result<()> {
         match self
             .docker
             .remove_container(

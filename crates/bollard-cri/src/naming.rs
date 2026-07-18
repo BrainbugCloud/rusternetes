@@ -29,7 +29,6 @@ pub fn sandbox_name(meta: &PodSandboxMetadata) -> String {
     )
 }
 
-#[allow(dead_code)] // used from B3 on (app containers)
 pub fn container_name(meta: &ContainerMetadata, sandbox_meta: &PodSandboxMetadata) -> String {
     format!(
         "{PREFIX}_{}_{}_{}_{}_{}",
@@ -75,7 +74,6 @@ pub fn parse_sandbox_name(name: &str) -> Result<PodSandboxMetadata> {
     })
 }
 
-#[allow(dead_code)] // used from B3 on (app containers)
 pub fn parse_container_name(name: &str) -> Result<ContainerMetadata> {
     let parts = parts(name)?;
     if parts[1] == SANDBOX_INFRA_NAME {

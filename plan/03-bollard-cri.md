@@ -25,17 +25,18 @@ CRI-on-Docker decision; port the decisions, not the code.
   - [x] Idempotent stop/remove (404→Ok, 304 already-stopped→Ok); create-conflict recovery verified against a squatting stale container (Docker + Podman conflict-message parsing)
   - [x] Acceptance: **critest `PodSandbox` focus 7/7 green** on Docker 28.2.2 (lima VM, JUnit `/tmp/critest-bollard-podsandbox.xml` + session scratchpad) — the 2 `sysctls` specs are skipped: they exec `sysctl` in an app container and land with B3; crictl runp/pods/inspectp/stopp/rmp round-trip; kill -9 mid-lifecycle + restart → `crictl pods` consistent, rmp cleans container **and** checkpoint
   - Note: `crictl rmp` on a checkpoint-only sandbox fails in crictl itself (it calls PodSandboxStatus first → NotFound; cri-dockerd behaves identically). The kubelet path (List→Stop→Remove) works: `stopp` of a vanished sandbox drops the checkpoint.
-- [ ] **B3 — container lifecycle + logs**
-  - [ ] Create/start/stop/remove/list/status with filters
-  - [ ] env/mounts/devices/security-context mapping
-  - [ ] CRI log relay (design a) + `ReopenContainerLog`
-  - [ ] Acceptance: critest `Container` focus green incl. log assertions; `crictl logs` == `docker logs`
+- [x] **B3 — container lifecycle + logs** *(2026-07-18)*
+  - [x] Create/start/stop/remove/list/status with filters (metadata, state, sandbox-id, label selector); update_container_resources; conflict recovery shared with sandboxes
+  - [x] env/mounts/devices/CDI/security-context mapping (user/groups, capabilities, privileged, seccomp incl. Localhost profile with privileged `sethostname` filter, apparmor both fields, masked/readonly paths, per-option PID mode); mount propagation mapped both ways (status echoes it — the propagation specs cri-dockerd skips in CI pass here)
+  - [x] CRI log relay (design a): per-container tokio task follows `docker logs` with daemon timestamps → `CriLogWriter`; `ReopenContainerLog` is synchronous (relay acks after recreating the file — cri-dockerd's symlink design can't support this spec at all); kill -9 + restart resumes from the file's last record with line-exact dedupe (verified: ticks 1–38, 0 dups, 0 missing across a restart)
+  - [x] Pulled forward: `exec_sync` (critest `Container` focus needs it — B4 keeps only the streaming variants) with 16 MiB cap + timeout → DeadlineExceeded; deviation: the timed-out exec process is SIGKILLed by host PID (cri-dockerd leaves it running and skips that spec). Basic container stats (Container focus asserts them — B5 keeps the rootfs size cache): cpu total_usage / memory usage per cri-dockerd, bounded fan-out for list.
+  - [x] Acceptance: **critest `Container` focus 30/30 green** on Docker 28.2.2 (lima VM, JUnit `/tmp/critest-bollard-container.xml` + session scratchpad); **`PodSandbox` focus now 9/9** (the 2 sysctls specs deferred from B2 pass); `crictl logs` == `docker logs` **byte-for-byte** (stdout with trailing partial line, stderr) for a multi-line two-stream workload
 - [ ] **B4 — streaming**
-  - [ ] exec_stream / attach_stream / exec_sync (16 MiB cap, timeout)
+  - [ ] exec_stream / attach_stream (exec_sync landed in B3)
   - [ ] `dial_in_sandbox` via setns (Linux)
   - [ ] Acceptance: critest `Streaming` focus green; interactive `crictl exec -it`; portforward to localhost-bound server
 - [ ] **B5 — stats + full suite**
-  - [ ] container_stats / list_container_stats with rootfs size cache
+  - [ ] rootfs/writable-layer size cache for container_stats (basic cpu/memory stats landed in B3)
   - [ ] `ImageFsInfo` verified against critest
   - [ ] Acceptance: full critest v1.36.0 zero failures on Docker/Linux; Podman divergences in PODMAN.md
 - [ ] **B6 — cluster integration (macOS workflow restored)**

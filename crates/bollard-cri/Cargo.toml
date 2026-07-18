@@ -24,6 +24,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# SIGKILL for timed-out exec processes (see container.rs exec_sync).
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
