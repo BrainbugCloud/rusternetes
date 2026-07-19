@@ -21,7 +21,7 @@
 //! container.
 
 pub(crate) mod channels;
-pub(crate) mod spdy;
+pub mod spdy;
 
 use std::collections::HashMap;
 use std::pin::Pin;

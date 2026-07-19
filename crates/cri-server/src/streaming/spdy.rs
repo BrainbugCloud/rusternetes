@@ -111,7 +111,7 @@ pub(crate) static SPDY_DICTIONARY: &[u8] = &[
 // SPDY/3 frame constants.
 const SPDY_CONTROL_BIT: u8 = 0x80;
 const SPDY_FLAG_FIN: u8 = 0x01;
-const TYPE_SYN_STREAM: u16 = 1;
+pub(crate) const TYPE_SYN_STREAM: u16 = 1;
 const TYPE_SYN_REPLY: u16 = 2;
 const TYPE_RST_STREAM: u16 = 3;
 const TYPE_PING: u16 = 6;
@@ -120,11 +120,11 @@ const TYPE_GOAWAY: u16 = 7;
 /// The largest chunk of container output written in a single SPDY data
 /// frame. Comfortably below the default 64 KiB flow-control window, so the
 /// tiny payloads the conformance suite moves never need a `WINDOW_UPDATE`.
-pub(crate) const MAX_DATA_CHUNK: usize = 16 * 1024;
+pub const MAX_DATA_CHUNK: usize = 16 * 1024;
 
 /// The frames this server reacts to; everything else is consumed and
 /// ignored.
-pub(crate) enum Frame {
+pub enum Frame {
     SynStream {
         stream_id: u32,
         headers: Vec<u8>,
@@ -148,7 +148,7 @@ fn u24(bytes: &[u8]) -> usize {
     ((bytes[0] as usize) << 16) | ((bytes[1] as usize) << 8) | bytes[2] as usize
 }
 
-pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
+pub async fn read_frame<R: AsyncRead + Unpin>(
     read: &mut R,
 ) -> std::io::Result<Option<Frame>> {
     let mut head = [0u8; 8];
@@ -206,13 +206,13 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
 /// The write side of a SPDY connection: owns the socket and the single
 /// zlib deflate context shared by every outgoing header block. Wrapped in a
 /// mutex so the concurrent output pumps serialise their frames.
-pub(crate) struct SpdyWriter<W> {
+pub struct SpdyWriter<W> {
     write: W,
     compress: Compress,
 }
 
 impl<W: AsyncWrite + Unpin> SpdyWriter<W> {
-    pub(crate) fn new(write: W) -> Self {
+    pub fn new(write: W) -> Self {
         let mut compress = Compress::new(Compression::default(), true);
         // The dictionary must be installed before the first byte is produced.
         let _ = compress.set_dictionary(SPDY_DICTIONARY);
@@ -221,7 +221,7 @@ impl<W: AsyncWrite + Unpin> SpdyWriter<W> {
 
     /// Compress a name/value header block, continuing the connection's shared
     /// deflate stream (flushed per block so the peer can inflate it alone).
-    pub(crate) fn compress_headers(&mut self, pairs: &[(&str, &str)]) -> Vec<u8> {
+    pub fn compress_headers(&mut self, pairs: &[(&str, &str)]) -> Vec<u8> {
         let mut raw = Vec::new();
         raw.extend_from_slice(&(pairs.len() as u32).to_be_bytes());
         for (name, value) in pairs {
@@ -277,7 +277,27 @@ impl<W: AsyncWrite + Unpin> SpdyWriter<W> {
         self.write_control(TYPE_SYN_REPLY, 0, &payload).await
     }
 
-    pub(crate) async fn data(
+    /// Open a new client-initiated stream (`SYN_STREAM`) carrying the given
+    /// name/value header block. Used by SPDY *clients* (e.g. the api-server
+    /// proxying exec/attach/portforward to a kubelet); the server replies with
+    /// `SYN_REPLY`. The SPDY/3 SYN_STREAM data layout is
+    /// `stream_id(4) | assoc_stream_id(4) | pri+unused(1) | slot(1) | headers`.
+    pub async fn syn_stream(
+        &mut self,
+        stream_id: u32,
+        pairs: &[(&str, &str)],
+    ) -> std::io::Result<()> {
+        let headers = self.compress_headers(pairs);
+        let mut payload = Vec::with_capacity(10 + headers.len());
+        payload.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
+        payload.extend_from_slice(&0u32.to_be_bytes()); // associated-to-stream-id
+        payload.push(0); // priority (top 3 bits) + unused
+        payload.push(0); // slot
+        payload.extend_from_slice(&headers);
+        self.write_control(TYPE_SYN_STREAM, 0, &payload).await
+    }
+
+    pub async fn data(
         &mut self,
         stream_id: u32,
         fin: bool,
@@ -297,18 +317,18 @@ impl<W: AsyncWrite + Unpin> SpdyWriter<W> {
         self.write.flush().await
     }
 
-    pub(crate) async fn rst_stream(&mut self, stream_id: u32, status: u32) -> std::io::Result<()> {
+    pub async fn rst_stream(&mut self, stream_id: u32, status: u32) -> std::io::Result<()> {
         let mut payload = [0u8; 8];
         payload[0..4].copy_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
         payload[4..8].copy_from_slice(&status.to_be_bytes());
         self.write_control(TYPE_RST_STREAM, 0, &payload).await
     }
 
-    pub(crate) async fn ping(&mut self, id: u32) -> std::io::Result<()> {
+    pub async fn ping(&mut self, id: u32) -> std::io::Result<()> {
         self.write_control(TYPE_PING, 0, &id.to_be_bytes()).await
     }
 
-    pub(crate) async fn goaway(&mut self) -> std::io::Result<()> {
+    pub async fn goaway(&mut self) -> std::io::Result<()> {
         self.write_control(TYPE_GOAWAY, 0, &[0u8; 8]).await
     }
 }
