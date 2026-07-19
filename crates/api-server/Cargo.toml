@@ -24,7 +24,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("pprof", "
 [dependencies]
 rusternetes-common = { path = "../common", features = ["axum-support"] }
 rusternetes-storage = { path = "../storage" }
-openssl-sys = { version = "0.9", features = ["vendored"] }
+# SPDY streaming codec (client side) for exec/attach/portforward — the one
+# maintained SPDY-for-k8s implementation; see plan/10-get-rid-of-spdy.md.
+cri-server = { path = "../cri-server" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -52,7 +54,7 @@ indexmap = "2.14"
 tokio-tungstenite = "0.21"
 bytes = "1.5"
 get_if_addrs = "0.5"
-prometheus-http-query = "0.8"
+prometheus-http-query = { version = "0.8", default-features = false, features = ["rustls-tls"] }
 url = "2.5.8"
 cel.workspace = true
 sha2 = "0.10"

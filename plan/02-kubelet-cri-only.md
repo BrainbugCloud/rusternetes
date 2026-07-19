@@ -8,13 +8,69 @@ ready, the kubelet is developed and tested against **containerd in a lima VM**
 
 ## Status
 
-- [ ] K1 — inventory + scaffolding (no behavior change)
-- [ ] K2 — sandbox + container lifecycle on CRI
-- [ ] K3 — statuses, init/ephemeral containers, GC
-- [ ] K4 — logs pipeline end to end
-- [ ] K5 — exec / attach / portforward streaming
-- [ ] K6 — stats, eviction, bollard removal
-- [ ] K7 — conformance re-baseline
+K1–K6 are **code-complete and the workspace compiles clean** (`cargo check
+--workspace` green, 2026-07-19). Bollard is fully gone from the kubelet
+(`grep -r bollard crates/kubelet/src` → 0). First live bring-up against
+containerd (all-in-one binary, lima VM) on 2026-07-19 runtime-verified the pod
+lifecycle and log pipeline; it also surfaced that **K5 streaming is broken** and
+kube-proxy breaks node networking. See [test-matrix.md](test-matrix.md) config 1.
+
+- [x] K1 — inventory + scaffolding (no behavior change) — `cri-proto` dep +
+  `--container-runtime-endpoint`/`--image-service-endpoint` config; generated
+  [`plan/k1-inventory.md`](k1-inventory.md)
+- [x] K2 — sandbox + container lifecycle on CRI — `runtime.rs` on
+  `RuntimeServiceClient`/`ImageServiceClient` (`cri.rs`). **Runtime-verified:**
+  `kubectl apply` → sandbox + image pull + container `Running`, real CNI pod IP
+  (10.88.0.3), container visible in `crictl ps`
+- [x] K3 — statuses, init/ephemeral containers, GC on CRI types
+  *(runtime-unverified — init/ephemeral/GC paths not yet exercised)*
+- [x] K4 — logs pipeline end to end — kubelet `/containerLogs/...` endpoint
+  (`server.rs`) via `CriLogReader`; api-server `log` subresource proxies to the
+  kubelet; `generate_pod_logs` + fallback deleted; node-proxy route wired.
+  **Runtime-verified:** `kubectl logs` + `kubectl logs -f` return real stdout;
+  CRI log file on disk in correct format (`…Z stdout F HELLO_FROM_CRI`)
+- [x] K5 — exec / attach / portforward streaming — **FIXED & runtime-verified
+  2026-07-19** by rewriting the api-server SPDY client onto
+  `cri-server::streaming::spdy` (`SpdyWriter` + `read_frame`) — no more
+  hand-rolled SPDY. Fixes applied in `crates/api-server/src/streaming.rs`:
+  1. **v4 negotiation** — dial the SPDY leg with `v4.channel.k8s.io` (v5 is
+     WebSocket-only; the runtime's SPDY server refused v5 → the original
+     `close 1005`).
+  2. **Correct remotecommand stream model** — create `error`+stdin+stdout+stderr
+     +resize streams with **zlib-compressed** `streamtype` headers, client-odd
+     IDs in creation order (the old codec sent *uncompressed* headers, so
+     containerd never learned the stream types → no output).
+  3. **v4 exit-code parse** — read the error-stream `metav1.Status`
+     (`details.causes[] reason=ExitCode`).
+  4. **Proper close** — end the WebSocket with a normal-closure (1000) frame
+     (`Close(None)` was reported as `close 1005`).
+  5. **v5 stdin half-close** — handle the channel-255 close signal so
+     `kubectl exec -i` terminates.
+  - **Verified on containerd:** stdout (`rc=0`), stderr demux, exit-code
+    propagation (`exit 3` → `rc=3`), `exec -i` stdin (`rc=0`), `exec -it`
+    (rc=0), **20/20 loop with zero `close 1005` and zero hangs**; `kubectl logs`
+    unaffected. Attach shares the same `proxy_remotecommand` path.
+    Port-forward was ported to the same codec (data/error streams with a `port`
+    header) but is **not yet runtime-verified** — see [cleanup-tasks.md](cleanup-tasks.md).
+- [x] K6 — stats, eviction, bollard removal — `eviction.rs` on
+  `ListContainerStats`; `bollard` removed from the kubelet crate
+  *(stats/eviction runtime-unverified)*
+- [ ] K7 — conformance re-baseline *(blocked on K5 + kube-proxy networking; see
+  test-matrix.md)*
+
+### Additional runtime findings (2026-07-19 first bring-up)
+
+- **kube-proxy blackholes node networking:** with kube-proxy enabled the
+  all-in-one's iptables `nat` rules broke the VM's outbound DNS/connectivity
+  (image pulls + DNS failed until `iptables -t nat -F`). Ran with
+  `--disable-proxy` to verify the CRI path. Must be fixed before Services /
+  sonobuoy (the sonobuoy aggregator itself needs Service networking).
+- **Node registers `kubernetes.io/arch=amd64` on an arm64 node** (hardcoded in
+  `register_node`); harmless for multi-arch images, wrong for arch-sensitive
+  conformance/scheduling.
+- Environment (not code): containerd needed CNI plugins+config; VM `protoc`
+  needed upgrading to 29.3 (`debug_redact`); all-in-one build needed
+  `openssl-sys`/`native-tls` dropped in favour of rustls.
 
 ## Current state (from coupling analysis)
 

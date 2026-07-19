@@ -5,11 +5,12 @@
 Checked = stage acceptance criteria met (see per-plan Status sections for detail).
 
 - [x] **01 `cri-proto` / `cri-server`** — [x] S1 · [x] S2 · [x] S3 · [x] S4 *(done 2026-07-17)*
-- [ ] **02 kubelet CRI-only** — [ ] K1 · [ ] K2 · [ ] K3 · [ ] K4 · [ ] K5 · [ ] K6 · [ ] K7
-- [ ] **03 `bollard-cri`** — [x] B1 · [ ] B2 · [ ] B3 · [ ] B4 · [ ] B5 · [ ] B6
+- [ ] **02 kubelet CRI-only** — [x] K1 · [x] K2 · [x] K3 · [x] K4 · [x] K5 · [x] K6 · [ ] K7 *(K2/K4/K5 runtime-verified on containerd — exec stdout/stderr/exit-code/stdin + 20× no-1005; K7 blocked on kube-proxy networking)*
+- [ ] **03 `bollard-cri`** — [x] B1 · [x] B2 · [x] B3 · [x] B4 · [x] B5 · [ ] B6
 - [ ] **04 `apple-cri` (CLI)** — [ ] A1 · [ ] A2 · [ ] A3 · [ ] A4 · [ ] A5
 - [ ] **05 `apple-cri` XPC migration** — [ ] X1 · [ ] X2 · [ ] X3 · [ ] X4 · [ ] X5
 - [ ] **06 testing/environments** — [ ] lima VM config checked in · [ ] critest harness scripted · [ ] CI wiring
+- [ ] **10 get rid of SPDY** — [ ] G1 · [ ] G2 · [ ] G3 · [ ] G4 · [ ] G5 *(SPDY as a default-on, deprecate-able crate feature; runtimes not WS-ready — see [10](10-get-rid-of-spdy.md))*
 
 Rusternetes' kubelet currently drives Docker/Podman directly through bollard.
 This plan set redesigns the kubelet to speak **only the Kubernetes CRI**

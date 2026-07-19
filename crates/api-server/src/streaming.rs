@@ -1,129 +1,53 @@
-//! WebSocket↔SPDY streaming for exec, attach, and port-forward
+//! WebSocket↔SPDY streaming for exec, attach, and port-forward.
 //!
-//! When the api-server receives a WebSocket request from kubectl,
-//! it opens a SPDY connection to the kubelet streaming server and
-//! translates between the two protocols:
+//! When the api-server receives a WebSocket request from kubectl, it opens a
+//! SPDY connection to the kubelet streaming server and translates between the
+//! two protocols:
 //!
-//!   kubectl ──WS──▶ api-server ──SPDY──▶ kubelet:10250 ──SPDY──▶ CRI runtime
+//!   kubectl ──WS(v5)──▶ api-server ──SPDY(v4)──▶ kubelet:10251 ──SPDY──▶ CRI runtime
 //!
-//! WS v5.channel.k8s.io frames map to SPDY DATA frames:
-//!   WS ch0 (stdin)  → SPDY stream 1
-//!   WS ch4 (resize) → SPDY stream 4
-//!   SPDY stdout     → WS ch1
-//!   SPDY stderr     → WS ch2
-//!   SPDY error      → WS ch3 (JSON status)
+//! The SPDY framing/zlib codec is reused from `cri-server::streaming::spdy`
+//! (the one maintained SPDY-for-Kubernetes implementation — see
+//! plan/10-get-rid-of-spdy.md); this module only implements the *remotecommand
+//! client* on top of it and the WebSocket-channel ↔ SPDY-stream translation.
+//!
+//! Remotecommand SPDY protocol (what the CRI runtime's server expects):
+//!   - the client creates every stream via SYN_STREAM with a `streamtype`
+//!     header: `error` (always, created first), then `stdin`/`stdout`/`stderr`
+//!     as requested, and `resize` when a TTY is used (no separate `stderr`
+//!     under a TTY). Stream IDs are client-odd, in creation order.
+//!   - stdout/stderr data arrive as DATA frames on their streams.
+//!   - the exit code arrives as a `metav1.Status` on the `error` stream, closed
+//!     with FIN (empty FIN = exit 0).
+//!
+//! WebSocket channel bytes (kubectl ↔ api-server): ch0 stdin, ch1 stdout,
+//! ch2 stderr, ch3 error/status, ch4 resize.
 
-use axum::extract::ws::{Message, WebSocket};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use axum::extract::ws::{CloseFrame, Message, WebSocket};
+use cri_server::streaming::spdy::{read_frame, Frame, SpdyWriter};
 use futures::{SinkExt, StreamExt};
 use rusternetes_common::resources::Pod;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 use tracing::{debug, error, info};
 
-// ── SPDY constants (subset needed for client-side streaming proxy) ──
+// ── SPDY upgrade handshake ─────────────────────────────────────────────
 
-/// SPDY/3 control frame bit
-const SPDY_CTRL_BIT: u8 = 0x80;
-
-/// SPDY/3 version [0x00, 0x03]
-const SPDY_VERSION: u16 = 3;
-
-/// Frame types
-const TYPE_DATA: u8 = 0; // not a real type, used as marker
-const TYPE_SYN_STREAM: u16 = 1;
-const TYPE_RST_STREAM: u16 = 3;
-const TYPE_GOAWAY: u16 = 7;
-
-/// Flags
-const FLAG_FIN: u8 = 0x01;
-
-/// SPDY stream IDs used to talk to the kubelet.
-/// These map to WebSocket channel IDs as follows:
-///   WS ch0 (stdin)  → SPDY stream 1
-///   WS ch4 (resize) → SPDY stream 4
-///   Kubelet stdout   → SPDY stream 2 → WS ch1
-///   Kubelet stderr   → SPDY stream 3 → WS ch2
-///   Kubelet error    → SPDY stream (anything) → WS ch3
-const STDIN_STREAM: u32 = 1;
-const STDOUT_STREAM: u32 = 2;
-const STDERR_STREAM: u32 = 3;
-const RESIZE_STREAM: u32 = 4;
-
-/// Write a SPDY control frame.
-async fn write_ctrl(
-    w: &mut (impl AsyncWriteExt + Unpin),
-    frame_type: u16,
-    flags: u8,
-    payload: &[u8],
-) -> std::io::Result<()> {
-    let mut head = [0u8; 8];
-    head[0] = SPDY_CTRL_BIT;
-    head[1] = SPDY_VERSION as u8;
-    head[2..4].copy_from_slice(&frame_type.to_be_bytes());
-    head[4] = flags;
-    let len = payload.len();
-    head[5] = (len >> 16) as u8;
-    head[6] = (len >> 8) as u8;
-    head[7] = len as u8;
-    w.write_all(&head).await?;
-    w.write_all(payload).await?;
-    w.flush().await
-}
-
-/// Write a SPDY DATA frame.
-async fn write_data_frame(
-    w: &mut (impl AsyncWriteExt + Unpin),
-    stream_id: u32,
-    fin: bool,
-    payload: &[u8],
-) -> std::io::Result<()> {
-    let mut head = [0u8; 8];
-    head[0..4].copy_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
-    head[4] = if fin { FLAG_FIN } else { 0 };
-    let len = payload.len();
-    head[5] = (len >> 16) as u8;
-    head[6] = (len >> 8) as u8;
-    head[7] = len as u8;
-    w.write_all(&head).await?;
-    if !payload.is_empty() {
-        w.write_all(payload).await?;
-    }
-    w.flush().await
-}
-
-/// Write a SPDY SYN_STREAM frame. Headers are raw name/value pairs
-/// each with a 4-byte-length prefix.
-async fn write_syn_stream(
-    w: &mut (impl AsyncWriteExt + Unpin),
-    stream_id: u32,
-    pairs: &[(&str, &str)],
-) -> std::io::Result<()> {
-    // Build COMPRESSED header block: count(4) + each: name_len(4)+name+val_len(4)+val
-    let mut hdr = Vec::new();
-    hdr.extend_from_slice(&(pairs.len() as u32).to_be_bytes());
-    for (n, v) in pairs {
-        hdr.extend_from_slice(&(n.len() as u32).to_be_bytes());
-        hdr.extend_from_slice(n.as_bytes());
-        hdr.extend_from_slice(&(v.len() as u32).to_be_bytes());
-        hdr.extend_from_slice(v.as_bytes());
-    }
-    // SYN_STREAM payload: stream_id(4) | assoc(4) | pri+slot(1+1) | headers
-    let mut payload = Vec::with_capacity(10 + hdr.len());
-    payload.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
-    payload.extend_from_slice(&[0u8; 4]); // associated-to-stream-id
-    payload.push(0); // priority + unused
-    payload.push(0); // slot
-    payload.extend_from_slice(&hdr);
-    write_ctrl(w, TYPE_SYN_STREAM, 0, &payload).await
-}
-
-/// Connect to the kubelet streaming server, perform the SPDY handshake,
-/// and return the TcpStream ready for frame relay.
-async fn kubelet_spdy_connect(
-    addr: &str,
-    path: &str,
-) -> anyhow::Result<TcpStream> {
-    let mut sock = TcpStream::connect(addr).await
+/// Connect to the kubelet streaming server and perform the HTTP/1.1 → SPDY/3.1
+/// upgrade, returning the raw stream positioned right after the `101` response.
+///
+/// The SPDY transport tops out at `v4.channel.k8s.io` — `v5` is WebSocket-only
+/// (it adds the stdin-CLOSE signal). kubectl↔api-server speaks `v5` over
+/// WebSocket; this SPDY leg to the kubelet/CRI runtime must advertise `v4`, or
+/// the runtime's SPDY streaming server refuses to negotiate and never sends the
+/// `101` upgrade response.
+async fn kubelet_spdy_connect(addr: &str, path: &str) -> anyhow::Result<TcpStream> {
+    let mut sock = TcpStream::connect(addr)
+        .await
         .map_err(|e| anyhow::anyhow!("TCP connect to kubelet {addr}: {e}"))?;
 
     let req = format!(
@@ -131,13 +55,15 @@ async fn kubelet_spdy_connect(
          Host: {addr}\r\n\
          Upgrade: SPDY/3.1\r\n\
          Connection: Upgrade\r\n\
-         X-Stream-Protocol-Version: v5.channel.k8s.io\r\n\
+         X-Stream-Protocol-Version: v4.channel.k8s.io\r\n\
          \r\n"
     );
-    sock.write_all(req.as_bytes()).await
+    sock.write_all(req.as_bytes())
+        .await
         .map_err(|e| anyhow::anyhow!("SPDY upgrade write: {e}"))?;
 
-    // Read 101 response byte-by-byte
+    // Read the 101 response one byte at a time so no SPDY frame bytes past the
+    // blank line are consumed.
     let mut resp = Vec::with_capacity(512);
     let mut b = [0u8; 1];
     loop {
@@ -160,73 +86,260 @@ async fn kubelet_spdy_connect(
     Ok(sock)
 }
 
-/// Read one byte-precise from the socket (for header parsing).
-async fn read_exact(
-    r: &mut (impl AsyncReadExt + Unpin),
-    buf: &mut [u8],
-) -> std::io::Result<()> {
-    let mut offset = 0;
-    while offset < buf.len() {
-        let n = r.read(&mut buf[offset..]).await?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "connection closed",
-            ));
+// ── exit-status helpers ─────────────────────────────────────────────────
+
+/// Parse an exit code out of a `metav1.Status` written to the error stream
+/// (v4 protocol). Non-zero codes live in `details.causes[]` with
+/// `reason: "ExitCode"`; a `Failure` without one maps to 1.
+fn parse_exit_code(payload: &[u8]) -> Option<i32> {
+    let v: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    if let Some(causes) = v.pointer("/details/causes").and_then(|c| c.as_array()) {
+        for cause in causes {
+            if cause.get("reason").and_then(|r| r.as_str()) == Some("ExitCode") {
+                if let Some(code) = cause
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .and_then(|s| s.parse::<i32>().ok())
+                {
+                    return Some(code);
+                }
+            }
         }
-        offset += n;
     }
-    Ok(())
-}
-
-/// Read a full SPDY frame (control or data) from a socket.
-/// Returns (is_data, stream_id, fin, payload).
-/// For control frames, stream_id/fin are meaningless but payload contains
-/// the control frame body.
-async fn read_spdy_raw(
-    r: &mut (impl AsyncReadExt + Unpin),
-) -> std::io::Result<Option<(bool, u32, bool, Vec<u8>)>> {
-    let mut head = [0u8; 8];
-    match r.read_exact(&mut head).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-
-    if head[0] & SPDY_CTRL_BIT != 0 {
-        // Control frame
-        let _frame_type = u16::from_be_bytes([head[2], head[3]]);
-        let len = ((head[5] as usize) << 16) | ((head[6] as usize) << 8) | (head[7] as usize);
-        let mut payload = vec![0u8; len];
-        read_exact(r, &mut payload).await?;
-        Ok(Some((false, 0, false, payload)))
-    } else {
-        // Data frame
-        let stream_id = u32::from_be_bytes([head[0] & 0x7f, head[1], head[2], head[3]]);
-        let fin = (head[4] & FLAG_FIN) != 0;
-        let len = ((head[5] as usize) << 16) | ((head[6] as usize) << 8) | (head[7] as usize);
-        let mut payload = vec![0u8; len];
-        read_exact(r, &mut payload).await?;
-        Ok(Some((true, stream_id, fin, payload)))
+    match v.get("status").and_then(|s| s.as_str()) {
+        Some("Failure") => Some(1),
+        _ => Some(0),
     }
 }
 
-/// Handle WebSocket exec by proxying to kubelet streaming server.
-/// Implements the Kubernetes `v5.channel.k8s.io` protocol:
-///   ch0 = stdin (client→server)
-///   ch1 = stdout (server→client)
-///   ch2 = stderr (server→client)
-///   ch3 = status (server→client, JSON)
-///   ch4 = resize (client→server)
-///
-/// Maps WS channels ↔ SPDY streams:
-///   ch0 → spdy stream 1,  ch4 → spdy stream 4
-///   spdy stream 2 → ch1,  spdy stream 3 → ch2
+fn success_status_json() -> String {
+    r#"{"metadata":{},"status":"Success"}"#.to_string()
+}
+
+/// A WebSocket close frame with an explicit normal-closure (1000) status code.
+/// kubectl reports a status-less close as `websocket: close 1005 (no status)`
+/// and treats it as an error, so every stream must end with this.
+fn normal_close() -> Message {
+    Message::Close(Some(CloseFrame {
+        code: 1000,
+        reason: std::borrow::Cow::Borrowed(""),
+    }))
+}
+
+fn failure_status_json(code: i32) -> String {
+    format!(
+        r#"{{"metadata":{{}},"status":"Failure","message":"command terminated with exit code {code}","reason":"NonZeroExitCode","details":{{"causes":[{{"reason":"ExitCode","message":"{code}"}}]}}}}"#
+    )
+}
+
+/// Send a `Failure` status on WS channel 3 and close, used when the SPDY
+/// upgrade itself fails before any streaming can start.
+async fn fail_socket(mut socket: WebSocket, message: &str) {
+    let mut err = vec![3u8];
+    let json = format!(
+        r#"{{"metadata":{{}},"status":"Failure","message":"{}"}}"#,
+        message.replace('"', "'")
+    );
+    err.extend_from_slice(json.as_bytes());
+    let _ = socket.send(Message::Binary(err)).await;
+    let _ = socket.close().await;
+}
+
+// ── shared exec/attach remotecommand client ─────────────────────────────
+
+/// Core exec/attach proxy: dial the kubelet over SPDY, create the
+/// remotecommand streams, and shuttle bytes between the kubelet's SPDY streams
+/// and the client's WebSocket channels until the error stream closes.
+#[allow(clippy::too_many_arguments)]
+async fn proxy_remotecommand(
+    socket: WebSocket,
+    kubelet_addr: String,
+    path: String,
+    stdin: bool,
+    stdout: bool,
+    stderr: bool,
+    tty: bool,
+    is_v1_protocol: bool,
+    label: &str,
+) {
+    let backend = match kubelet_spdy_connect(&kubelet_addr, &path).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("WS {label}: SPDY connect failed: {e}");
+            fail_socket(socket, &e.to_string()).await;
+            return;
+        }
+    };
+
+    let (mut read_half, write_half) = tokio::io::split(backend);
+    let writer = Arc::new(Mutex::new(SpdyWriter::new(write_half)));
+
+    // Allocate client-odd stream IDs in creation order (error first).
+    let mut next = 1u32;
+    let mut alloc = || {
+        let id = next;
+        next += 2;
+        id
+    };
+    let error_id = alloc();
+    let stdin_id = stdin.then(&mut alloc);
+    let stdout_id = stdout.then(&mut alloc);
+    // Under a TTY there is no demultiplexed stderr; the client sends resize.
+    let stderr_id = (stderr && !tty).then(&mut alloc);
+    let resize_id = tty.then(&mut alloc);
+
+    {
+        let mut w = writer.lock().await;
+        if let Err(e) = w.syn_stream(error_id, &[("streamtype", "error")]).await {
+            drop(w);
+            error!("WS {label}: failed to open error stream: {e}");
+            fail_socket(socket, &e.to_string()).await;
+            return;
+        }
+        if let Some(id) = stdin_id {
+            let _ = w.syn_stream(id, &[("streamtype", "stdin")]).await;
+        }
+        if let Some(id) = stdout_id {
+            let _ = w.syn_stream(id, &[("streamtype", "stdout")]).await;
+        }
+        if let Some(id) = stderr_id {
+            let _ = w.syn_stream(id, &[("streamtype", "stderr")]).await;
+        }
+        if let Some(id) = resize_id {
+            let _ = w.syn_stream(id, &[("streamtype", "resize")]).await;
+        }
+    }
+
+    let (mut ws_sender, mut ws_receiver) = socket.split();
+
+    // Client → kubelet: WS ch0 (stdin) and ch4 (resize) → SPDY DATA frames.
+    let stdin_task = {
+        let writer = writer.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = ws_receiver.next().await {
+                match msg {
+                    Ok(Message::Binary(data)) if !data.is_empty() => {
+                        let ch = data[0];
+                        let payload = &data[1..];
+                        match ch {
+                            0 => {
+                                if let Some(id) = stdin_id {
+                                    let mut w = writer.lock().await;
+                                    // Empty ch0 frame = v5 stdin-close signal.
+                                    if payload.is_empty() {
+                                        let _ = w.data(id, true, &[]).await;
+                                    } else {
+                                        let _ = w.data(id, false, payload).await;
+                                    }
+                                }
+                            }
+                            4 => {
+                                if let Some(id) = resize_id {
+                                    let mut w = writer.lock().await;
+                                    let _ = w.data(id, false, payload).await;
+                                }
+                            }
+                            255 => {
+                                // v5.channel.k8s.io stream-close signal: the
+                                // payload names the channel being closed. kubectl
+                                // sends `[255, 0]` on stdin EOF — half-close the
+                                // stdin SPDY stream so the process sees EOF.
+                                if payload.first() == Some(&0) {
+                                    if let Some(id) = stdin_id {
+                                        let mut w = writer.lock().await;
+                                        let _ = w.data(id, true, &[]).await;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(Message::Close(_)) | Err(_) => {
+                        if let Some(id) = stdin_id {
+                            let mut w = writer.lock().await;
+                            let _ = w.data(id, true, &[]).await;
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+    };
+
+    // Kubelet → client: SPDY DATA frames → WS channels; error stream FIN ends it.
+    let mut exit_code: Option<i32> = None;
+    loop {
+        match read_frame(&mut read_half).await {
+            Ok(Some(Frame::Data {
+                stream_id,
+                fin,
+                payload,
+            })) => {
+                if Some(stream_id) == stdout_id {
+                    if !payload.is_empty() {
+                        let mut f = vec![1u8];
+                        f.extend_from_slice(&payload);
+                        if ws_sender.send(Message::Binary(f)).await.is_err() {
+                            break;
+                        }
+                    }
+                } else if Some(stream_id) == stderr_id {
+                    if !payload.is_empty() {
+                        let mut f = vec![2u8];
+                        f.extend_from_slice(&payload);
+                        if ws_sender.send(Message::Binary(f)).await.is_err() {
+                            break;
+                        }
+                    }
+                } else if stream_id == error_id {
+                    if !payload.is_empty() {
+                        exit_code = parse_exit_code(&payload);
+                    }
+                    if fin {
+                        // The runtime writes the status last, after all output.
+                        break;
+                    }
+                }
+            }
+            Ok(Some(Frame::GoAway)) | Ok(None) => break,
+            // SYN_REPLY / PING / RST_STREAM / others: ignore.
+            Ok(Some(_)) => continue,
+            Err(_) => break,
+        }
+    }
+
+    let code = exit_code.unwrap_or(0);
+    debug!("WS {label}: done, exit_code={code}");
+    if !is_v1_protocol || code != 0 {
+        let status_json = if code == 0 {
+            success_status_json()
+        } else {
+            failure_status_json(code)
+        };
+        let mut status = vec![3u8];
+        status.extend_from_slice(status_json.as_bytes());
+        let _ = ws_sender.send(Message::Binary(status)).await;
+    }
+    let _ = ws_sender.send(normal_close()).await;
+    stdin_task.abort();
+}
+
+/// Extract a boolean query flag (`name=true`/`name=1`) from a raw query string.
+fn query_flag(query: &str, name: &str) -> bool {
+    query.split('&').any(|pair| {
+        matches!(pair.split_once('='), Some((k, v)) if k == name && (v == "true" || v == "1"))
+    })
+}
+
+// ── public handlers (invoked from pod_subresources) ─────────────────────
+
+/// Handle a WebSocket `exec` by proxying to the kubelet streaming server.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_exec_websocket_via_kubelet(
-    mut socket: WebSocket,
+    socket: WebSocket,
     kubelet_addr: String,
-    _pod: Pod,
+    pod: Pod,
     container_name: String,
     command: Vec<String>,
     stdin: bool,
@@ -235,339 +348,219 @@ pub async fn handle_exec_websocket_via_kubelet(
     tty: bool,
     is_v1_protocol: bool,
 ) {
-    info!("WS exec → kubelet {kubelet_addr} for {container_name} cmd={command:?}");
+    let namespace = pod
+        .metadata
+        .namespace
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
 
-    // Build kubelet exec path
     let mut query = String::new();
     for cmd in &command {
-        if !query.is_empty() { query.push('&'); }
+        if !query.is_empty() {
+            query.push('&');
+        }
         query.push_str(&format!("command={}", urlencode(cmd)));
     }
-    if stdin { query.push_str("&stdin=true"); }
-    if stdout { query.push_str("&stdout=true"); }
-    if stderr { query.push_str("&stderr=true"); }
-    if tty { query.push_str("&tty=true"); }
+    if stdin {
+        query.push_str("&stdin=true");
+    }
+    if stdout {
+        query.push_str("&stdout=true");
+    }
+    if stderr {
+        query.push_str("&stderr=true");
+    }
+    if tty {
+        query.push_str("&tty=true");
+    }
     query.push_str(&format!("&container={}", urlencode(&container_name)));
 
-    let path = format!("/exec/default/{}/{}?{}", _pod.metadata.name, container_name, query);
-    debug!("WS exec: connecting to kubelet at {kubelet_addr}{path}");
+    let path = format!(
+        "/exec/{}/{}/{}?{}",
+        namespace, pod.metadata.name, container_name, query
+    );
+    info!("WS exec → kubelet {kubelet_addr}{path} cmd={command:?}");
 
-    // Connect to kubelet via SPDY
-    let backend = match kubelet_spdy_connect(&kubelet_addr, &path).await {
+    proxy_remotecommand(
+        socket,
+        kubelet_addr,
+        path,
+        stdin,
+        stdout,
+        stderr,
+        tty,
+        is_v1_protocol,
+        "exec",
+    )
+    .await;
+}
+
+/// Handle a WebSocket `attach` by proxying to the kubelet streaming server.
+pub async fn handle_attach_websocket_via_kubelet(
+    socket: WebSocket,
+    kubelet_addr: String,
+    kubelet_path: String,
+) {
+    // Attach flags live in the request query; default to stdout+stderr.
+    let query = kubelet_path.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let stdin = query_flag(query, "stdin") || query_flag(query, "input");
+    let mut stdout = query_flag(query, "stdout");
+    let stderr = query_flag(query, "stderr");
+    let tty = query_flag(query, "tty");
+    if !stdout && !stderr {
+        stdout = true;
+    }
+    info!("WS attach → kubelet {kubelet_addr}{kubelet_path}");
+
+    proxy_remotecommand(
+        socket,
+        kubelet_addr,
+        kubelet_path,
+        stdin,
+        stdout,
+        stderr,
+        tty,
+        false,
+        "attach",
+    )
+    .await;
+}
+
+/// Handle a WebSocket `port-forward` by proxying to the kubelet streaming
+/// server. Per forwarded port the client uses two WS channels — `2*i` (data)
+/// and `2*i+1` (error) — and the runtime expects a SPDY `data`+`error` stream
+/// pair carrying a `port` header.
+pub async fn handle_portforward_websocket_via_kubelet(
+    socket: WebSocket,
+    kubelet_addr: String,
+    kubelet_path: String,
+) {
+    let query = kubelet_path.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let ports: Vec<u16> = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .filter(|(k, _)| *k == "ports" || *k == "port")
+        .flat_map(|(_, v)| v.split(','))
+        .filter_map(|p| p.parse::<u16>().ok())
+        .collect();
+
+    info!("WS portforward → kubelet {kubelet_addr}{kubelet_path} ports={ports:?}");
+    if ports.is_empty() {
+        fail_socket(socket, "no ports specified").await;
+        return;
+    }
+
+    let backend = match kubelet_spdy_connect(&kubelet_addr, &kubelet_path).await {
         Ok(s) => s,
         Err(e) => {
-            error!("WS exec: SPDY connect failed: {e}");
-            let mut err = vec![3u8];
-            let msg = format!(r#"{{"status":"Failure","message":"{}"}}"#, e);
-            err.extend_from_slice(msg.as_bytes());
-            let _ = socket.send(Message::Binary(err)).await;
-            let _ = socket.close().await;
+            error!("WS portforward: SPDY connect failed: {e}");
+            fail_socket(socket, &e.to_string()).await;
             return;
         }
     };
 
-    let (mut backend_read, mut backend_write) = tokio::io::split(backend);
+    let (mut read_half, write_half) = tokio::io::split(backend);
+    let writer = Arc::new(Mutex::new(SpdyWriter::new(write_half)));
+    let (ws_sender, mut ws_receiver) = socket.split();
+    let ws_sender = Arc::new(Mutex::new(ws_sender));
 
-    // Open client→server streams: stdin (stream 1) and resize (stream 4)
-    let _ = write_syn_stream(&mut backend_write, STDIN_STREAM, &[("streamtype", "stdin")]).await;
-    let _ = write_syn_stream(&mut backend_write, RESIZE_STREAM, &[("streamtype", "resize")]).await;
+    // Map SPDY data-stream id → WS data channel, and WS data channel → SPDY id.
+    let mut spdy_to_ws: HashMap<u32, u8> = HashMap::new();
+    let mut ws_to_spdy: HashMap<u8, u32> = HashMap::new();
+    let mut next = 1u32;
 
-    let (mut ws_sender, mut ws_receiver) = socket.split();
+    for (i, port) in ports.iter().enumerate() {
+        let ws_data = (i * 2) as u8;
+        let ws_err = (i * 2 + 1) as u8;
+        let port_str = port.to_string();
+        let error_id = next;
+        next += 2;
+        let data_id = next;
+        next += 2;
+        {
+            let mut w = writer.lock().await;
+            let _ = w
+                .syn_stream(error_id, &[("streamtype", "error"), ("port", &port_str)])
+                .await;
+            let _ = w
+                .syn_stream(data_id, &[("streamtype", "data"), ("port", &port_str)])
+                .await;
+        }
+        spdy_to_ws.insert(data_id, ws_data);
+        ws_to_spdy.insert(ws_data, data_id);
+        // Initial port handshake to the client on both channels (2-byte LE).
+        let pbytes = port.to_le_bytes();
+        let mut s = ws_sender.lock().await;
+        let mut df = vec![ws_data];
+        df.extend_from_slice(&pbytes);
+        let _ = s.send(Message::Binary(df)).await;
+        let mut ef = vec![ws_err];
+        ef.extend_from_slice(&pbytes);
+        let _ = s.send(Message::Binary(ef)).await;
+    }
 
-    // Track whether client disconnected
-    let client_closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let client_closed2 = client_closed.clone();
+    // Track how many leading bytes of the client's port handshake to strip per
+    // data channel (kubectl repeats the 2-byte port as its first data frame).
+    let mut pending_handshake: HashMap<u8, u8> = ws_to_spdy.keys().map(|&c| (c, 2u8)).collect();
 
-    // Spawn task: read WS messages, forward to kubelet via SPDY
-    let client_to_kubelet = {
-        let mut bw = backend_write;
+    // Client → kubelet
+    let c2k = {
+        let writer = writer.clone();
         tokio::spawn(async move {
             while let Some(msg) = ws_receiver.next().await {
                 match msg {
-                    Ok(Message::Close(_)) | Err(_) => {
-                        client_closed2.store(true, std::sync::atomic::Ordering::Relaxed);
-                        let _ = write_data_frame(&mut bw, STDIN_STREAM, true, &[]).await;
-                        break;
-                    }
                     Ok(Message::Binary(data)) if !data.is_empty() => {
                         let ch = data[0];
-                        let payload = &data[1..];
-                        match ch {
-                            0 => {
-                                // stdin
-                                if payload.is_empty() {
-                                    // v5 close-stream signal
-                                    let _ = write_data_frame(&mut bw, STDIN_STREAM, true, &[]).await;
-                                } else {
-                                    let _ = write_data_frame(&mut bw, STDIN_STREAM, false, payload).await;
-                                }
+                        let mut payload = &data[1..];
+                        if let Some(rem) = pending_handshake.get_mut(&ch) {
+                            let skip = (*rem as usize).min(payload.len());
+                            *rem -= skip as u8;
+                            payload = &payload[skip..];
+                            if payload.is_empty() {
+                                continue;
                             }
-                            4 => {
-                                // resize
-                                let _ = write_data_frame(&mut bw, RESIZE_STREAM, false, payload).await;
-                            }
-                            _ => {}
+                        }
+                        if let Some(&data_id) = ws_to_spdy.get(&ch) {
+                            let mut w = writer.lock().await;
+                            let _ = w.data(data_id, false, payload).await;
                         }
                     }
+                    Ok(Message::Close(_)) | Err(_) => break,
                     _ => {}
                 }
             }
         })
     };
 
-    // Read SPDY frames from kubelet, translate to WS channel frames
-    let mut exit_code: Option<i32> = None;
+    // Kubelet → client
     loop {
-        match read_spdy_raw(&mut backend_read).await {
-            Ok(Some((is_data, stream_id, _fin, payload))) => {
-                if !is_data {
-                    // Control frame — could be SYN_REPLY, RST_STREAM, GOAWAY
-                    // For RST_STREAM on stdout/stderr, treat as end of stream
-                    if payload.len() >= 4 {
-                        let rst_id = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) & 0x7fff_ffff;
-                        if rst_id == STDOUT_STREAM || rst_id == STDERR_STREAM {
-                            continue; // stream closed, ignore
+        match read_frame(&mut read_half).await {
+            Ok(Some(Frame::Data {
+                stream_id, payload, ..
+            })) => {
+                if let Some(&ws_ch) = spdy_to_ws.get(&stream_id) {
+                    if !payload.is_empty() {
+                        let mut f = vec![ws_ch];
+                        f.extend_from_slice(&payload);
+                        let mut s = ws_sender.lock().await;
+                        if s.send(Message::Binary(f)).await.is_err() {
+                            break;
                         }
                     }
-                    // Check for GOAWAY
-                    if payload.len() >= 8 {
-                        // last_good_stream + status_code
-                        break;
-                    }
-                    continue;
-                }
-
-                // Map SPDY stream to WS channel
-                let ws_channel: u8 = match stream_id {
-                    STDOUT_STREAM => 1,
-                    STDERR_STREAM => 2,
-                    _ => {
-                        // Unknown or error stream → send as ch3 (error/status)
-                        // Try to parse as JSON exit status
-                        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&payload) {
-                            if let Some(ec) = val.get("exitCode").and_then(|v| v.as_i64()) {
-                                exit_code = Some(ec as i32);
-                            }
-                        }
-                        continue;
-                    }
-                };
-
-                let mut frame = vec![ws_channel];
-                frame.extend_from_slice(&payload);
-                if ws_sender.send(Message::Binary(frame)).await.is_err() {
-                    break;
                 }
             }
-            Ok(None) => {
-                // Connection closed gracefully
-                break;
-            }
-            Err(e) => {
-                if client_closed.load(std::sync::atomic::Ordering::Relaxed) {
-                    break;
-                }
-                error!("WS exec: SPDY read error: {e}");
-                // Check if we got any data before error
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    break;
-                }
-                // Send error on status channel
-                let mut err = vec![3u8];
-                let msg = format!(r#"{{"status":"Failure","message":"{}"}}"#, e);
-                err.extend_from_slice(msg.as_bytes());
-                let _ = ws_sender.send(Message::Binary(err)).await;
-                break;
-            }
-        }
-
-        // Check timeout / client disconnect
-        if client_closed.load(std::sync::atomic::Ordering::Relaxed) {
-            break;
-        }
-    }
-
-    let _ = client_to_kubelet.await;
-
-    // Send exit status on channel 3
-    let code = exit_code.unwrap_or(0);
-    info!("WS exec: done, exit_code={code}");
-    if !is_v1_protocol || code != 0 {
-        let status_json = if code == 0 {
-            r#"{"status":"Success"}"#.to_string()
-        } else {
-            format!(
-                r#"{{"status":"Failure","message":"command terminated with exit code {}","reason":"NonZeroExitCode","details":{{"causes":[{{"reason":"ExitCode","message":"{}"}}]}}}}"#,
-                code, code
-            )
-        };
-        let mut status_data = vec![3u8];
-        status_data.extend_from_slice(status_json.as_bytes());
-        let _ = ws_sender.send(Message::Binary(status_data)).await;
-    }
-    let _ = ws_sender.send(Message::Close(None)).await;
-}
-
-/// Handle WebSocket attach by proxying to kubelet streaming server.
-pub async fn handle_attach_websocket_via_kubelet(
-    mut socket: WebSocket,
-    kubelet_addr: String,
-    kubelet_path: String,
-) {
-    info!("WS attach → kubelet {kubelet_addr}");
-
-    // Connect to kubelet via SPDY using the provided path
-    let backend = match kubelet_spdy_connect(&kubelet_addr, &kubelet_path).await {
-        Ok(s) => s,
-        Err(e) => {
-            error!("WS attach: SPDY connect failed: {e}");
-            let mut err = vec![3u8];
-            let msg = format!(r#"{{"status":"Failure","message":"{}"}}"#, e);
-            err.extend_from_slice(msg.as_bytes());
-            let _ = socket.send(Message::Binary(err)).await;
-            let _ = socket.close().await;
-            return;
-        }
-    };
-
-    let (mut backend_read, mut backend_write) = tokio::io::split(backend);
-
-    // Open stdin and resize streams for attach
-    let _ = write_syn_stream(&mut backend_write, STDIN_STREAM, &[("streamtype", "stdin")]).await;
-    let _ = write_syn_stream(&mut backend_write, RESIZE_STREAM, &[("streamtype", "resize")]).await;
-
-    let (mut ws_sender, mut ws_receiver) = socket.split();
-
-    // Client → kubelet (stdin + resize)
-    let client_closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let c2 = client_closed.clone();
-    tokio::spawn(async move {
-        while let Some(msg) = ws_receiver.next().await {
-            match msg {
-                Ok(Message::Close(_)) | Err(_) => {
-                    c2.store(true, std::sync::atomic::Ordering::Relaxed);
-                    let _ = write_data_frame(&mut backend_write, STDIN_STREAM, true, &[]).await;
-                    break;
-                }
-                Ok(Message::Binary(data)) if !data.is_empty() => {
-                    let ch = data[0];
-                    let payload = &data[1..];
-                    match ch {
-                        0 => {
-                            if payload.is_empty() {
-                                let _ = write_data_frame(&mut backend_write, STDIN_STREAM, true, &[]).await;
-                            } else {
-                                let _ = write_data_frame(&mut backend_write, STDIN_STREAM, false, payload).await;
-                            }
-                        }
-                        4 => {
-                            let _ = write_data_frame(&mut backend_write, RESIZE_STREAM, false, payload).await;
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
-            }
-        }
-    });
-
-    // Kubelet → client (stdout, stderr → WS ch1, ch2)
-    loop {
-        match read_spdy_raw(&mut backend_read).await {
-            Ok(Some((true, stream_id, _fin, payload))) => {
-                let ws_ch = match stream_id {
-                    STDOUT_STREAM => 1u8,
-                    STDERR_STREAM => 2u8,
-                    _ => continue,
-                };
-                let mut frame = vec![ws_ch];
-                frame.extend_from_slice(&payload);
-                if ws_sender.send(Message::Binary(frame)).await.is_err() {
-                    break;
-                }
-            }
-            Ok(None) => break,
-            Ok(Some((false, _, _, _))) => continue, // control frames
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Ok(Some(Frame::GoAway)) | Ok(None) => break,
+            Ok(Some(_)) => continue,
             Err(_) => break,
         }
-        if client_closed.load(std::sync::atomic::Ordering::Relaxed) {
-            break;
-        }
     }
 
-    let _ = ws_sender.send(Message::Close(None)).await;
+    c2k.abort();
+    let mut s = ws_sender.lock().await;
+    let _ = s.send(normal_close()).await;
 }
 
-/// Handle WebSocket port-forward by proxying to kubelet streaming server.
-pub async fn handle_portforward_websocket_via_kubelet(
-    mut socket: WebSocket,
-    kubelet_addr: String,
-    kubelet_path: String,
-) {
-    info!("WS portforward → kubelet {kubelet_addr}");
-
-    let backend = match kubelet_spdy_connect(&kubelet_addr, &kubelet_path).await {
-        Ok(s) => s,
-        Err(e) => {
-            error!("WS portforward: SPDY connect failed: {e}");
-            let mut err = vec![3u8];
-            let msg = format!(r#"{{"status":"Failure","message":"{}"}}"#, e);
-            err.extend_from_slice(msg.as_bytes());
-            let _ = socket.send(Message::Binary(err)).await;
-            let _ = socket.close().await;
-            return;
-        }
-    };
-
-    let (mut ws_sender, mut ws_receiver) = socket.split();
-    let (mut backend_read, mut backend_write) = tokio::io::split(backend);
-
-    // For port-forward, the client sends data on ch0 (stdin) and receives on ch1
-    let client_closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let c2 = client_closed.clone();
-    tokio::spawn(async move {
-        while let Some(msg) = ws_receiver.next().await {
-            match msg {
-                Ok(Message::Close(_)) | Err(_) => {
-                    c2.store(true, std::sync::atomic::Ordering::Relaxed);
-                    break;
-                }
-                Ok(Message::Binary(data)) if !data.is_empty() => {
-                    let ch = data[0];
-                    let payload = &data[1..];
-                    if ch == 0 {
-                        let _ = backend_write.write_all(payload).await;
-                    }
-                }
-                _ => {}
-            }
-        }
-    });
-
-    // Read from kubelet, forward to WS
-    let mut buf = vec![0u8; 16 * 1024];
-    loop {
-        match backend_read.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                let mut frame = vec![1u8]; // stdout channel
-                frame.extend_from_slice(&buf[..n]);
-                if ws_sender.send(Message::Binary(frame)).await.is_err() {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-        if client_closed.load(std::sync::atomic::Ordering::Relaxed) {
-            break;
-        }
-    }
-
-    let _ = ws_sender.send(Message::Close(None)).await;
-}
-
-// ── Backward-compatibility wrappers ──
+// ── Backward-compatibility wrappers ─────────────────────────────────────
 
 /// Backward-compat alias. Routes exec WebSocket to the kubelet.
 #[allow(clippy::too_many_arguments)]
@@ -582,7 +575,15 @@ pub async fn handle_exec_websocket(
     tty: bool,
 ) {
     handle_exec_websocket_with_protocol(
-        socket, pod, container_name, command, stdin, stdout, stderr, tty, false,
+        socket,
+        pod,
+        container_name,
+        command,
+        stdin,
+        stdout,
+        stderr,
+        tty,
+        false,
     )
     .await
 }
@@ -600,22 +601,24 @@ pub async fn handle_exec_websocket_with_protocol(
     tty: bool,
     is_v1_protocol: bool,
 ) {
-    // Build kubelet address from pod info
     let kubelet_addr = match resolve_kubelet_for_pod(&pod).await {
         Ok(a) => a,
         Err(_) => {
-            let mut s = socket;
-            let mut err = vec![3u8];
-            let msg = r#"{"status":"Failure","message":"Failed to resolve kubelet address"}"#;
-            err.extend_from_slice(msg.as_bytes());
-            let _ = s.send(Message::Binary(err)).await;
-            let _ = s.close().await;
+            fail_socket(socket, "Failed to resolve kubelet address").await;
             return;
         }
     };
     handle_exec_websocket_via_kubelet(
-        socket, kubelet_addr, pod, container_name, command,
-        stdin, stdout, stderr, tty, is_v1_protocol,
+        socket,
+        kubelet_addr,
+        pod,
+        container_name,
+        command,
+        stdin,
+        stdout,
+        stderr,
+        tty,
+        is_v1_protocol,
     )
     .await
 }
@@ -630,30 +633,17 @@ pub async fn handle_attach_websocket(
     _stderr: bool,
     _tty: bool,
 ) {
-    // Legacy stub — proper path comes from pod_subresources now
     info!("WS attach (legacy): stub");
-    let mut s = socket;
-    let mut err = vec![3u8];
-    err.extend_from_slice(br#"{"status":"Failure","message":"Attach via kubelet: use via_kubelet endpoint"}"#);
-    let _ = s.send(Message::Binary(err)).await;
-    let _ = s.close().await;
+    fail_socket(socket, "Attach via kubelet: use via_kubelet endpoint").await;
 }
 
 /// Backward-compat alias for port-forward WebSocket.
-pub async fn handle_portforward_websocket(
-    socket: WebSocket,
-    _pod: Pod,
-    _ports: Vec<u16>,
-) {
+pub async fn handle_portforward_websocket(socket: WebSocket, _pod: Pod, _ports: Vec<u16>) {
     info!("WS portforward (legacy): stub");
-    let mut s = socket;
-    let mut err = vec![3u8];
-    err.extend_from_slice(br#"{"status":"Failure","message":"Port-forward via kubelet: use via_kubelet endpoint"}"#);
-    let _ = s.send(Message::Binary(err)).await;
-    let _ = s.close().await;
+    fail_socket(socket, "Port-forward via kubelet: use via_kubelet endpoint").await;
 }
 
-// ── Helpers ──
+// ── Helpers ─────────────────────────────────────────────────────────────
 
 /// Very lightweight percent-encoding for query strings.
 fn urlencode(s: &str) -> String {
@@ -670,8 +660,6 @@ fn urlencode(s: &str) -> String {
 
 /// Resolve kubelet address from a pod (for backward-compat wrappers).
 async fn resolve_kubelet_for_pod(pod: &Pod) -> anyhow::Result<String> {
-    // We can't access storage directly here — use a default
-    // For backward compat, return a placeholder
     let node_name = pod
         .spec
         .as_ref()
