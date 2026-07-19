@@ -117,10 +117,35 @@ fails: `strict decoding error: unknown field "metadata.uid", "spec.hostIPC",
 - **Expect a tail:** conformance will surface more field mismatches one at a
   time; each needs a struct/rename fix + rebuild.
 
+## 8. Kubelet pod-status updates lose to resourceVersion conflicts under load
+
+After #7 was fixed, the sonobuoy quick test advanced but still failed: the test
+pod stayed **Pending in the API** for the 5-min timeout, even though an identical
+pod created standalone reaches `Running` in ~8s (image pulled, sandbox IP,
+container started). Under concurrent conformance load the kubelet log is full of:
+
+    Failed to update pod status after retry: Conflict: resourceVersion mismatch
+       (expected: N, current: N+2)
+
+The kubelet's status-update path gives up after one retry on an optimistic-
+concurrency conflict, so a running pod's status never reaches `Running` in the
+API → every test that waits for a pod to run times out. (A 500 also appeared at
+the moment of failure.)
+
+- **Fix:** make the kubelet status update re-fetch the latest object and re-apply
+  the status patch on `Conflict`, with bounded retries + backoff (or use a
+  status subresource / merge-patch that doesn't require the caller's
+  resourceVersion). This is the **current top conformance blocker** — it gates
+  essentially all pod-lifecycle tests.
+- **Also seen:** kubelet warns `CNI not available, falling back to Podman
+  networking` on the CRI path — a stale pre-CRI code path (pods still get real
+  CNI IPs from containerd); should be removed/quieted on the CRI path.
+
 ## Priority
 
 K5 streaming (done) and #4 kube-proxy (done) were the two original **conformance
-blockers** — both fixed. **#7 (strict decoding) is the current blocker** — it
-fails pod-creating e2e tests, so a full conformance number isn't meaningful until
-it's addressed. #6 items are bringup fixes (worked around for the run). #1/#2/#3/#5
-are lower-priority polish.
+blockers** — both fixed. #7 (strict decoding) — **fixed**, pod creation works.
+**#8 (status-update conflicts) is now the top blocker** — pods run but their
+status doesn't reach `Running` in the API under load, timing out pod-lifecycle
+tests. #6 items are bringup fixes (worked around). #1/#2/#3/#5 are lower-priority
+polish.
