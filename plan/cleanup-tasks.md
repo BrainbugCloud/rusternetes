@@ -72,8 +72,55 @@ are the K5 streaming bug (tracked in plan 02 K5) — these are the side findings
 - **Impact:** likely breaks conformance's `kubernetes` service expectations and
   in-cluster API discovery via `KUBERNETES_SERVICE_HOST`.
 
+## 6. Conformance-bringup gaps found running sonobuoy (2026-07-19)
+
+Sonobuoy runs end-to-end on the containerd cluster (aggregator + e2e plugin +
+results all work). Bringup required these; several are out-of-band workarounds
+that should become code fixes:
+
+- **api-server doesn't persist its self-signed CA.** With `--tls` (self-signed)
+  the CA lives only in memory, so the namespace controller (`namespace.rs`, reads
+  `/etc/kubernetes/pki/ca.crt` or `/root/.rusternetes/certs/ca.crt`) can't
+  publish `kube-root-ca.crt` and the kubelet can't inject `ca.crt` into SA
+  mounts. **Fix:** on self-signed generation, write the CA PEM to
+  `~/.rusternetes/certs/ca.crt` (+ `/etc/kubernetes/pki/ca.crt`). *(Worked around
+  by extracting the serving cert with `openssl s_client` and writing it there.)*
+- **`--kubernetes-service-host` defaults to `127.0.0.1`.** That's a pod's own
+  loopback — regular pods can't reach the API. For a real cluster it must be the
+  `kubernetes` ClusterIP (`10.96.0.1`, port 443). *(Worked around with
+  `--kubernetes-service-host 10.96.0.1`.)* Consider defaulting it to the
+  kubernetes ClusterIP.
+- **CoreDNS Corefile hardcoded `endpoint https://api-server:6443`** (a compose
+  network alias). Fixed in `bootstrap-cluster.yaml` → `https://10.96.0.1:443`.
+- **Serving cert SANs** must include `10.96.0.1` + `kubernetes.default.svc.*`
+  (passed via `--tls-san`); the all-in-one should add these automatically.
+- **Node `status.addresses` InternalIP is `127.0.1.1`** (from the lima
+  `/etc/hosts` line) and **`nodeInfo.architecture` is `amd64`** on arm64 — both
+  wrong for conformance (`get nodes/<node>:10250/proxy` also 404s — node-proxy
+  gap). Related to #2.
+
+## 7. Strict decoding rejects standard Pod fields (blocks pod-creating e2e)
+
+The first conformance test (`[sig-node] Pods should be submitted and removed`)
+fails: `strict decoding error: unknown field "metadata.uid", "spec.hostIPC",
+"spec.hostPID"`. Root causes:
+
+- **`host_ipc`/`host_pid`** in [`crates/common/src/resources/pod.rs`](../crates/common/src/resources/pod.rs)
+  rely on `rename_all = "camelCase"` → serialize as `hostIpc`/`hostPid`, but K8s
+  uses `hostIPC`/`hostPID`. Add `#[serde(rename = "hostIPC")]` /
+  `#[serde(rename = "hostPID")]`. **Audit every abbreviation field** for the same
+  bug (CLAUDE.md's `podIP`/`hostIP`/`containerID` rule).
+- **`metadata.uid`** (`types.rs`, `skip_serializing_if = "String::is_empty"`): an
+  empty uid in the request is dropped from the canonical form, so the strict
+  validator flags it. Treat empty-valued known fields like the null case (see
+  the existing fix in `validation.rs`).
+- **Expect a tail:** conformance will surface more field mismatches one at a
+  time; each needs a struct/rename fix + rebuild.
+
 ## Priority
 
-K5 streaming (done) and #4 kube-proxy (done) were the two **conformance
-blockers** — both fixed. #1/#2/#3/#5 are correctness/ergonomics items that also
-help conformance but don't block a first sonobuoy run.
+K5 streaming (done) and #4 kube-proxy (done) were the two original **conformance
+blockers** — both fixed. **#7 (strict decoding) is the current blocker** — it
+fails pod-creating e2e tests, so a full conformance number isn't meaningful until
+it's addressed. #6 items are bringup fixes (worked around for the run). #1/#2/#3/#5
+are lower-priority polish.

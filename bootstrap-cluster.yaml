@@ -139,7 +139,7 @@ data:
           pods insecure
           fallthrough in-addr.arpa ip6.arpa
           ttl 30
-          endpoint https://api-server:6443
+          endpoint https://10.96.0.1:443
           tls "" "" /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
         }
         prometheus :9153
