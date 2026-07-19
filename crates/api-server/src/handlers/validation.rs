@@ -346,7 +346,17 @@ fn find_unknown_fields_recursive(
                 if let Some(canon_val) = canon_map.get(key) {
                     // Recurse into nested objects
                     find_unknown_fields_recursive(orig_val, canon_val, &field_path, unknown);
-                } else {
+                } else if !orig_val.is_null() {
+                    // A field present in the request but absent after canonical
+                    // re-serialization is normally "unknown". But a *known*
+                    // optional field sent as JSON `null` deserializes to `None`
+                    // and is then dropped by `skip_serializing_if`, so it
+                    // legitimately vanishes from the canonical form. The most
+                    // common case is `metadata.creationTimestamp: null`, which
+                    // every client-go request (kubectl, sonobuoy, controllers)
+                    // emits — flagging it would reject essentially all real
+                    // traffic. Treat a null original value as acceptable rather
+                    // than mis-flagging it as an unknown field.
                     unknown.push(field_path);
                 }
             }
@@ -758,6 +768,43 @@ mod tests {
             "default rejection should match strict decoder format: {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn test_strict_validation_allows_null_optional_fields() {
+        // Regression: client-go always serializes `metadata.creationTimestamp`
+        // as JSON `null`. Such a field deserializes to `None` and is dropped by
+        // `skip_serializing_if`, so it is absent from the canonical re-serialized
+        // form. The strict validator must NOT flag a null-valued original field
+        // as unknown, otherwise every client-go write (kubectl, sonobuoy, the
+        // controllers) is rejected with a 400.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Meta {
+            name: String,
+            #[serde(rename = "creationTimestamp", skip_serializing_if = "Option::is_none")]
+            creation_timestamp: Option<String>,
+        }
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Obj {
+            metadata: Meta,
+        }
+
+        let body = br#"{"metadata": {"name": "x", "creationTimestamp": null}}"#;
+        let parsed = Obj {
+            metadata: Meta {
+                name: "x".to_string(),
+                creation_timestamp: None,
+            },
+        };
+        let params = HashMap::new(); // default: Strict
+
+        let result = validate_strict_fields(&params, body, &parsed);
+        assert!(
+            result.is_ok(),
+            "null-valued known optional field must not be rejected: {:?}",
+            result.err()
+        );
+        assert!(result.unwrap().is_empty(), "no warnings expected either");
     }
 
     #[test]

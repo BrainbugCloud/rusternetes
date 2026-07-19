@@ -31,7 +31,7 @@ podman run -d \
   -p 2379:2379 -p 2380:2380 \
   -v rusternetes-etcd-data:/etcd-data \
   -e ETCDCTL_API=3 \
-  --health-cmd "/usr/local/bin/etcdctl --endpoints=http://localhost:2379 endpoint health" \
+  --health-cmd '["/usr/local/bin/etcdctl","--endpoints=http://localhost:2379","endpoint","health"]' \
   --health-interval 10s \
   --health-timeout 5s \
   --health-retries 5 \
@@ -48,9 +48,11 @@ podman run -d \
   --quota-backend-bytes=8589934592
 
 # Wait for etcd to be healthy
+# Probe etcd directly via exec rather than `podman healthcheck run`: the etcd
+# image is distroless (no /bin/sh), so a CMD-SHELL healthcheck never succeeds.
 echo "Waiting for etcd to be healthy..."
 sleep 5
-while ! podman healthcheck run rusternetes-etcd 2>/dev/null; do
+while ! podman exec rusternetes-etcd /usr/local/bin/etcdctl --endpoints=http://localhost:2379 endpoint health >/dev/null 2>&1; do
   echo "Waiting for etcd..."
   sleep 2
 done
@@ -64,9 +66,9 @@ podman run -d \
   --network-alias api-server \
   -p 6443:6443 \
   -v ./.rusternetes/certs:/etc/kubernetes/pki:ro \
-  -v /var/run/docker.sock:/var/run/docker.sock:rw \
+  -v /run/podman/podman.sock:/run/podman/podman.sock:rw \
   -e RUST_LOG=info \
-  -e DOCKER_HOST=unix:///var/run/docker.sock \
+  -e DOCKER_HOST=unix:///run/podman/podman.sock \
   localhost/rusternetes_api-server \
   --bind-address 0.0.0.0:6443 \
   --etcd-servers http://etcd:2379 \
@@ -108,11 +110,11 @@ podman run -d \
   --name rusternetes-kubelet \
   --network rusternetes-network \
   --privileged \
-  -v /var/run/docker.sock:/var/run/docker.sock:rw \
+  -v /run/podman/podman.sock:/run/podman/podman.sock:rw \
   -v ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw \
   -v ./.rusternetes/certs:/root/.rusternetes/certs:ro \
   -e RUST_LOG=info \
-  -e DOCKER_HOST=unix:///var/run/docker.sock \
+  -e DOCKER_HOST=unix:///run/podman/podman.sock \
   -e KUBERNETES_SERVICE_HOST_OVERRIDE=api-server \
   -e KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH} \
   localhost/rusternetes_kubelet \
@@ -127,11 +129,11 @@ podman run -d \
   --name rusternetes-kubelet2 \
   --network rusternetes-network \
   --privileged \
-  -v /var/run/docker.sock:/var/run/docker.sock:rw \
+  -v /run/podman/podman.sock:/run/podman/podman.sock:rw \
   -v ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw \
   -v ./.rusternetes/certs:/root/.rusternetes/certs:ro \
   -e RUST_LOG=info \
-  -e DOCKER_HOST=unix:///var/run/docker.sock \
+  -e DOCKER_HOST=unix:///run/podman/podman.sock \
   -e KUBERNETES_SERVICE_HOST_OVERRIDE=api-server \
   -e KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH} \
   localhost/rusternetes_kubelet \
