@@ -49,25 +49,31 @@ are the K5 streaming bug (tracked in plan 02 K5) — these are the side findings
   for `err_msg` at the `error!("Failed to start pod …")` site (and the analogous
   container-start/stop/remove sites). Cheap, high-value for every future debug.
 
-## 4. kube-proxy iptables rules blackhole node networking
+## 4. kube-proxy iptables rules blackhole node networking — ✅ FIXED (2026-07-19)
 
 - **Symptom:** with kube-proxy enabled (all-in-one default), the VM's **outbound
-  DNS + image pulls broke**; `iptables -t nat -F` restored connectivity. Had to
-  run `--disable-proxy` to verify the CRI path.
-- **Cause (to investigate):**
-  [`crates/kube-proxy/src/iptables.rs`](../crates/kube-proxy/src/iptables.rs) /
-  [`proxy.rs`](../crates/kube-proxy/src/proxy.rs) — likely a KUBE-SERVICES /
-  MASQUERADE / ClusterIP rule that intercepts more than intended (e.g. a service
-  with no endpoints black-holing, or a too-broad `-j` jump on the OUTPUT/
-  PREROUTING nat chains catching node egress incl. UDP 53).
-- **Fix:** reproduce in the VM, dump `iptables -t nat -S` after kube-proxy syncs,
-  find the offending rule, scope it correctly (only ClusterIP CIDR, reject-with
-  for no-endpoint services rather than blackhole, preserve node egress).
-- **Blocks:** Services and the sonobuoy aggregator (needs Service networking) —
-  i.e. this gates the K7 conformance run alongside K5.
+  DNS + image pulls broke**; had to run `--disable-proxy`.
+- **Root cause:** [`crates/kube-proxy/src/iptables.rs`](../crates/kube-proxy/src/iptables.rs)
+  added `-A POSTROUTING -m addrtype --src-type LOCAL -j MASQUERADE` — matches
+  *every* node-originated packet, including loopback DNS to 127.0.0.53
+  (MASQUERADE on `lo` drops it) and all egress. (Rules land in **iptables-legacy**
+  on this VM — inspect with `iptables-legacy -t nat -S`, not plain `iptables`.)
+- **Fix:** removed the rule; the node→NodePort case it targeted is already
+  covered by the adjacent `-m conntrack --ctstate DNAT -j MASQUERADE`.
+- **Verified** with kube-proxy enabled: node DNS/egress work, pods pull+run, and
+  ClusterIP DNAT still routes (wget through a Service ClusterIP → nginx backend).
+
+## 5. ClusterIP allocator gives a normal Service `10.96.0.1`
+
+- **Symptom:** `kubectl expose` assigned `web-svc` the ClusterIP `10.96.0.1`,
+  which should be reserved for the default `kubernetes` service.
+- **Cause (to investigate):** the ClusterIP allocator / default-`kubernetes`-
+  service bootstrap in the api-server. Not a kube-proxy bug (DNAT worked).
+- **Impact:** likely breaks conformance's `kubernetes` service expectations and
+  in-cluster API discovery via `KUBERNETES_SERVICE_HOST`.
 
 ## Priority
 
-K5 streaming (plan 02) and #4 kube-proxy are the two **conformance blockers**.
-#1/#2/#3 are correctness/ergonomics polish that also help conformance and
-debuggability but don't block the run.
+K5 streaming (done) and #4 kube-proxy (done) were the two **conformance
+blockers** — both fixed. #1/#2/#3/#5 are correctness/ergonomics items that also
+help conformance but don't block a first sonobuoy run.

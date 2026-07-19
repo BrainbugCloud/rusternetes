@@ -60,11 +60,12 @@ kube-proxy breaks node networking. See [test-matrix.md](test-matrix.md) config 1
 
 ### Additional runtime findings (2026-07-19 first bring-up)
 
-- **kube-proxy blackholes node networking:** with kube-proxy enabled the
-  all-in-one's iptables `nat` rules broke the VM's outbound DNS/connectivity
-  (image pulls + DNS failed until `iptables -t nat -F`). Ran with
-  `--disable-proxy` to verify the CRI path. Must be fixed before Services /
-  sonobuoy (the sonobuoy aggregator itself needs Service networking).
+- **kube-proxy blackholed node networking — FIXED (2026-07-19):** an over-broad
+  `-A POSTROUTING -m addrtype --src-type LOCAL -j MASQUERADE` rule SNAT'd every
+  node-originated packet (incl. loopback DNS), breaking egress/image pulls.
+  Removed it (the `ctstate DNAT` masquerade already covers node→NodePort).
+  Verified with kube-proxy enabled: egress works, pods run, ClusterIP DNAT
+  routes. (Rules are in **iptables-legacy** on the VM.)
 - **Node registers `kubernetes.io/arch=amd64` on an arm64 node** (hardcoded in
   `register_node`); harmless for multi-arch images, wrong for arch-sensitive
   conformance/scheduling.

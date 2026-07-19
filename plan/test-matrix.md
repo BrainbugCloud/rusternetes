@@ -91,13 +91,15 @@ was not started (it would predictably land well below 90 %).**
 | `kubectl logs` / `logs -f` (K4, ~53-spec class) | ✅ real stdout; on-disk CRI log format correct |
 | `kubectl exec` (K5, ~17-spec class) | ✅ **FIXED** — stdout/stderr/exit-code/stdin all work; 20/20 loop, zero `close 1005` (rewrote api-server SPDY client onto `cri-server` codec) |
 | `kubectl port-forward` (K5) | ⚠️ ported to the same codec, not yet runtime-verified |
-| kube-proxy | ❌ iptables `nat` rules blackholed VM DNS/egress; ran `--disable-proxy` |
+| kube-proxy — node egress | ✅ **FIXED** — removed the over-broad `--src-type LOCAL` MASQUERADE; DNS/egress survive with kube-proxy on |
+| kube-proxy — ClusterIP DNAT | ✅ wget through a Service ClusterIP reaches the backend |
 
-**Verdict: 90 % baseline not yet re-measured.** K4 (logs, ~53 specs) and K5
-(exec, ~17 specs) — the two big failure classes — are now both fixed and
-runtime-verified on containerd. Remaining blocker before a full sonobuoy run:
-**kube-proxy** iptables must stop blackholing node egress/Services (the sonobuoy
-aggregator itself needs Service networking). Then run sonobuoy for the number.
+**Verdict: the two big failure classes and the networking blocker are cleared.**
+K4 (logs, ~53 specs), K5 (exec, ~17 specs), and the kube-proxy blackhole are all
+fixed and runtime-verified on containerd. A full sonobuoy conformance run is now
+unblocked — that is the next step to actually measure the ≥90 % gate. (Known
+lower-priority follow-ups before/after: ClusterIP allocator handing `10.96.0.1`
+to normal Services, and port-forward verification — see cleanup-tasks.md.)
 
 Environment prep needed on a bare VM (not code bugs): install CNI plugins +
 `/etc/cni/net.d` (containerd `RunPodSandbox` fails "cni plugin not initialized"
