@@ -141,11 +141,44 @@ the moment of failure.)
   networking` on the CRI path — a stale pre-CRI code path (pods still get real
   CNI IPs from containerd); should be removed/quieted on the CRI path.
 
+## 8b. Pod-status write storm (root cause of #8) — ✅ FIXED (2026-07-19)
+
+Diagnosed while investigating #8: `running_pod_conditions()`/
+`not_ready_pod_conditions()` (`crates/kubelet/src/kubelet.rs`) stamped
+`lastTransitionTime = now()` on every status sync, so a stable pod's status
+looked "changed" each cycle, defeating the no-op write gate. coredns was
+rewritten ~hundreds of times/sec (a MODIFIED / resourceVersion storm) — which
+*also* generated the CAS conflicts of #8. **Fix:** preserve `lastTransitionTime`
+for unchanged `(type, status)` conditions; add retry-on-conflict to the two hot
+status writers. **Verified:** coredns `resourceVersion` now stable (~0 redundant
+MODIFIED events, even under sonobuoy load). Commit `02fa0171`.
+
+## 9. Scheduler stalls under conformance API load (current top blocker)
+
+With #7/#8/#8b fixed, the sonobuoy quick test still fails: the e2e test pod
+(`pods-XXXX/pod-submit-remove-…`) is **never scheduled** during the run
+(`nodeName` stays empty for the full 5-min timeout), so it never runs. But:
+
+- a pod created via `kubectl` **before or after** the run schedules in ~2s,
+- a pod in a **fresh namespace** schedules in ~2s,
+- the scheduler bound pods at 20:58:20, then **nothing until 21:04:13** — exactly
+  the window the e2e conformance container was hammering the API (list/watch all
+  resources, create namespaces, etc.).
+
+So the scheduler (and likely other control-plane loops) is **starved/stalled
+under the e2e's concurrent API load**, not broken. Likely storage-backend
+(SQLite/kine) contention serializing access, or a lock held under load.
+
+- **Fix (investigate):** profile the scheduler's `schedule_pending_pods` sweep
+  under load; check whether `storage.list("pods")`/`list("nodes")` blocks or is
+  starved when the API is under heavy list/watch load; consider a watch-driven
+  scheduling queue instead of full-list sweeps, and SQLite read concurrency
+  (WAL / separate read pool). Gates all pod-lifecycle e2e tests.
+
 ## Priority
 
-K5 streaming (done) and #4 kube-proxy (done) were the two original **conformance
-blockers** — both fixed. #7 (strict decoding) — **fixed**, pod creation works.
-**#8 (status-update conflicts) is now the top blocker** — pods run but their
-status doesn't reach `Running` in the API under load, timing out pod-lifecycle
-tests. #6 items are bringup fixes (worked around). #1/#2/#3/#5 are lower-priority
-polish.
+K5 streaming, #4 kube-proxy, #7 strict decoding, and #8/#8b status churn+retry
+are all **fixed**. **#9 (scheduler stalls under load) is now the top blocker** —
+pods created during a conformance run don't get scheduled, so pod-lifecycle
+tests time out. #6 items are bringup fixes (worked around). #1/#2/#3/#5 are
+lower-priority polish.
