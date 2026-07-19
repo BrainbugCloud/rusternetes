@@ -3344,12 +3344,19 @@ impl Kubelet {
                                         pod_ip.as_ref().map(|ip| vec![PodIP { ip: ip.clone() }]);
                                     status.pod_ip = pod_ip;
                                 }
+                                let existing_conditions = status.conditions.take();
                                 if all_ready {
                                     status.message = Some("All containers ready".to_string());
-                                    status.conditions = Some(Self::running_pod_conditions());
+                                    status.conditions = Some(Self::preserve_transition_times(
+                                        Self::running_pod_conditions(),
+                                        existing_conditions.as_deref(),
+                                    ));
                                 } else {
                                     status.message = Some("Some containers not ready".to_string());
-                                    status.conditions = Some(Self::not_ready_pod_conditions());
+                                    status.conditions = Some(Self::preserve_transition_times(
+                                        Self::not_ready_pod_conditions(),
+                                        existing_conditions.as_deref(),
+                                    ));
                                 }
                             }
 
@@ -3367,30 +3374,42 @@ impl Kubelet {
                                 return Ok(());
                             }
 
-                            if let Err(e) = self.storage.update(&key, &new_pod).await {
-                                // CAS conflict — re-read and retry once
-                                debug!("Pod status update CAS conflict, retrying: {}", e);
-                                if let Ok(mut fresh_pod) = self.storage.get::<Pod>(&key).await {
-                                    if let Some(ref mut status) = fresh_pod.status {
-                                        status.container_statuses = new_pod
-                                            .status
-                                            .as_ref()
-                                            .and_then(|s| s.container_statuses.clone());
-                                        status.conditions = new_pod
-                                            .status
-                                            .as_ref()
-                                            .and_then(|s| s.conditions.clone());
-                                        status.message =
-                                            new_pod.status.as_ref().and_then(|s| s.message.clone());
-                                        if let Some(ref new_status) = new_pod.status {
-                                            if new_status.pod_ip.is_some() {
-                                                status.pod_ip = new_status.pod_ip.clone();
-                                                status.pod_i_ps = new_status.pod_i_ps.clone();
-                                            }
-                                        }
+                            // Write the status, retrying on CAS (resourceVersion)
+                            // conflict by re-fetching the latest pod and
+                            // re-applying the full desired status. Under
+                            // conformance load the pod is modified concurrently
+                            // (controllers, GC, the test itself), so a single
+                            // retry is not enough — a running pod's status must
+                            // still reach the API or every "wait for Running"
+                            // test times out. The kubelet owns pod status, so
+                            // overwriting the fresh object's status is correct.
+                            let desired_status = new_pod.status.clone();
+                            let mut result = self.storage.update(&key, &new_pod).await;
+                            let mut attempt = 0u32;
+                            while let Err(ref e) = result {
+                                if !e.to_string().contains("Conflict") || attempt >= 5 {
+                                    warn!(
+                                        "Failed to update pod status for {}/{} after {} attempt(s): {}",
+                                        namespace, pod_name, attempt + 1, e
+                                    );
+                                    break;
+                                }
+                                attempt += 1;
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    20 * attempt as u64,
+                                ))
+                                .await;
+                                match self.storage.get::<Pod>(&key).await {
+                                    Ok(mut fresh_pod) => {
+                                        fresh_pod.status = desired_status.clone();
+                                        result = self.storage.update(&key, &fresh_pod).await;
                                     }
-                                    if let Err(e2) = self.storage.update(&key, &fresh_pod).await {
-                                        warn!("Failed to update pod status after retry: {}", e2);
+                                    Err(ge) => {
+                                        warn!(
+                                            "Failed to re-fetch pod {}/{} for status retry: {}",
+                                            namespace, pod_name, ge
+                                        );
+                                        break;
                                     }
                                 }
                             }
@@ -3648,6 +3667,30 @@ impl Kubelet {
     /// Build the standard pod conditions for a Running pod.
     /// Real Kubernetes sets Initialized, PodScheduled, ContainersReady, and Ready=True
     /// when all containers are running. The e2e conformance suite checks these conditions.
+    /// Carry `last_transition_time` forward from the existing conditions for any
+    /// condition whose (type, status) is unchanged. The condition builders stamp
+    /// `now()` unconditionally; without this, every status sync produces a
+    /// "different" status (new timestamps), defeating the no-op write gate and
+    /// causing a MODIFIED-event / resourceVersion storm (and the CAS conflicts it
+    /// spawns). K8s semantics: `lastTransitionTime` only advances on an actual
+    /// status transition.
+    fn preserve_transition_times(
+        mut new: Vec<PodCondition>,
+        existing: Option<&[PodCondition]>,
+    ) -> Vec<PodCondition> {
+        if let Some(existing) = existing {
+            for cond in &mut new {
+                if let Some(prev) = existing
+                    .iter()
+                    .find(|e| e.condition_type == cond.condition_type && e.status == cond.status)
+                {
+                    cond.last_transition_time = prev.last_transition_time;
+                }
+            }
+        }
+        new
+    }
+
     fn running_pod_conditions() -> Vec<PodCondition> {
         let now = Some(chrono::Utc::now());
         vec![
@@ -3951,25 +3994,40 @@ impl Kubelet {
             &pod.metadata.name,
         );
 
-        // Read the fresh pod from storage so we preserve container_statuses,
+        let reason_s = reason.map(|s| s.to_string());
+        let message_s = message.map(|s| s.to_string());
+
+        // Read fresh, apply, write — retrying on CAS conflict by re-fetching.
+        // Reading the fresh pod preserves container_statuses,
         // init_container_statuses, conditions, pod_ip, start_time, etc.
-        // Constructing a fresh PodStatus would WIPE those fields — destructive
-        // when called on a failure path of a previously-Running pod.
-        let mut new_pod = match self.storage.get::<Pod>(&key).await {
-            Ok(p) => p,
-            Err(_) => pod.clone(),
-        };
-        let original = new_pod.clone();
+        // (constructing a fresh PodStatus would WIPE those). A single write
+        // loses to concurrent modification under load, so loop.
+        for attempt in 0..6u32 {
+            let mut new_pod = match self.storage.get::<Pod>(&key).await {
+                Ok(p) => p,
+                Err(_) => pod.clone(),
+            };
+            let original = new_pod.clone();
 
-        let mut status = new_pod.status.take().unwrap_or_default();
-        status.phase = Some(phase);
-        status.reason = reason.map(|s| s.to_string());
-        status.message = message.map(|s| s.to_string());
-        new_pod.status = Some(status);
+            let mut status = new_pod.status.take().unwrap_or_default();
+            status.phase = Some(phase.clone());
+            status.reason = reason_s.clone();
+            status.message = message_s.clone();
+            new_pod.status = Some(status);
 
-        // Gate the write so a no-op call doesn't emit a MODIFIED watch event.
-        if !pod_status_equal(&original, &new_pod) {
-            self.storage.update(&key, &new_pod).await?;
+            // Gate the write so a no-op call doesn't emit a MODIFIED watch event.
+            if pod_status_equal(&original, &new_pod) {
+                return Ok(());
+            }
+
+            match self.storage.update(&key, &new_pod).await {
+                Ok(_) => return Ok(()),
+                Err(e) if e.to_string().contains("Conflict") && attempt < 5 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20 * (attempt as u64 + 1)))
+                        .await;
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
 
         Ok(())
