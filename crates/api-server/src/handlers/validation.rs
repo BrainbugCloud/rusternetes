@@ -327,6 +327,20 @@ pub fn find_duplicate_json_key_public(json_str: &str) -> Option<String> {
     find_duplicate_json_key(json_str)
 }
 
+/// True for values a known optional field legitimately drops from the canonical
+/// (re-serialized) form via `skip_serializing_if`: JSON null (→ `None`), and
+/// empty string / array / object (→ empty containers). Such a field present in
+/// the request but absent from the canonical form is not an unknown field.
+fn is_droppable_empty(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(s) => s.is_empty(),
+        serde_json::Value::Array(a) => a.is_empty(),
+        serde_json::Value::Object(o) => o.is_empty(),
+        _ => false,
+    }
+}
+
 /// Recursively find fields in `original` that are not present in `canonical`.
 /// Returns a list of dotted field paths for unknown fields.
 fn find_unknown_fields_recursive(
@@ -346,17 +360,18 @@ fn find_unknown_fields_recursive(
                 if let Some(canon_val) = canon_map.get(key) {
                     // Recurse into nested objects
                     find_unknown_fields_recursive(orig_val, canon_val, &field_path, unknown);
-                } else if !orig_val.is_null() {
+                } else if !is_droppable_empty(orig_val) {
                     // A field present in the request but absent after canonical
                     // re-serialization is normally "unknown". But a *known*
-                    // optional field sent as JSON `null` deserializes to `None`
-                    // and is then dropped by `skip_serializing_if`, so it
-                    // legitimately vanishes from the canonical form. The most
-                    // common case is `metadata.creationTimestamp: null`, which
-                    // every client-go request (kubectl, sonobuoy, controllers)
-                    // emits — flagging it would reject essentially all real
-                    // traffic. Treat a null original value as acceptable rather
-                    // than mis-flagging it as an unknown field.
+                    // optional field whose value is empty (`null`, `""`, `[]`,
+                    // `{}`) deserializes to None / an empty container and is then
+                    // dropped by `skip_serializing_if`, so it legitimately
+                    // vanishes from the canonical form. Common real traffic:
+                    // `metadata.creationTimestamp: null` and `metadata.uid: ""`,
+                    // which client-go (kubectl, sonobuoy, controllers) emits —
+                    // flagging them would reject essentially all requests.
+                    // Genuine unknown fields in the conformance strict-decode
+                    // tests always carry a non-empty value, so this stays sound.
                     unknown.push(field_path);
                 }
             }
