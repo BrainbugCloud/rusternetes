@@ -50,7 +50,6 @@ base64 = "0.22"
 openapiv3 = "2.2.0"
 indexmap = "2.14"
 tokio-tungstenite = "0.21"
-bollard.workspace = true
 bytes = "1.5"
 get_if_addrs = "0.5"
 prometheus-http-query = "0.8"

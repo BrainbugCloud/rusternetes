@@ -221,6 +221,7 @@ async fn main() -> Result<()> {
         network: args.network,
         sync_interval: args.kubelet_sync_interval,
         metrics_port: 10250,
+        streaming_port: 10251,
         kubernetes_service_host: args
             .kubernetes_service_host
             .clone()

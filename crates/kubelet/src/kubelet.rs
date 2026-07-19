@@ -45,6 +45,7 @@ pub struct Kubelet {
     storage: Arc<StorageBackend>,
     runtime: Arc<ContainerRuntime>,
     sync_interval: Duration,
+    streaming_port: u16,
     eviction_manager: Mutex<EvictionManager>,
     /// Per-pod worker state. K8s uses a goroutine per pod; we track state
     /// per-UID and dispatch in the sync loop.
@@ -90,6 +91,7 @@ impl Kubelet {
         network: String,
         kubernetes_service_host: String,
         container_runtime_endpoint: String,
+        streaming_port: u16,
         image_service_endpoint: String,
     ) -> Result<Self> {
         let runtime = ContainerRuntime::new(
@@ -109,6 +111,7 @@ impl Kubelet {
             storage,
             runtime: Arc::new(runtime),
             sync_interval: Duration::from_secs(sync_interval_secs),
+            streaming_port,
             eviction_manager: Mutex::new(EvictionManager::new()),
             pod_states: Mutex::new(HashMap::new()),
             pod_sync_locks: Mutex::new(HashSet::new()),
@@ -450,7 +453,7 @@ impl Kubelet {
             // See: pkg/kubelet/kubelet.go:505 — DaemonEndpoints{KubeletEndpoint{Port: kubeCfg.Port}}
             daemon_endpoints: Some(rusternetes_common::resources::NodeDaemonEndpoints {
                 kubelet_endpoint: Some(rusternetes_common::resources::DaemonEndpoint {
-                    port: 10250,
+                    port: i32::from(self.streaming_port),
                 }),
             }),
             config: None,

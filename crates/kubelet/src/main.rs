@@ -7,6 +7,7 @@ mod eviction;
 mod kubelet;
 mod runtime;
 mod server;
+mod streaming_server;
 
 use anyhow::Result;
 use axum::{routing::get, Json, Router};
@@ -58,6 +59,9 @@ struct Args {
     /// Metrics server port
     #[arg(long)]
     metrics_port: Option<u16>,
+    /// Streaming server port for exec/attach/portforward (default 10250)
+    #[arg(long)]
+    streaming_port: Option<u16>,
 
     /// Cluster DNS service IP address (dynamically discovered if not provided)
     #[arg(long)]
@@ -227,6 +231,18 @@ async fn main() -> Result<()> {
         &runtime_config.container_runtime_endpoint,
         &runtime_config.image_service_endpoint,
     );
+    // Start streaming server on a separate port for exec/attach/portforward
+
+    let streaming_port = args.streaming_port.unwrap_or(10251);
+    let streaming_cri = cri_client.clone();
+    let http_forward_port = runtime_config.metrics_bind_port;
+    tokio::spawn(async move {
+        if let Err(e) =
+            streaming_server::start(streaming_cri, streaming_port, http_forward_port).await
+        {
+            tracing::error!("streaming server failed: {:#}", e);
+        }
+    });
     tokio::spawn(async move {
         let app = Router::new()
             .route("/metrics", get(|| async move { metrics_clone.gather() }))
@@ -252,6 +268,7 @@ async fn main() -> Result<()> {
             args.network,
             runtime_config.kubernetes_service_host.clone(),
             runtime_config.container_runtime_endpoint.clone(),
+            streaming_port,
             runtime_config.image_service_endpoint.clone(),
         )
         .await?,

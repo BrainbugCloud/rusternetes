@@ -18,8 +18,7 @@ pub mod response;
 pub mod router;
 #[allow(dead_code)]
 pub mod spdy;
-#[allow(dead_code)]
-pub mod spdy_handlers;
+mod kubelet_proxy;
 pub mod state;
 #[allow(dead_code)]
 pub mod streaming;

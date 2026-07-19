@@ -3901,7 +3901,6 @@ dependencies = [
  "axum 0.7.9",
  "axum-server",
  "base64 0.22.1",
- "bollard",
  "bytes",
  "cel",
  "chrono",
@@ -4084,6 +4083,7 @@ dependencies = [
  "futures",
  "futures-util",
  "http 1.4.2",
+ "hyper 1.9.0",
  "hyper-util",
  "prost 0.14.3",
  "reqwest 0.12.28",
@@ -4102,6 +4102,7 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

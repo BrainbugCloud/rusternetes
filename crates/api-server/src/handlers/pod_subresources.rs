@@ -6,7 +6,7 @@
 //! - /attach - Attach to running containers (SPDY and WebSocket)
 //! - /portforward - Forward ports to pods (SPDY and WebSocket)
 
-use crate::{middleware::AuthContext, spdy, spdy_handlers, state::ApiServerState, streaming};
+use crate::{kubelet_proxy, middleware::AuthContext, spdy, state::ApiServerState, streaming};
 use axum::{
     body::Body,
     extract::{ws::WebSocketUpgrade, Path, Query, Request, State},
@@ -485,19 +485,40 @@ pub async fn exec(
         )));
     }
 
-    // Handle WebSocket upgrade if requested
+    // ── Proxy to kubelet streaming server ──
+
+    // Resolve kubelet streaming endpoint from Node status
+    let kubelet_addr = kubelet_proxy::kubelet_streaming_endpoint(&state, &pod).await
+        .map_err(|e| Error::Internal(format!("Failed to resolve kubelet: {e}")))?;
+
+    // Build the kubelet streaming path
+    let kubelet_path = if raw_query.is_empty() {
+        format!("/exec/{namespace}/{name}/{container_name}")
+    } else {
+        format!("/exec/{namespace}/{name}/{container_name}?{raw_query}")
+    };
+
+    // Check for SPDY upgrade first (kubectl\'s default protocol)
+    let is_spdy = spdy::is_spdy_upgrade(req.headers());
+    if is_spdy {
+        info!("SPDY exec → kubelet at {kubelet_addr}{kubelet_path}");
+        let upgrade = hyper::upgrade::on(req);
+        return Ok(kubelet_proxy::spdy_proxy_response(
+            upgrade, &kubelet_addr, &kubelet_path,
+        ));
+    }
+
+    // Handle WebSocket upgrade
     if let Some(ws) = ws {
-        info!("Upgrading exec to WebSocket for pod {}/{}", namespace, name);
-        // Accept the v5.channel.k8s.io subprotocol for Kubernetes exec
-        // Detect which protocol the client requested. v1 (channel.k8s.io) doesn't
-        // use channel 3 for status; v4/v5 do. We need to tell the handler.
+        info!("WebSocket exec → kubelet at {kubelet_addr}");
         let is_v1_protocol = sec_ws_protocol == "channel.k8s.io"
             || (!sec_ws_protocol.contains("v4.channel") && !sec_ws_protocol.contains("v5.channel"));
         return Ok(ws
             .protocols(["v5.channel.k8s.io", "v4.channel.k8s.io", "channel.k8s.io"])
             .on_upgrade(move |socket| {
-                streaming::handle_exec_websocket_with_protocol(
+                streaming::handle_exec_websocket_via_kubelet(
                     socket,
+                    kubelet_addr,
                     pod,
                     container_name,
                     query.command,
@@ -511,102 +532,22 @@ pub async fn exec(
             .into_response());
     }
 
-    // For SPDY requests and plain HTTP: execute directly and return output
-    // kubectl will receive the output as the HTTP response body
-    info!(
-        "Direct exec for pod {}/{}: {:?}",
-        namespace, name, query.command
-    );
-
-    use bollard::exec::{CreateExecOptions, StartExecResults};
-    use bollard::Docker;
-    use futures::StreamExt;
-
-    let docker = Docker::connect_with_local_defaults()
-        .map_err(|e| Error::Internal(format!("Docker: {}", e)))?;
-
-    let container_id = format!("{}_{}", pod.metadata.name, container_name);
-    let exec_config = CreateExecOptions {
-        cmd: Some(query.command.iter().map(|s| s.as_str()).collect()),
-        attach_stdout: Some(true),
-        attach_stderr: Some(true),
-        attach_stdin: Some(false),
-        tty: Some(query.tty),
-        ..Default::default()
-    };
-
-    let exec = docker
-        .create_exec(&container_id, exec_config)
-        .await
-        .map_err(|e| Error::Internal(format!("Create exec: {}", e)))?;
-
-    let output = docker
-        .start_exec(
-            &exec.id,
-            Some(bollard::exec::StartExecOptions {
-                detach: false,
-                ..Default::default()
-            }),
-        )
-        .await
-        .map_err(|e| Error::Internal(format!("Start exec: {}", e)))?;
-
-    let mut stdout_data = Vec::new();
-    let mut stderr_data = Vec::new();
-    if let StartExecResults::Attached {
-        output: mut stream, ..
-    } = output
-    {
-        loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await {
-                Ok(Some(Ok(msg))) => match msg {
-                    bollard::container::LogOutput::StdOut { message } => {
-                        stdout_data.extend_from_slice(&message)
-                    }
-                    bollard::container::LogOutput::StdErr { message } => {
-                        stderr_data.extend_from_slice(&message)
-                    }
-                    _ => {}
-                },
-                Ok(Some(Err(_))) | Ok(None) => break,
-                Err(_) => {
-                    if let Ok(info) = docker.inspect_exec(&exec.id).await {
-                        if !info.running.unwrap_or(false) {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-            }
+    // Plain HTTP: reverse-proxy to kubelet
+    info!("HTTP exec proxy → kubelet at {kubelet_addr}{kubelet_path}");
+    let target = format!("http://{kubelet_addr}{kubelet_path}");
+    match reqwest::Client::new().get(&target).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let body_bytes = resp.bytes().await.unwrap_or_default();
+            Ok(Response::builder()
+                .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK))
+                .header("Content-Type", "text/plain")
+                .body(Body::from(body_bytes))
+                .unwrap())
         }
+        Err(e) => Err(Error::Internal(format!("kubelet proxy error: {e}"))),
     }
 
-    // Get exit code
-    let exit_code = docker
-        .inspect_exec(&exec.id)
-        .await
-        .ok()
-        .and_then(|info| info.exit_code)
-        .unwrap_or(0);
-
-    // Return as Kubernetes-compatible exec response
-    // For SPDY clients: return 101 Switching Protocols with the output
-    // This isn't proper SPDY but gives kubectl something to parse
-    // Return exec output as plain HTTP response
-    let mut output_str = String::from_utf8_lossy(&stdout_data).to_string();
-    if !stderr_data.is_empty() {
-        output_str.push_str(&String::from_utf8_lossy(&stderr_data));
-    }
-    Ok(Response::builder()
-        .status(if exit_code == 0 {
-            StatusCode::OK
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
-        .header("Content-Type", "text/plain")
-        .body(Body::from(output_str))
-        .unwrap())
 }
 
 /// GET/POST /api/v1/namespaces/{namespace}/pods/{name}/attach
@@ -684,11 +625,6 @@ pub async fn attach(
     }
 
     // Run admission webhooks for Connect operation (attach)
-    // K8s validates attach requests through admission webhooks the same as exec.
-    // The GVR resource must include the subresource (pods/attach) so that webhook
-    // rules matching "pods/attach" or "pods/*" are correctly triggered.
-    // K8s passes PodAttachOptions as the admission object so webhooks can inspect
-    // which container is being attached to and what streams are requested.
     {
         use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource, Operation};
         let gvk = GroupVersionKind {
@@ -701,7 +637,6 @@ pub async fn attach(
             version: "v1".to_string(),
             resource: "pods/attach".to_string(),
         };
-        // Build PodAttachOptions object matching K8s schema
         let attach_options = serde_json::json!({
             "apiVersion": "v1",
             "kind": "PodAttachOptions",
@@ -732,72 +667,59 @@ pub async fn attach(
         }
     }
 
-    // Check if this is a SPDY upgrade request (kubectl uses SPDY)
-    if spdy::is_spdy_request(&req) {
-        info!(
-            "Upgrading attach to SPDY for pod {}/{} (kubectl compatibility)",
-            namespace, name
-        );
+    // ── Proxy to kubelet streaming server ──
 
-        // Create SPDY upgrade response
-        let response = spdy::create_spdy_upgrade_response().map_err(|e| {
-            Error::Internal(format!("Failed to create SPDY upgrade response: {}", e))
-        })?;
+    // Resolve kubelet streaming endpoint from Node status
+    let kubelet_addr = kubelet_proxy::kubelet_streaming_endpoint(&state, &pod).await
+        .map_err(|e| Error::Internal(format!("Failed to resolve kubelet: {e}")))?;
 
-        // Spawn task to handle SPDY connection after upgrade
-        tokio::spawn(async move {
-            match spdy::upgrade_to_spdy(req).await {
-                Ok(spdy_conn) => {
-                    spdy_handlers::handle_spdy_attach(
-                        spdy_conn,
-                        pod,
-                        container_name,
-                        query.stdin,
-                        query.stdout,
-                        query.stderr,
-                        query.tty,
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    tracing::error!("Failed to upgrade to SPDY: {}", e);
-                }
-            }
-        });
+    // Build the kubelet streaming path
+    let raw_query = req.uri().query().unwrap_or("");
+    let kubelet_path = if raw_query.is_empty() {
+        format!("/attach/{namespace}/{name}/{container_name}")
+    } else {
+        format!("/attach/{namespace}/{name}/{container_name}?{raw_query}")
+    };
 
-        return Ok(response.into_response());
+    // Check for SPDY upgrade first (kubectl's default protocol)
+    let is_spdy = spdy::is_spdy_upgrade(req.headers());
+    if is_spdy {
+        info!("SPDY attach → kubelet at {kubelet_addr}{kubelet_path}");
+        let upgrade = hyper::upgrade::on(req);
+        return Ok(kubelet_proxy::spdy_proxy_response(
+            upgrade, &kubelet_addr, &kubelet_path,
+        ));
     }
 
-    // Handle WebSocket upgrade if requested
+    // Handle WebSocket upgrade
     if let Some(ws) = ws {
-        info!(
-            "Upgrading attach to WebSocket for pod {}/{}",
-            namespace, name
-        );
-        Ok(ws
+        info!("WebSocket attach → kubelet at {kubelet_addr}");
+        return Ok(ws
+            .protocols(["v5.channel.k8s.io", "v4.channel.k8s.io", "channel.k8s.io"])
             .on_upgrade(move |socket| {
-                streaming::handle_attach_websocket(
+                streaming::handle_attach_websocket_via_kubelet(
                     socket,
-                    pod,
-                    container_name,
-                    query.stdin,
-                    query.stdout,
-                    query.stderr,
-                    query.tty,
+                    kubelet_addr,
+                    kubelet_path,
                 )
             })
-            .into_response())
-    } else {
-        // No upgrade requested - return error
-        Ok(Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .header("Content-Type", "text/plain")
-            .body(Body::from(
-                "Attach requires protocol upgrade (SPDY or WebSocket). Use:\n\
-                - kubectl (uses SPDY automatically)\n\
-                - WebSocket protocol for custom clients\n",
-            ))
-            .unwrap())
+            .into_response());
+    }
+
+    // Plain HTTP: reverse-proxy to kubelet
+    info!("HTTP attach proxy → kubelet at {kubelet_addr}{kubelet_path}");
+    let target = format!("http://{kubelet_addr}{kubelet_path}");
+    match reqwest::Client::new().get(&target).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let body_bytes = resp.bytes().await.unwrap_or_default();
+            Ok(Response::builder()
+                .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK))
+                .header("Content-Type", "text/plain")
+                .body(Body::from(body_bytes))
+                .unwrap())
+        }
+        Err(e) => Err(Error::Internal(format!("kubelet proxy error: {e}"))),
     }
 }
 
@@ -831,68 +753,76 @@ pub async fn portforward(
     let pod: rusternetes_common::resources::Pod = state.storage.get(&pod_key).await?;
 
     // Parse ports from query parameter
-    let ports: Vec<u16> = if let Some(ref ports_str) = query.ports {
-        ports_str
+    if let Some(ref ports_str) = query.ports {
+        if ports_str
             .split(',')
-            .filter_map(|p| p.trim().parse().ok())
-            .collect()
+            .filter_map(|p| p.trim().parse::<u16>().ok())
+            .next()
+            .is_none()
+        {
+            return Err(Error::InvalidResource(
+                "No valid ports specified for port forwarding".to_string(),
+            ));
+        }
     } else {
-        vec![]
-    };
-
-    if ports.is_empty() {
         return Err(Error::InvalidResource(
             "No ports specified for port forwarding".to_string(),
         ));
     }
 
-    // Check if this is a SPDY upgrade request (kubectl uses SPDY)
-    if spdy::is_spdy_request(&req) {
-        info!(
-            "Upgrading port-forward to SPDY for pod {}/{}, ports: {:?} (kubectl compatibility)",
-            namespace, name, ports
-        );
+    // ── Proxy to kubelet streaming server ──
 
-        // Create SPDY upgrade response
-        let response = spdy::create_spdy_upgrade_response().map_err(|e| {
-            Error::Internal(format!("Failed to create SPDY upgrade response: {}", e))
-        })?;
+    // Resolve kubelet streaming endpoint from Node status
+    let kubelet_addr = kubelet_proxy::kubelet_streaming_endpoint(&state, &pod).await
+        .map_err(|e| Error::Internal(format!("Failed to resolve kubelet: {e}")))?;
 
-        // Spawn task to handle SPDY connection after upgrade
-        tokio::spawn(async move {
-            match spdy::upgrade_to_spdy(req).await {
-                Ok(spdy_conn) => {
-                    spdy_handlers::handle_spdy_portforward(spdy_conn, pod, ports).await;
-                }
-                Err(e) => {
-                    tracing::error!("Failed to upgrade to SPDY: {}", e);
-                }
-            }
-        });
+    // Build the kubelet streaming path for port-forward
+    let raw_query = req.uri().query().unwrap_or("");
+    let kubelet_path = if raw_query.is_empty() {
+        format!("/portForward/{namespace}/{name}")
+    } else {
+        format!("/portForward/{namespace}/{name}?{raw_query}")
+    };
 
-        return Ok(response.into_response());
+    // Check for SPDY upgrade first (kubectl's default protocol)
+    let is_spdy = spdy::is_spdy_upgrade(req.headers());
+    if is_spdy {
+        info!("SPDY portforward → kubelet at {kubelet_addr}{kubelet_path}");
+        let upgrade = hyper::upgrade::on(req);
+        return Ok(kubelet_proxy::spdy_proxy_response(
+            upgrade, &kubelet_addr, &kubelet_path,
+        ));
     }
 
-    // Handle WebSocket upgrade if requested
+    // Handle WebSocket upgrade
     if let Some(ws) = ws {
-        info!(
-            "Upgrading port-forward to WebSocket for pod {}/{}, ports: {:?}",
-            namespace, name, ports
-        );
-        Ok(ws
-            .on_upgrade(move |socket| streaming::handle_portforward_websocket(socket, pod, ports))
-            .into_response())
-    } else {
-        // No upgrade requested - return error
-        Ok(Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .header("Content-Type", "text/plain")
-            .body(Body::from(
-                "Port forward requires protocol upgrade (SPDY or WebSocket). Use:\n\
-                - kubectl (uses SPDY automatically)\n\
-                - WebSocket protocol for custom clients\n",
-            ))
-            .unwrap())
+        info!("WebSocket portforward → kubelet at {kubelet_addr}");
+        return Ok(ws
+            .protocols(["v5.channel.k8s.io", "v4.channel.k8s.io", "channel.k8s.io"])
+            .on_upgrade(move |socket| {
+                streaming::handle_portforward_websocket_via_kubelet(
+                    socket,
+                    kubelet_addr,
+                    kubelet_path,
+                )
+            })
+            .into_response());
+    }
+
+    // Plain HTTP: reverse-proxy to kubelet
+    info!("HTTP portforward proxy → kubelet at {kubelet_addr}{kubelet_path}");
+    let target = format!("http://{kubelet_addr}{kubelet_path}");
+    match reqwest::Client::new().get(&target).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let body_bytes = resp.bytes().await.unwrap_or_default();
+            Ok(Response::builder()
+                .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK))
+                .header("Content-Type", "text/plain")
+                .body(Body::from(body_bytes))
+                .unwrap())
+        }
+        Err(e) => Err(Error::Internal(format!("kubelet proxy error: {e}"))),
     }
 }
 

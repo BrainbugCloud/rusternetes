@@ -18,8 +18,7 @@ mod response;
 mod router;
 #[allow(dead_code)]
 mod spdy;
-#[allow(dead_code)]
-mod spdy_handlers;
+mod kubelet_proxy;
 mod state;
 #[allow(dead_code)]
 mod streaming;

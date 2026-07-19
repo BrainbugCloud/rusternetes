@@ -157,8 +157,8 @@ For e2e testing, build all binaries and run in the privileged pod.
 ### K5 — Exec / attach / portforward streaming
 - [x] Probes and lifecycle hooks execute via CRI `ExecSync` (no bollard)
 - [x] `main.rs` `handle_exec` (bollard Docker exec) deleted
-- [ ] Kubelet proxy of CRI `Exec` / `Attach` / `PortForward` streaming URLs
-- [ ] api-server websocket⇄SPDY translation with proper close frames
+- [x] Kubelet proxy of CRI `Exec` / `Attach` / `PortForward` streaming URLs
+- [x] api-server websocket⇄SPDY translation with proper close frames
 
 ### K6 — Stats, eviction, bollard removal
 - [x] `collect_node_metrics` reimplemented on CRI `ListContainerStats`
@@ -166,11 +166,127 @@ For e2e testing, build all binaries and run in the privileged pod.
 - [x] `bollard` removed from the kubelet `Cargo.toml`
 - [x] `grep -r bollard crates/kubelet/` → empty; crate compiles green and unit tests pass
 
-> **Note:** End-to-end acceptances that require a live containerd runtime
-> (`kubectl run nginx` → Running with real IP, `kubectl logs -f`, `kubectl exec`
-> exit codes, `kubectl port-forward`, the 50-exec `close 1005` gate) are not
-> verifiable in the current non-privileged build container and were not run.
-> They require the privileged-pod + containerd test setup described above.
+### K7 — End-to-end validation in privileged pod on rk1 node
+
+> Build and E2E test in a privileged pod on an rk1 node with containerd access.
+
+**Steps:**
+
+1. **Build all rusternetes binaries** (from build machine):
+   ```bash
+   cd ~/git/rusternetes
+   export PROTOC="$HOME/.local/bin/protoc"
+   export PROTOC_INCLUDE="$HOME/.local/include"
+   cargo build --release -p rusternetes -p rusternetes-kubelet -p rusternetes-api-server -p rusternetes-scheduler -p rusternetes-controller-manager -p rusternetes-kubectl
+   ```
+   Strip to reduce size: `strip target/release/rusternetes`
+
+2. **Create privileged pod on rk1 node:**
+   ```bash
+   kubectl apply -f - << 'EOF'
+   apiVersion: v1
+   kind: Pod
+   metadata:
+     name: rusternetes-e2e
+     namespace: agent-sandbox-system
+   spec:
+     nodeName: bb-k8s-rk1b-01   # any rk1 node (NEVER cm4 — out of memory)
+     containers:
+     - name: rusternetes
+       image: ubuntu:24.04
+       securityContext:
+         privileged: true
+       command: ["sleep", "infinity"]
+       volumeMounts:
+       - name: binaries
+         mountPath: /opt/rusternetes
+       - name: run
+         mountPath: /host-run
+     volumes:
+     - name: binaries
+       emptyDir: {}
+     - name: run
+       hostPath:
+         path: /run
+   EOF
+   ```
+
+3. **Copy binary and start rusternetes (all-in-one mode):**
+   ```bash
+   # On build machine:
+   kubectl cp target/release/rusternetes agent-sandbox-system/rusternetes-e2e:/opt/rusternetes/
+
+   # Inside pod:
+   export CONTAINER_RUNTIME_ENDPOINT=unix:///host-run/containerd/containerd.sock
+   export IMAGE_SERVICE_ENDPOINT=unix:///host-run/containerd/containerd.sock
+   mkdir -p /tmp/rusternetes-data /tmp/rusternetes-volumes
+   /opt/rusternetes/rusternetes \
+     --storage-backend sqlite \
+     --data-dir /tmp/rusternetes-data/rusternetes.db \
+     --node-name node-1 \
+     --volume-dir /tmp/rusternetes-volumes \
+     --bind-address 0.0.0.0:6443
+   ```
+   **CRITICAL:** Use `--data-dir /path/to/file.db` (full file path), NOT a directory.
+   If `--data-dir` points to a directory, SQLite returns "unable to open database file".
+
+4. **Create a test client pod** that connects to the test pod:
+   ```bash
+   RUSTERNETES_IP=$(kubectl get pod -n agent-sandbox-system rusternetes-e2e -o jsonpath='{.status.podIP}')
+   kubectl apply -f - << EOF
+   apiVersion: v1
+   kind: Pod
+   metadata:
+     name: e2e-client
+     namespace: agent-sandbox-system
+   spec:
+     containers:
+     - name: client
+       image: bitnami/kubectl:latest
+       command: ["sleep", "infinity"]
+   EOF
+   kubectl exec -n agent-sandbox-system -it pod/e2e-client -- env RUSTERNETES_IP=$RUSTERNETES_IP bash
+   ```
+
+   Then inside the client pod:
+   ```bash
+   export RUSTERNETES_IP=10.x.x.x   # test pod IP
+   export KUBE_CONFIG_FILE=/dev/null
+   kubectl --server=https://$RUSTERNETES_IP:6443 --insecure-skip-tls-verify cluster-info
+   ```
+
+5. **Run tests:**
+   ```bash
+   # Test 1: Create a deployment
+   kubectl --server=https://$RUSTERNETES_IP:6443 --insecure-skip-tls-verify run nginx --image=nginx:latest --replicas=1
+
+   # Test 2: Verify pod Running
+   kubectl --server=https://$RUSTERNETES_IP:6443 --insecure-skip-tls-verify get pods
+
+   # Test 3: kubectl logs
+   kubectl --server=https://$RUSTERNETES_IP:6443 --insecure-skip-tls-verify logs deploy/nginx
+
+   # Test 4: kubectl exec (basic)
+   kubectl --server=https://$RUSTERNETES_IP:6443 --insecure-skip-tls-verify exec deploy/nginx -- sh -c 'echo hi; exit 3'
+   # Expected: prints "hi", exit code 3
+
+   # Test 5: 50-exec loop — check for close 1005 errors
+   for i in $(seq 1 50); do
+     kubectl --server=https://$RUSTERNETES_IP:6443 --insecure-skip-tls-verify exec deploy/nginx -- sh -c "echo $i"
+   done
+
+   # Test 6: kubectl delete
+   kubectl --server=https://$RUSTERNETES_IP:6443 --insecure-skip-tls-verify delete deploy/nginx
+   ```
+
+- **Acceptance:**
+  - [ ] `kubectl run nginx` → pod Running with real IP
+  - [ ] `kubectl get pods` → shows correct statuses (Running, Pending, etc.)
+  - [ ] `kubectl logs` → returns real stdout from container
+  - [ ] `kubectl exec pod -- sh -c 'echo hi; exit 3'` → prints `hi`, exit code 3
+  - [ ] `kubectl port-forward pod 8080:80` → forwards to container's port 80
+  - [ ] 50-exec loop → zero `close 1005` errors in logs
+  - [ ] `kubectl delete pod` → proper cleanup
 
 ## Important Notes
 
