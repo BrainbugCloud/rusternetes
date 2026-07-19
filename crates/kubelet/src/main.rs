@@ -9,22 +9,12 @@ mod runtime;
 mod server;
 
 use anyhow::Result;
-use axum::{
-    extract::{Path, Query},
-    http::StatusCode,
-    routing::{get, post},
-    Json, Router,
-};
-use bollard::container::LogOutput;
-use bollard::exec::{CreateExecOptions, StartExecResults};
-use bollard::Docker;
+use axum::{routing::get, Json, Router};
 use clap::Parser;
 use config::{KubeletConfiguration, RuntimeConfig};
-use futures::StreamExt;
 use kubelet::Kubelet;
 use rusternetes_common::observability::MetricsRegistry;
 use rusternetes_storage::{StorageBackend, StorageConfig};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, warn, Level};
 
@@ -244,7 +234,6 @@ async fn main() -> Result<()> {
                 "/configz",
                 get(|| async move { Json(kubelet_config_clone.as_ref().clone()) }),
             )
-            .route("/exec/:container_id", post(handle_exec))
             .merge(server::router(cri_client));
 
         let listener = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
@@ -270,93 +259,4 @@ async fn main() -> Result<()> {
     kubelet.run().await?;
 
     Ok(())
-}
-
-/// Handle exec requests from the API server.
-///
-/// The API server proxies exec requests to the kubelet, which uses bollard
-/// to create and start a Docker exec on the target container.
-async fn handle_exec(
-    Path(container_id): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
-    body: axum::body::Bytes,
-) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let command: Vec<String> = params
-        .get("command")
-        .map(|c| c.split(',').map(|s| s.to_string()).collect())
-        .unwrap_or_default();
-    let stdin_data = if body.is_empty() { None } else { Some(body) };
-    let tty = params.get("tty").map(|v| v == "true").unwrap_or(false);
-
-    let docker = Docker::connect_with_local_defaults()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let exec_config = CreateExecOptions {
-        cmd: Some(command.iter().map(|s| s.as_str()).collect()),
-        attach_stdout: Some(true),
-        attach_stderr: Some(true),
-        attach_stdin: Some(stdin_data.is_some()),
-        tty: Some(tty),
-        ..Default::default()
-    };
-
-    let exec = docker
-        .create_exec(&container_id, exec_config)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Always use attached mode to collect output
-    let start_config = Some(bollard::exec::StartExecOptions {
-        detach: false,
-        ..Default::default()
-    });
-
-    let output = docker
-        .start_exec(&exec.id, start_config)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Collect output with short timeout per read to prevent hanging
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let exec_id = exec.id.clone();
-    if let StartExecResults::Attached {
-        output: mut stream, ..
-    } = output
-    {
-        loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(1), stream.next()).await {
-                Ok(Some(Ok(msg))) => match msg {
-                    LogOutput::StdOut { message } => stdout.extend_from_slice(&message),
-                    LogOutput::StdErr { message } => stderr.extend_from_slice(&message),
-                    _ => {}
-                },
-                Ok(Some(Err(_))) | Ok(None) => break, // stream ended or error
-                Err(_) => {
-                    // Timeout — check if exec is still running
-                    match docker.inspect_exec(&exec_id).await {
-                        Ok(info) => {
-                            if !info.running.unwrap_or(false) {
-                                break; // exec finished, stream just didn't close
-                            }
-                            // still running, continue waiting
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }
-        }
-    }
-
-    info!(
-        "Exec completed: container={}, stdout_len={}, stderr_len={}",
-        container_id,
-        stdout.len(),
-        stderr.len()
-    );
-
-    Ok(Json(serde_json::json!({
-        "stdout": String::from_utf8_lossy(&stdout),
-        "stderr": String::from_utf8_lossy(&stderr),
-    })))
 }

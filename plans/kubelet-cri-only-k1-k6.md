@@ -132,6 +132,46 @@ For conformance (K7, later): sonobuoy certified-conformance.
 Commit after each stage. Use `cargo build -p rusternetes-kubelet` for fast iteration.
 For e2e testing, build all binaries and run in the privileged pod.
 
+## Acceptance Criteria
+
+### K1 — Inventory + scaffolding
+- [x] `cri-proto` + `cri-server` deps added to the kubelet crate
+- [x] `--container-runtime-endpoint` / `--image-service-endpoint` config added
+- [x] bollard→CRI inventory produced (mapping table above)
+- [x] Kubelet crate compiles green
+
+### K2 — Sandbox + container lifecycle on CRI
+- [x] `start_pod` / `stop_pod_*` / container create/start/stop/remove rewritten on CRI
+- [x] `RuntimeState` caches rebuilt from `ListPodSandbox` / `ListContainers`
+- [x] `get_pod_ip` derived from `PodSandboxStatus.network.ip`
+
+### K3 — Statuses, init/ephemeral containers, GC
+- [x] `get_container_statuses` / init / ephemeral / GC implemented on CRI types
+- [x] containerID prefixes taken from `Version()` (`containerd://…`)
+
+### K4 — Logs pipeline end to end
+- [x] `log_directory` / `log_path` wired into `PodSandboxConfig` / `ContainerConfig`
+- [x] Kubelet `/containerLogs/…` endpoint with follow / tailLines / sinceSeconds / sinceTime / timestamps / previous / limitBytes via the CRI log reader
+- [x] api-server `log` subresource proxies to the kubelet; `generate_pod_logs` fallback deleted
+
+### K5 — Exec / attach / portforward streaming
+- [x] Probes and lifecycle hooks execute via CRI `ExecSync` (no bollard)
+- [x] `main.rs` `handle_exec` (bollard Docker exec) deleted
+- [ ] Kubelet proxy of CRI `Exec` / `Attach` / `PortForward` streaming URLs
+- [ ] api-server websocket⇄SPDY translation with proper close frames
+
+### K6 — Stats, eviction, bollard removal
+- [x] `collect_node_metrics` reimplemented on CRI `ListContainerStats`
+- [x] `eviction.rs` pod stats reimplemented on CRI `ListContainerStats` (working-set memory + writable-layer disk)
+- [x] `bollard` removed from the kubelet `Cargo.toml`
+- [x] `grep -r bollard crates/kubelet/` → empty; crate compiles green and unit tests pass
+
+> **Note:** End-to-end acceptances that require a live containerd runtime
+> (`kubectl run nginx` → Running with real IP, `kubectl logs -f`, `kubectl exec`
+> exit codes, `kubectl port-forward`, the 50-exec `close 1005` gate) are not
+> verifiable in the current non-privileged build container and were not run.
+> They require the privileged-pod + containerd test setup described above.
+
 ## Important Notes
 
 - Don't delete the `cni/` subtree yet — it's unused on CRI path but removal is follow-up

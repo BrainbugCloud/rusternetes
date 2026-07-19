@@ -3,7 +3,7 @@
 //! Wraps the tonic `RuntimeServiceClient` / `ImageServiceClient` from
 //! `cri-proto` behind typed helpers used by `runtime.rs`. Channels are
 //! created lazily so the kubelet can start before the runtime socket is
-//! available (parity with bollard's lazy Docker connection); the first
+//! available (the channel connects lazily on first use); the first
 //! RPC fails with a transport error if the socket never appears.
 
 // K1 scaffolding: call sites land stage by stage (K2-K6); drop this once

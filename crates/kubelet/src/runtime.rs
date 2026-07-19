@@ -1,13 +1,5 @@
 use anyhow::{Context, Result};
-use bollard::container::{
-    Config, CreateContainerOptions, InspectContainerOptions, ListContainersOptions,
-    RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
-};
-use bollard::exec::{CreateExecOptions, StartExecResults};
-use bollard::image::CreateImageOptions;
-use bollard::Docker;
 use chrono::Utc;
-use futures_util::StreamExt;
 use rusternetes_common::resources::{
     ConfigMap, Container, ContainerState, ContainerStatus, ExecAction, GRPCAction, HTTPGetAction,
     LifecycleHandler, PersistentVolume, PersistentVolumeClaim, Pod, Probe, Secret, TCPSocketAction,
@@ -84,12 +76,10 @@ struct ProbeState {
     consecutive_successes: i32,
 }
 
-/// ContainerRuntime manages containers using Docker/Podman with CNI networking
+/// ContainerRuntime manages pods and containers via the Container Runtime
+/// Interface (CRI), talking to containerd (or any CRI runtime) over gRPC.
 pub struct ContainerRuntime {
-    docker: Docker,
-    /// CRI runtime + image service clients (K1 scaffolding; call sites are
-    /// migrated off bollard stage by stage, see plan/02-kubelet-cri-only.md).
-    #[allow(dead_code)]
+    /// CRI runtime + image service clients.
     cri: CriClient,
     /// Runtime name from CRI `Version()` (e.g. "containerd"), used for
     /// containerID prefixes. Cached on first use.
@@ -198,7 +188,6 @@ impl ContainerRuntime {
         container_runtime_endpoint: String,
         image_service_endpoint: String,
     ) -> Result<Self> {
-        let docker = Docker::connect_with_local_defaults()?;
         let cri = CriClient::new(&container_runtime_endpoint, &image_service_endpoint);
 
         info!(
@@ -233,7 +222,6 @@ impl ContainerRuntime {
         let token_manager = rusternetes_common::auth::TokenManager::new_auto(jwt_secret.as_bytes());
 
         Ok(Self {
-            docker,
             cri,
             runtime_name: tokio::sync::OnceCell::new(),
             storage: None,
@@ -350,14 +338,8 @@ impl ContainerRuntime {
     fn pod_labels(pod: &Pod) -> HashMap<String, String> {
         let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
         HashMap::from([
-            (
-                cri_labels::POD_NAME.to_string(),
-                pod.metadata.name.clone(),
-            ),
-            (
-                cri_labels::POD_NAMESPACE.to_string(),
-                namespace.to_string(),
-            ),
+            (cri_labels::POD_NAME.to_string(), pod.metadata.name.clone()),
+            (cri_labels::POD_NAMESPACE.to_string(), namespace.to_string()),
             (cri_labels::POD_UID.to_string(), pod.metadata.uid.clone()),
         ])
     }
@@ -388,9 +370,7 @@ impl ContainerRuntime {
         let pod_name = &pod.metadata.name;
         let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
         let spec = pod.spec.as_ref();
-        let host_network = spec
-            .and_then(|s| s.host_network)
-            .unwrap_or(false);
+        let host_network = spec.and_then(|s| s.host_network).unwrap_or(false);
 
         // Hostname: empty when the sandbox shares the node network namespace.
         let hostname = if host_network {
@@ -652,7 +632,11 @@ impl ContainerRuntime {
             .await
             .ok()??;
         let status = self.cri.container_status(&container.id).await.ok()?;
-        let cid = Some(format!("{}://{}", self.runtime_prefix().await, container.id));
+        let cid = Some(format!(
+            "{}://{}",
+            self.runtime_prefix().await,
+            container.id
+        ));
         let iid = if status.image_ref.is_empty() {
             None
         } else {
@@ -978,7 +962,10 @@ impl ContainerRuntime {
         let pod_ip: Option<String> = match self.sandbox_ip(&sandbox_id).await {
             Ok(ip) => {
                 if let Some(ref ip) = ip {
-                    info!("Sandbox {} assigned IP {} for pod {}", sandbox_id, ip, pod_name);
+                    info!(
+                        "Sandbox {} assigned IP {} for pod {}",
+                        sandbox_id, ip, pod_name
+                    );
                 }
                 ip
             }
@@ -3247,11 +3234,7 @@ impl ContainerRuntime {
         // restart count source of truth.
         let mut attempt: u32 = 0;
         if let Ok(Some(existing)) = self.cri.find_container(pod_name, &container.name).await {
-            let prev_attempt = existing
-                .metadata
-                .as_ref()
-                .map(|m| m.attempt)
-                .unwrap_or(0);
+            let prev_attempt = existing.metadata.as_ref().map(|m| m.attempt).unwrap_or(0);
             match Self::cri_state(existing.state) {
                 v1::ContainerState::ContainerRunning => return Ok(()),
                 v1::ContainerState::ContainerCreated => {
@@ -4185,10 +4168,7 @@ impl ContainerRuntime {
             // retrieval. Conformance tests read logs from completed/deleted
             // pods after the pod has been deleted from the API. The orphaned
             // container cleanup will remove them on the next cycle.
-            debug!(
-                "Container {} stopped, keeping for log access",
-                container.id
-            );
+            debug!("Container {} stopped, keeping for log access", container.id);
         }
 
         // Stop the sandbox last
@@ -4686,30 +4666,27 @@ impl ContainerRuntime {
         for ec in ecs {
             let status = match self.cri_status_for(pod_name, &ec.name).await {
                 Some((cs, cid, iid)) => {
-                    let running =
-                        Self::cri_state(cs.state) == v1::ContainerState::ContainerRunning;
+                    let running = Self::cri_state(cs.state) == v1::ContainerState::ContainerRunning;
 
                     let container_state = match Self::cri_state(cs.state) {
                         v1::ContainerState::ContainerRunning => Some(ContainerState::Running {
                             started_at: Self::nanos_to_rfc3339(cs.started_at),
                         }),
-                        v1::ContainerState::ContainerExited => {
-                            Some(ContainerState::Terminated {
-                                exit_code: cs.exit_code,
-                                signal: None,
-                                reason: Some(if cs.exit_code == 0 {
-                                    "Completed".to_string()
-                                } else if !cs.reason.is_empty() {
-                                    cs.reason.clone()
-                                } else {
-                                    "Error".to_string()
-                                }),
-                                message: None,
-                                started_at: Self::nanos_to_rfc3339(cs.started_at),
-                                finished_at: Self::nanos_to_rfc3339(cs.finished_at),
-                                container_id: cid.clone(),
-                            })
-                        }
+                        v1::ContainerState::ContainerExited => Some(ContainerState::Terminated {
+                            exit_code: cs.exit_code,
+                            signal: None,
+                            reason: Some(if cs.exit_code == 0 {
+                                "Completed".to_string()
+                            } else if !cs.reason.is_empty() {
+                                cs.reason.clone()
+                            } else {
+                                "Error".to_string()
+                            }),
+                            message: None,
+                            started_at: Self::nanos_to_rfc3339(cs.started_at),
+                            finished_at: Self::nanos_to_rfc3339(cs.finished_at),
+                            container_id: cid.clone(),
+                        }),
                         _ => Some(ContainerState::Waiting {
                             reason: Some("ContainerCreating".to_string()),
                             message: None,
@@ -5094,8 +5071,7 @@ impl ContainerRuntime {
                 let initial_delay = probe.initial_delay_seconds.unwrap_or(0);
                 if initial_delay > 0 {
                     // Check container start time
-                    if let Some((cs, _, _)) = self.cri_status_for(pod_name, &container.name).await
-                    {
+                    if let Some((cs, _, _)) = self.cri_status_for(pod_name, &container.name).await {
                         if cs.started_at > 0 {
                             let now_nanos = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
                             let elapsed_secs = (now_nanos - cs.started_at) / 1_000_000_000;
@@ -5178,7 +5154,9 @@ impl ContainerRuntime {
 
         // Exec probe
         if let Some(exec) = &probe.exec {
-            return self.check_exec_probe(container_name, exec, timeout).await;
+            return self
+                .check_exec_probe(container_name, container, exec, timeout)
+                .await;
         }
 
         // gRPC probe
@@ -5415,37 +5393,47 @@ impl ContainerRuntime {
         }
     }
 
+    /// Resolve a `{pod}_{container}` kubelet container name to the current CRI
+    /// container id by looking it up via the pod-name + container-name labels.
+    async fn cri_container_id(
+        &self,
+        container_name: &str,
+        container: &Container,
+    ) -> Option<String> {
+        let pod_name = container_name
+            .strip_suffix(&format!("_{}", container.name))
+            .unwrap_or(container_name);
+        self.cri
+            .find_container(pod_name, &container.name)
+            .await
+            .ok()
+            .flatten()
+            .map(|c| c.id)
+    }
+
     async fn check_exec_probe(
         &self,
         container_name: &str,
+        container: &Container,
         exec: &ExecAction,
-        _timeout: Duration,
+        timeout: Duration,
     ) -> Result<bool> {
         debug!("Exec probe: {:?}", exec.command);
 
-        let exec_config = CreateExecOptions {
-            cmd: Some(exec.command.clone()),
-            attach_stdout: Some(true),
-            attach_stderr: Some(true),
-            ..Default::default()
+        let Some(container_id) = self.cri_container_id(container_name, container).await else {
+            debug!("Exec probe: container {} not found in CRI", container_name);
+            return Ok(false);
         };
 
-        let exec_id = self
-            .docker
-            .create_exec(container_name, exec_config)
-            .await?
-            .id;
-
-        let start_result = self.docker.start_exec(&exec_id, None).await?;
-
-        match start_result {
-            StartExecResults::Attached { mut output, .. } => while output.next().await.is_some() {},
-            StartExecResults::Detached => {}
-        }
-
-        // Get exec inspect to check exit code
-        let inspect = self.docker.inspect_exec(&exec_id).await?;
-        let exit_code = inspect.exit_code.unwrap_or(1);
+        // CRI ExecSync applies the probe timeout server-side (0 = no timeout).
+        let (exit_code, _stdout, _stderr) = self
+            .cri
+            .exec_sync(
+                &container_id,
+                exec.command.clone(),
+                timeout.as_secs() as i64,
+            )
+            .await?;
 
         Ok(exit_code == 0)
     }
@@ -5555,38 +5543,24 @@ impl ContainerRuntime {
                 "Lifecycle exec handler: {:?} in {}",
                 exec.command, container_name
             );
-            let exec_config = CreateExecOptions {
-                cmd: Some(exec.command.clone()),
-                attach_stdout: Some(true),
-                attach_stderr: Some(true),
-                ..Default::default()
-            };
-
-            let exec_id = self
-                .docker
-                .create_exec(container_name, exec_config)
+            let container_id = self
+                .cri_container_id(container_name, container)
                 .await
-                .context("Failed to create exec for lifecycle handler")?
-                .id;
+                .with_context(|| {
+                    format!(
+                        "container {} not found in CRI for lifecycle exec",
+                        container_name
+                    )
+                })?;
 
-            let start_result = self
-                .docker
-                .start_exec(&exec_id, None)
+            // ExecSync bounds the handler at 30s server-side, matching the
+            // previous drain timeout.
+            let (exit_code, _stdout, _stderr) = self
+                .cri
+                .exec_sync(&container_id, exec.command.clone(), 30)
                 .await
-                .context("Failed to start exec for lifecycle handler")?;
+                .context("Failed to run exec for lifecycle handler")?;
 
-            // Drain output with a timeout to prevent indefinite hangs
-            match start_result {
-                StartExecResults::Attached { mut output, .. } => {
-                    let drain = async { while output.next().await.is_some() {} };
-                    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), drain).await;
-                }
-                StartExecResults::Detached => {}
-            }
-
-            // Check exit code
-            let inspect = self.docker.inspect_exec(&exec_id).await?;
-            let exit_code = inspect.exit_code.unwrap_or(1);
             if exit_code != 0 {
                 return Err(anyhow::anyhow!(
                     "Lifecycle exec handler exited with code {}",
@@ -5694,52 +5668,10 @@ impl ContainerRuntime {
                     resolved.unwrap_or_else(|| host.clone())
                 }
             } else {
-                let inspect = self
-                    .docker
-                    .inspect_container(container_name, None::<InspectContainerOptions>)
-                    .await?;
-                let container_ip = inspect
-                    .network_settings
-                    .as_ref()
-                    .and_then(|ns| ns.ip_address.as_ref())
-                    .filter(|ip| !ip.is_empty())
-                    .cloned();
-                if let Some(ip) = container_ip {
-                    ip
-                } else {
-                    // Container uses container: network mode — get IP from the pause container.
-                    // Container names have format "{pod_name}_{container_suffix}".
-                    // Use rsplitn(2, '_') to split at the last underscore, preserving
-                    // any underscores in the pod name itself.
-                    let pod_name = container_name
-                        .rsplitn(2, '_')
-                        .last()
-                        .unwrap_or(container_name);
-                    let pause_name = format!("{}_pause", pod_name);
-                    info!(
-                        "Lifecycle HTTP handler: resolving IP from pause container {} (container: {})",
-                        pause_name, container_name
-                    );
-                    let pause_inspect = self
-                        .docker
-                        .inspect_container(&pause_name, None::<InspectContainerOptions>)
-                        .await
-                        .ok();
-                    pause_inspect
-                        .and_then(|pi| pi.network_settings)
-                        .and_then(|ns| {
-                            // Check bridge network first, then global IP
-                            ns.networks
-                                .and_then(|nets| {
-                                    nets.values()
-                                        .next()
-                                        .and_then(|n| n.ip_address.clone())
-                                        .filter(|ip| !ip.is_empty())
-                                })
-                                .or_else(|| ns.ip_address.filter(|ip| !ip.is_empty()))
-                        })
-                        .unwrap_or_else(|| "127.0.0.1".to_string())
-                }
+                // Resolve the container IP from its pod sandbox via CRI. The
+                // sandbox owns the network namespace, so this also covers
+                // container: network-mode containers.
+                self.get_effective_container_ip(container_name).await
             };
 
             let scheme = http_get.scheme.as_deref().unwrap_or("HTTP").to_lowercase();
@@ -5786,16 +5718,9 @@ impl ContainerRuntime {
                 }
             }
         } else if let Some(ref tcp_socket) = handler.tcp_socket {
-            // Open TCP connection to the container
-            let inspect = self
-                .docker
-                .inspect_container(container_name, None::<InspectContainerOptions>)
-                .await?;
-
-            let ip = inspect
-                .network_settings
-                .and_then(|ns| ns.ip_address)
-                .unwrap_or_else(|| "127.0.0.1".to_string());
+            // Open TCP connection to the container (IP resolved from the pod
+            // sandbox via CRI).
+            let ip = self.get_effective_container_ip(container_name).await;
 
             let port =
                 rusternetes_common::resources::resolve_probe_port(&tcp_socket.port, container)
@@ -6017,10 +5942,7 @@ impl ContainerRuntime {
                 warn!("Failed to stop container {}: {}", container.id, e);
             }
 
-            debug!(
-                "Container {} stopped, keeping for log access",
-                container.id
-            );
+            debug!("Container {} stopped, keeping for log access", container.id);
         }
 
         // Stop the sandbox last — the network namespace dies with it
@@ -6693,9 +6615,7 @@ impl ContainerRuntime {
     pub async fn get_container_age(&self, pod_name: &str) -> Result<std::time::Duration> {
         match self.get_any_sandbox(pod_name).await {
             Ok(Some(sandbox)) if sandbox.created_at > 0 => {
-                let now_nanos = chrono::Utc::now()
-                    .timestamp_nanos_opt()
-                    .unwrap_or(i64::MAX);
+                let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
                 let age_nanos = (now_nanos - sandbox.created_at).max(0);
                 Ok(std::time::Duration::from_nanos(age_nanos as u64))
             }
@@ -6705,122 +6625,77 @@ impl ContainerRuntime {
 
     /// Collect CPU and memory usage for all containers belonging to pods on this node.
     /// Returns (cpu_millicores, memory_bytes).
+    ///
+    /// Uses CRI `ListContainerStats`, which reports averaged CPU (nano-cores)
+    /// and working-set memory per container — no sampling window needed.
     pub async fn collect_node_metrics(&self, pod_names: &[String]) -> (u64, u64) {
-        use futures::StreamExt;
-
         if pod_names.is_empty() {
             return (0, 0);
         }
 
-        let opts = ListContainersOptions::<String> {
-            all: false,
-            ..Default::default()
-        };
-
-        let containers = match self.docker.list_containers(Some(opts)).await {
-            Ok(c) => c,
+        let stats = match self.cri.list_container_stats(None).await {
+            Ok(s) => s,
             Err(e) => {
-                warn!("Failed to list containers for metrics: {}", e);
+                warn!("Failed to list container stats for metrics: {}", e);
                 return (0, 0);
             }
         };
 
-        // Match containers to pods by name prefix ({pod_name}_{container_name})
-        // Skip pause containers — they have minimal resource usage
-        let node_containers: Vec<_> = containers
-            .iter()
-            .filter(|c| {
-                if let Some(names) = &c.names {
-                    for name in names {
-                        let clean = name.trim_start_matches('/');
-                        if clean.ends_with("_pause") {
-                            return false;
-                        }
-                        for pod_name in pod_names {
-                            if clean.starts_with(pod_name) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-                false
-            })
-            .collect();
-
-        if node_containers.is_empty() {
-            return (0, 0);
-        }
-
-        // Collect stats from all containers in parallel
-        let mut stat_futures = Vec::new();
-        for container in &node_containers {
-            if let Some(id) = &container.id {
-                let id_clone = id.clone();
-                let docker_ref = &self.docker;
-                stat_futures.push(async move {
-                    let stats_opts = bollard::container::StatsOptions {
-                        stream: true,
-                        one_shot: false,
-                    };
-                    let mut stream = docker_ref.stats(&id_clone, Some(stats_opts));
-                    // Skip first sample (precpu_stats may be zeros), use second
-                    let _ = stream.next().await;
-                    let second = stream.next().await;
-                    drop(stream);
-                    second
-                });
-            }
-        }
-
-        let results = futures::future::join_all(stat_futures).await;
+        let node_pods: std::collections::HashSet<&String> = pod_names.iter().collect();
 
         let mut total_memory_bytes: u64 = 0;
-        let mut total_cpu_pct: f64 = 0.0;
+        let mut total_cpu_nanocores: u64 = 0;
+        let mut counted = 0usize;
 
-        for result in results {
-            if let Some(Ok(stats)) = result {
-                // Memory: usage minus cache
-                if let Some(usage) = stats.memory_stats.usage {
-                    let cache = stats
-                        .memory_stats
-                        .stats
-                        .as_ref()
-                        .map(|s| match s {
-                            bollard::container::MemoryStatsStats::V1(v1) => v1.cache,
-                            bollard::container::MemoryStatsStats::V2(v2) => v2.inactive_file,
-                        })
-                        .unwrap_or(0);
-                    total_memory_bytes += usage.saturating_sub(cache);
-                }
+        for stat in &stats {
+            // Only account for containers whose pod is scheduled on this node.
+            let belongs = stat
+                .attributes
+                .as_ref()
+                .and_then(|a| a.labels.get(cri_labels::POD_NAME))
+                .map(|pod| node_pods.contains(pod))
+                .unwrap_or(false);
+            if !belongs {
+                continue;
+            }
+            counted += 1;
 
-                // CPU: delta between current and previous sample
-                let total_usage = stats.cpu_stats.cpu_usage.total_usage;
-                if let Some(system_cpu) = stats.cpu_stats.system_cpu_usage {
-                    let prev_total = stats.precpu_stats.cpu_usage.total_usage;
-                    let prev_system = stats.precpu_stats.system_cpu_usage.unwrap_or(0);
-                    let cpu_delta = total_usage.saturating_sub(prev_total);
-                    let system_delta = system_cpu.saturating_sub(prev_system);
-                    if system_delta > 0 {
-                        let num_cpus = stats.cpu_stats.online_cpus.unwrap_or(1);
-                        total_cpu_pct +=
-                            (cpu_delta as f64 / system_delta as f64) * num_cpus as f64 * 100.0;
-                    }
-                }
+            if let Some(mem) = stat
+                .memory
+                .as_ref()
+                .and_then(|m| m.working_set_bytes.as_ref())
+            {
+                total_memory_bytes += mem.value;
+            }
+            if let Some(cpu) = stat.cpu.as_ref().and_then(|c| c.usage_nano_cores.as_ref()) {
+                total_cpu_nanocores += cpu.value;
             }
         }
 
-        // Convert CPU percentage to millicores (1 core = 1000m, so 3.5% = 35m)
-        let cpu_millicores = (total_cpu_pct * 10.0) as u64;
+        // nano-cores → millicores (1 core = 1e9 nano-cores = 1000m).
+        let cpu_millicores = total_cpu_nanocores / 1_000_000;
 
         debug!(
             "Node metrics: {}m CPU, {} bytes memory ({} containers from {} pods)",
             cpu_millicores,
             total_memory_bytes,
-            node_containers.len(),
+            counted,
             pod_names.len()
         );
 
         (cpu_millicores, total_memory_bytes)
+    }
+
+    /// All CRI container stats on this node. Used by the eviction manager to
+    /// compute per-pod working-set memory and writable-layer disk usage.
+    pub async fn all_container_stats(&self) -> Vec<v1::ContainerStats> {
+        self.cri
+            .list_container_stats(None)
+            .await
+            .unwrap_or_else(|e| {
+                warn!("Failed to list container stats for eviction: {}", e);
+                Vec::new()
+            })
     }
 }
 
@@ -8345,7 +8220,7 @@ mod tests {
     #[test]
     fn test_sysctls_values_passed_to_docker_config() {
         // Verify the sysctl values are collected into the HashMap format
-        // that bollard's HostConfig.sysctls expects
+        // that the CRI LinuxContainerConfig sysctls map expects
         let sysctls = vec![
             Sysctl {
                 name: "net.ipv4.ip_forward".to_string(),

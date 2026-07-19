@@ -139,11 +139,7 @@ async fn logs_response(
                 }
             }
         }
-        return Ok((
-            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            body,
-        )
-            .into_response());
+        return Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response());
     }
 
     // follow: initial batch honoring since/tail, then stream file growth
@@ -154,7 +150,16 @@ async fn logs_response(
     let timestamps = query.timestamps;
     let limit_bytes = query.limit_bytes;
     tokio::spawn(async move {
-        follow_logs(cri, container_id, log_path, opts, timestamps, limit_bytes, tx).await;
+        follow_logs(
+            cri,
+            container_id,
+            log_path,
+            opts,
+            timestamps,
+            limit_bytes,
+            tx,
+        )
+        .await;
     });
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     Ok(Response::builder()

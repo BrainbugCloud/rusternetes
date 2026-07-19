@@ -4077,7 +4077,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
- "bollard",
  "chrono",
  "clap",
  "cri-proto",
