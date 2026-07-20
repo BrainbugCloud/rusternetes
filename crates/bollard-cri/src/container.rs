@@ -121,9 +121,15 @@ fn mount_bindings(mounts: &[Mount]) -> Result<Vec<DockerMount>> {
             // when the source contains the daemon root).
             _ => {}
         }
+        // Docker rejects relative mount paths in the HostConfig.Mounts field
+        // (unlike the legacy Binds field). Canonicalize before sending.
+        let host_path = std::path::absolute(std::path::Path::new(&m.host_path))
+            .unwrap_or_else(|_| std::path::PathBuf::from(&m.host_path))
+            .to_string_lossy()
+            .into_owned();
         result.push(DockerMount {
             typ: Some(MountTypeEnum::BIND),
-            source: Some(m.host_path.clone()),
+            source: Some(host_path),
             target: Some(m.container_path.clone()),
             read_only: m.readonly.then_some(true),
             bind_options: Some(bind_options),
