@@ -36,6 +36,34 @@ pub mod labels {
     pub const RESTART_COUNT: &str = "io.rusternetes.container.restart-count";
 }
 
+/// Label selector matching every sandbox/container of a pod, keyed by BOTH
+/// namespace and name. Both labels are required: pod names are only unique
+/// within a namespace, so a name-only selector would also match same-named
+/// pods in other namespaces (the cross-namespace identity bug this guards).
+fn pod_label_selector(
+    namespace: &str,
+    pod_name: &str,
+) -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::from([
+        (labels::POD_NAMESPACE.to_string(), namespace.to_string()),
+        (labels::POD_NAME.to_string(), pod_name.to_string()),
+    ])
+}
+
+/// Like [`pod_label_selector`] but additionally pins the container name.
+fn container_label_selector(
+    namespace: &str,
+    pod_name: &str,
+    container_name: &str,
+) -> std::collections::HashMap<String, String> {
+    let mut selector = pod_label_selector(namespace, pod_name);
+    selector.insert(
+        labels::CONTAINER_NAME.to_string(),
+        container_name.to_string(),
+    );
+    selector
+}
+
 /// Build a lazily-connecting tonic channel over a unix domain socket.
 ///
 /// Accepts `unix:///path`, `unix:/path`, or a bare filesystem path.
@@ -157,15 +185,20 @@ impl CriClient {
             .items)
     }
 
-    /// List sandboxes carrying the given pod-name label (any state).
-    pub async fn sandboxes_for_pod(&self, pod_name: &str) -> Result<Vec<v1::PodSandbox>> {
+    /// List sandboxes carrying the given namespace+pod-name labels (any state).
+    ///
+    /// Both labels are required: pod names are only unique within a namespace,
+    /// so filtering by name alone would match same-named pods in OTHER
+    /// namespaces and cause cross-namespace sandbox termination.
+    pub async fn sandboxes_for_pod(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+    ) -> Result<Vec<v1::PodSandbox>> {
         self.list_pod_sandbox(Some(v1::PodSandboxFilter {
             id: String::new(),
             state: None,
-            label_selector: std::collections::HashMap::from([(
-                labels::POD_NAME.to_string(),
-                pod_name.to_string(),
-            )]),
+            label_selector: pod_label_selector(namespace, pod_name),
         }))
         .await
     }
@@ -235,23 +268,29 @@ impl CriClient {
             .containers)
     }
 
-    /// List containers carrying the given pod-name label (any state).
-    pub async fn containers_for_pod(&self, pod_name: &str) -> Result<Vec<v1::Container>> {
+    /// List containers carrying the given namespace+pod-name labels (any state).
+    ///
+    /// Both labels are required — see `sandboxes_for_pod` for why name alone
+    /// is unsafe across namespaces.
+    pub async fn containers_for_pod(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+    ) -> Result<Vec<v1::Container>> {
         self.list_containers(Some(v1::ContainerFilter {
             id: String::new(),
             state: None,
             pod_sandbox_id: String::new(),
-            label_selector: std::collections::HashMap::from([(
-                labels::POD_NAME.to_string(),
-                pod_name.to_string(),
-            )]),
+            label_selector: pod_label_selector(namespace, pod_name),
         }))
         .await
     }
 
     /// Find one container by namespace + pod-name + container-name labels,
-    /// preferring the newest attempt.
-    pub async fn find_container_scoped(
+    /// preferring the newest attempt. Namespace is required: pod names are not
+    /// globally unique, so a name-only match can return a same-named container
+    /// from another namespace.
+    pub async fn find_container(
         &self,
         namespace: &str,
         pod_name: &str,
@@ -262,41 +301,9 @@ impl CriClient {
                 id: String::new(),
                 state: None,
                 pod_sandbox_id: String::new(),
-                label_selector: std::collections::HashMap::from([
-                    (labels::POD_NAMESPACE.to_string(), namespace.to_string()),
-                    (labels::POD_NAME.to_string(), pod_name.to_string()),
-                    (
-                        labels::CONTAINER_NAME.to_string(),
-                        container_name.to_string(),
-                    ),
-                ]),
+                label_selector: container_label_selector(namespace, pod_name, container_name),
             }))
             .await?;
-        found.sort_by_key(|c| std::cmp::Reverse(c.created_at));
-        Ok(found.into_iter().next())
-    }
-
-    /// Find one container by pod-name + container-name labels.
-    pub async fn find_container(
-        &self,
-        pod_name: &str,
-        container_name: &str,
-    ) -> Result<Option<v1::Container>> {
-        let mut found = self
-            .list_containers(Some(v1::ContainerFilter {
-                id: String::new(),
-                state: None,
-                pod_sandbox_id: String::new(),
-                label_selector: std::collections::HashMap::from([
-                    (labels::POD_NAME.to_string(), pod_name.to_string()),
-                    (
-                        labels::CONTAINER_NAME.to_string(),
-                        container_name.to_string(),
-                    ),
-                ]),
-            }))
-            .await?;
-        // Prefer the newest attempt if multiple exist.
         found.sort_by_key(|c| std::cmp::Reverse(c.created_at));
         Ok(found.into_iter().next())
     }
@@ -456,5 +463,60 @@ impl CriClient {
             .context("CRI PullImage")?
             .into_inner()
             .image_ref)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression guard for the cross-namespace pod-identity bug: the pod-scoped
+    /// CRI lookups (`sandboxes_for_pod`, `containers_for_pod`) MUST filter on BOTH
+    /// the pod-namespace and pod-name labels. Filtering by name alone matched
+    /// same-named pods in other namespaces and terminated the wrong pod.
+    #[test]
+    fn pod_label_selector_includes_namespace_and_name() {
+        let selector = pod_label_selector("team-a", "web-0");
+        assert_eq!(
+            selector.get(labels::POD_NAMESPACE).map(String::as_str),
+            Some("team-a")
+        );
+        assert_eq!(
+            selector.get(labels::POD_NAME).map(String::as_str),
+            Some("web-0")
+        );
+        // Exactly the two identity labels — no accidental extra/missing keys.
+        assert_eq!(selector.len(), 2);
+    }
+
+    /// `find_container` additionally pins the container name, but must still carry
+    /// the namespace label so it can never resolve a container of a same-named pod
+    /// in another namespace.
+    #[test]
+    fn container_label_selector_includes_namespace_name_and_container() {
+        let selector = container_label_selector("team-a", "web-0", "nginx");
+        assert_eq!(
+            selector.get(labels::POD_NAMESPACE).map(String::as_str),
+            Some("team-a")
+        );
+        assert_eq!(
+            selector.get(labels::POD_NAME).map(String::as_str),
+            Some("web-0")
+        );
+        assert_eq!(
+            selector.get(labels::CONTAINER_NAME).map(String::as_str),
+            Some("nginx")
+        );
+        assert_eq!(selector.len(), 3);
+    }
+
+    /// Two pods sharing a name across namespaces produce distinct selectors,
+    /// so their sandboxes/containers can never be confused.
+    #[test]
+    fn same_name_different_namespace_selectors_differ() {
+        assert_ne!(
+            pod_label_selector("team-a", "web-0"),
+            pod_label_selector("team-b", "web-0"),
+        );
     }
 }

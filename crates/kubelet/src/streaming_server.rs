@@ -111,7 +111,7 @@ async fn handle_connection(
 
     // 2. Find the container via CRI labels.
     let container = cri
-        .find_container_scoped(&client_req.namespace, &client_req.pod, &client_req.container)
+        .find_container(&client_req.namespace, &client_req.pod, &client_req.container)
         .await?
         .with_context(|| {
             format!(

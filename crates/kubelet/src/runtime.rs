@@ -282,8 +282,12 @@ impl ContainerRuntime {
         Ok(cni)
     }
 
-    pub fn volumes_base_path(&self) -> &str {
-        &self.volumes_base_path
+    /// On-disk root for a pod's volumes. Namespaced because pod names are only
+    /// unique within a namespace; two same-named pods in different namespaces
+    /// must not share or delete each other's volume directory. Matches the
+    /// `{namespace}_{name}` convention already used for the pod log directory.
+    pub fn pod_volume_root(&self, namespace: &str, pod_name: &str) -> String {
+        format!("{}/{}_{}", self.volumes_base_path, namespace, pod_name)
     }
 
     pub fn with_storage(mut self, storage: Arc<rusternetes_storage::StorageBackend>) -> Self {
@@ -531,8 +535,12 @@ impl ContainerRuntime {
     }
 
     /// Newest READY sandbox for a pod, if any.
-    async fn get_ready_sandbox(&self, pod_name: &str) -> Result<Option<v1::PodSandbox>> {
-        let mut sandboxes = self.cri.sandboxes_for_pod(pod_name).await?;
+    async fn get_ready_sandbox(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+    ) -> Result<Option<v1::PodSandbox>> {
+        let mut sandboxes = self.cri.sandboxes_for_pod(namespace, pod_name).await?;
         sandboxes.sort_by_key(|s| std::cmp::Reverse(s.created_at));
         Ok(sandboxes
             .into_iter()
@@ -540,8 +548,12 @@ impl ContainerRuntime {
     }
 
     /// Newest sandbox for a pod in any state.
-    async fn get_any_sandbox(&self, pod_name: &str) -> Result<Option<v1::PodSandbox>> {
-        let mut sandboxes = self.cri.sandboxes_for_pod(pod_name).await?;
+    async fn get_any_sandbox(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+    ) -> Result<Option<v1::PodSandbox>> {
+        let mut sandboxes = self.cri.sandboxes_for_pod(namespace, pod_name).await?;
         sandboxes.sort_by_key(|s| std::cmp::Reverse(s.created_at));
         Ok(sandboxes.into_iter().next())
     }
@@ -554,14 +566,22 @@ impl ContainerRuntime {
     /// etc.) — don't treat it as stale; wait for it to become ready.
     async fn ensure_sandbox(&self, pod: &Pod) -> Result<(String, v1::PodSandboxConfig)> {
         let config = self.sandbox_config_for_pod(pod);
-        if let Some(sandbox) = self.get_ready_sandbox(&pod.metadata.name).await? {
+        let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
+        if let Some(sandbox) = self
+            .get_ready_sandbox(namespace, &pod.metadata.name)
+            .await?
+        {
             return Ok((sandbox.id, config));
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        for stale in self.cri.sandboxes_for_pod(&pod.metadata.name).await? {
+        for stale in self
+            .cri
+            .sandboxes_for_pod(namespace, &pod.metadata.name)
+            .await?
+        {
             // Don't remove a sandbox that was just created — it may still be
             // initializing. The sync loop will retry on the next cycle.
             if stale.created_at > now - 10 {
@@ -641,12 +661,13 @@ impl ContainerRuntime {
     /// the container doesn't exist in the runtime.
     async fn cri_status_for(
         &self,
+        namespace: &str,
         pod_name: &str,
         container_name: &str,
     ) -> Option<(v1::ContainerStatus, Option<String>, Option<String>)> {
         let container = self
             .cri
-            .find_container(pod_name, container_name)
+            .find_container(namespace, pod_name, container_name)
             .await
             .ok()??;
         let status = self.cri.container_status(&container.id).await.ok()?;
@@ -666,11 +687,11 @@ impl ContainerRuntime {
     /// Setup CNI networking for a pod
     /// Creates a network namespace and configures CNI networking
     /// Returns None if CNI setup fails (will fall back to Podman networking)
-    async fn setup_pod_network(&self, pod_name: &str) -> Option<String> {
+    async fn setup_pod_network(&self, namespace: &str, pod_name: &str) -> Option<String> {
         info!("Setting up CNI network for pod: {}", pod_name);
 
         // Create network namespace
-        let netns_name = format!("cni-{}", pod_name);
+        let netns_name = format!("cni-{}_{}", namespace, pod_name);
         let output = match Command::new("ip")
             .args(["netns", "add", &netns_name])
             .output()
@@ -702,7 +723,12 @@ impl ContainerRuntime {
 
         // Setup CNI networking in the namespace
         if let Some(cni) = &self.cni {
-            match cni.setup_network(pod_name, &netns_path, "eth0", None) {
+            match cni.setup_network(
+                &format!("{}_{}", namespace, pod_name),
+                &netns_path,
+                "eth0",
+                None,
+            ) {
                 Ok(result) => {
                     info!(
                         "CNI network setup successful for pod {}: IP={:?}",
@@ -725,15 +751,20 @@ impl ContainerRuntime {
 
     /// Teardown CNI networking for a pod
     /// Removes CNI configuration and deletes the network namespace
-    async fn teardown_pod_network(&self, pod_name: &str) -> Result<()> {
+    async fn teardown_pod_network(&self, namespace: &str, pod_name: &str) -> Result<()> {
         info!("Tearing down CNI network for pod: {}", pod_name);
 
-        let netns_name = format!("cni-{}", pod_name);
+        let netns_name = format!("cni-{}_{}", namespace, pod_name);
         let netns_path = format!("/var/run/netns/{}", netns_name);
 
         // Teardown CNI networking
         if let Some(cni) = &self.cni {
-            if let Err(e) = cni.teardown_network(pod_name, &netns_path, "eth0", None) {
+            if let Err(e) = cni.teardown_network(
+                &format!("{}_{}", namespace, pod_name),
+                &netns_path,
+                "eth0",
+                None,
+            ) {
                 warn!("Failed to teardown CNI network for pod {}: {}", pod_name, e);
                 // Continue with namespace deletion even if CNI teardown fails
             } else {
@@ -884,7 +915,11 @@ impl ContainerRuntime {
         // Guard: if the pod's containers are already running, skip the start.
         // This prevents duplicate container creation when sync_pod is called
         // multiple times in rapid succession (e.g., watch feedback loops).
-        if self.is_pod_running(pod_name).await.unwrap_or(false) {
+        if self
+            .is_pod_running(namespace, pod_name)
+            .await
+            .unwrap_or(false)
+        {
             debug!(
                 "Pod {}/{} containers already running, skipping start",
                 namespace, pod_name
@@ -967,7 +1002,7 @@ impl ContainerRuntime {
         // Docker Desktop uses virtiofs which may cache writes. Instead of a global
         // sync (which flushes ALL filesystems), we sync_data just the pod's volume dir.
         {
-            let pod_vol_dir = format!("{}/{}", self.volumes_base_path, pod_name);
+            let pod_vol_dir = self.pod_volume_root(namespace, pod_name);
             if let Ok(dir) = std::fs::File::open(&pod_vol_dir) {
                 let _ = dir.sync_all();
             }
@@ -1142,7 +1177,7 @@ impl ContainerRuntime {
 
                         // Wait for init container to complete
                         match self
-                            .wait_for_container_completion(pod_name, &container.name)
+                            .wait_for_container_completion(namespace, pod_name, &container.name)
                             .await
                         {
                             Ok(()) => {
@@ -1387,7 +1422,7 @@ impl ContainerRuntime {
             raw_hostname
         };
 
-        let pod_dir = format!("{}/{}", self.volumes_base_path, pod_name);
+        let pod_dir = self.pod_volume_root(namespace, pod_name);
         std::fs::create_dir_all(&pod_dir)
             .context("Failed to create pod directory for /etc/hosts")?;
 
@@ -1477,6 +1512,7 @@ impl ContainerRuntime {
     /// Wait for a container to complete (used for init containers)
     async fn wait_for_container_completion(
         &self,
+        namespace: &str,
         pod_name: &str,
         container_name: &str,
     ) -> Result<()> {
@@ -1491,7 +1527,11 @@ impl ContainerRuntime {
                 ));
             }
 
-            match self.cri.find_container(pod_name, container_name).await {
+            match self
+                .cri
+                .find_container(namespace, pod_name, container_name)
+                .await
+            {
                 Ok(Some(container)) => {
                     if Self::cri_state(container.state) != v1::ContainerState::ContainerRunning {
                         match self.cri.container_status(&container.id).await {
@@ -1646,8 +1686,11 @@ impl ContainerRuntime {
                     };
                     let key =
                         rusternetes_storage::build_key("secrets", Some(namespace), secret_name);
-                    let volume_dir =
-                        format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+                    let volume_dir = format!(
+                        "{}/{}",
+                        self.pod_volume_root(namespace, pod_name),
+                        volume.name
+                    );
                     if let Ok(secret) = storage
                         .get::<rusternetes_common::resources::Secret>(&key)
                         .await
@@ -1717,8 +1760,11 @@ impl ContainerRuntime {
                             .get::<rusternetes_common::resources::ConfigMap>(&key)
                             .await
                         {
-                            let volume_dir =
-                                format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+                            let volume_dir = format!(
+                                "{}/{}",
+                                self.pod_volume_root(namespace, pod_name),
+                                volume.name
+                            );
                             if let Some(ref items) = cm_source.items {
                                 // Only mount the specified keys at their mapped paths
                                 for item in items {
@@ -1786,8 +1832,11 @@ impl ContainerRuntime {
                 // Resync projected volumes (may contain configmap/secret projections)
                 if let Some(projected) = &volume.projected {
                     if let Some(sources) = &projected.sources {
-                        let volume_dir =
-                            format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+                        let volume_dir = format!(
+                            "{}/{}",
+                            self.pod_volume_root(namespace, pod_name),
+                            volume.name
+                        );
                         // Track expected files so we can delete stale ones
                         let mut expected_files: std::collections::HashSet<String> =
                             std::collections::HashSet::new();
@@ -1922,8 +1971,11 @@ impl ContainerRuntime {
                 // Resync standalone downwardAPI volumes
                 if let Some(downward_api) = &volume.downward_api {
                     if let Some(items) = &downward_api.items {
-                        let volume_dir =
-                            format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+                        let volume_dir = format!(
+                            "{}/{}",
+                            self.pod_volume_root(namespace, pod_name),
+                            volume.name
+                        );
                         for item in items {
                             let file_path = format!("{}/{}", volume_dir, item.path);
                             let value = if let Some(ref field_ref) = item.field_ref {
@@ -2057,7 +2109,11 @@ impl ContainerRuntime {
         // ensures the directory exists with mode 0o777 and idempotently re-chmods even
         // when the directory pre-exists from a prior run.
         if volume.empty_dir.is_some() {
-            let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+            let volume_dir = format!(
+                "{}/{}",
+                self.pod_volume_root(namespace, pod_name),
+                volume.name
+            );
             setup_emptydir_dir(&volume_dir).context("Failed to create emptyDir volume")?;
             info!("Created emptyDir volume {} at {}", volume.name, volume_dir);
             return Ok(volume_dir);
@@ -2095,7 +2151,11 @@ impl ContainerRuntime {
             let configmap_result: Result<ConfigMap, _> = storage.get(&key).await;
 
             // Create volume directory
-            let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+            let volume_dir = format!(
+                "{}/{}",
+                self.pod_volume_root(namespace, pod_name),
+                volume.name
+            );
             std::fs::create_dir_all(&volume_dir)
                 .context("Failed to create ConfigMap volume directory")?;
 
@@ -2318,7 +2378,11 @@ impl ContainerRuntime {
             let secret_result: Result<Secret, _> = storage.get(&key).await;
 
             // Create volume directory
-            let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+            let volume_dir = format!(
+                "{}/{}",
+                self.pod_volume_root(namespace, pod_name),
+                volume.name
+            );
             std::fs::create_dir_all(&volume_dir)
                 .context("Failed to create Secret volume directory")?;
 
@@ -2538,7 +2602,11 @@ impl ContainerRuntime {
 
         // DownwardAPI: expose pod/container metadata as files
         if let Some(downward_api) = &volume.downward_api {
-            let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+            let volume_dir = format!(
+                "{}/{}",
+                self.pod_volume_root(namespace, pod_name),
+                volume.name
+            );
             std::fs::create_dir_all(&volume_dir)
                 .context("Failed to create DownwardAPI volume directory")?;
 
@@ -2613,7 +2681,11 @@ impl ContainerRuntime {
         if let Some(_csi) = &volume.csi {
             // CSI ephemeral inline volumes are managed by the CSI driver via the kubelet CSI plugin
             // For conformance, we create a placeholder directory and rely on the CSI driver to populate it
-            let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+            let volume_dir = format!(
+                "{}/{}",
+                self.pod_volume_root(namespace, pod_name),
+                volume.name
+            );
             std::fs::create_dir_all(&volume_dir)
                 .context("Failed to create CSI volume directory")?;
 
@@ -2716,7 +2788,11 @@ impl ContainerRuntime {
 
         // Projected: combine multiple volume sources (configMap, secret, downwardAPI, serviceAccountToken) into one directory
         if let Some(projected) = &volume.projected {
-            let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+            let volume_dir = format!(
+                "{}/{}",
+                self.pod_volume_root(namespace, pod_name),
+                volume.name
+            );
             std::fs::create_dir_all(&volume_dir)
                 .context("Failed to create projected volume directory")?;
 
@@ -3043,7 +3119,11 @@ impl ContainerRuntime {
             volume.csi.is_some(),
             volume.ephemeral.is_some(),
         );
-        let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+        let volume_dir = format!(
+            "{}/{}",
+            self.pod_volume_root(namespace, pod_name),
+            volume.name
+        );
         std::fs::create_dir_all(&volume_dir)
             .context("Failed to create fallback volume directory")?;
         Ok(volume_dir)
@@ -3090,8 +3170,8 @@ impl ContainerRuntime {
 
         // Create volume directory
         let volume_dir = format!(
-            "{}/{}/serviceaccount-token",
-            self.volumes_base_path, pod_name
+            "{}/serviceaccount-token",
+            self.pod_volume_root(namespace, pod_name)
         );
         std::fs::create_dir_all(&volume_dir)
             .context("Failed to create ServiceAccount token volume directory")?;
@@ -3251,7 +3331,11 @@ impl ContainerRuntime {
         // and recreated with attempt+1; the CRI metadata.attempt is the
         // restart count source of truth.
         let mut attempt: u32 = 0;
-        if let Ok(Some(existing)) = self.cri.find_container(pod_name, &container.name).await {
+        if let Ok(Some(existing)) = self
+            .cri
+            .find_container(namespace, pod_name, &container.name)
+            .await
+        {
             let prev_attempt = existing.metadata.as_ref().map(|m| m.attempt).unwrap_or(0);
             match Self::cri_state(existing.state) {
                 v1::ContainerState::ContainerRunning => return Ok(()),
@@ -3789,11 +3873,17 @@ impl ContainerRuntime {
         // Docker's /dev is a tmpfs that becomes inaccessible after the container stops,
         // so we create a host-side file and bind-mount it into the container.
         {
+            // Default to /dev/termination-log when unset OR empty. Clients (the
+            // e2e protobuf path) send terminationMessagePath as "" rather than
+            // omitting it; an empty bind-mount destination makes runc fail with
+            // "file bind mount over rootfs", so the container never starts.
             let term_msg_path = container
                 .termination_message_path
                 .as_deref()
+                .filter(|s| !s.is_empty())
                 .unwrap_or("/dev/termination-log");
-            let term_host_dir = format!("{}/{}/termination", self.volumes_base_path, pod_name);
+            let term_host_dir =
+                format!("{}/termination", self.pod_volume_root(namespace, pod_name));
             std::fs::create_dir_all(&term_host_dir).ok();
             let term_host_file = format!("{}/{}", term_host_dir, container.name);
             // Create an empty file
@@ -4104,7 +4194,7 @@ impl ContainerRuntime {
             if let Some(ref post_start) = lifecycle.post_start {
                 info!("Executing postStart hook for container {}", container.name);
                 if let Err(e) = self
-                    .execute_lifecycle_handler(post_start, pod_name, container)
+                    .execute_lifecycle_handler(post_start, namespace, pod_name, container)
                     .await
                 {
                     warn!(
@@ -4128,29 +4218,30 @@ impl ContainerRuntime {
 
     /// Stop all containers for a pod
     #[allow(dead_code)]
-    pub async fn stop_pod(&self, pod_name: &str) -> Result<()> {
-        self.clear_probe_states_for_pod(pod_name);
-        self.stop_pod_with_grace_period(pod_name, 30).await
+    pub async fn stop_pod(&self, namespace: &str, pod_name: &str) -> Result<()> {
+        self.clear_probe_states_for_pod(namespace, pod_name);
+        self.stop_pod_with_grace_period(namespace, pod_name, 30)
+            .await
     }
 
     /// Stop and force-remove all containers for a pod.
     /// Used for orphaned container cleanup where logs are no longer needed.
-    pub async fn stop_and_remove_pod(&self, pod_name: &str) -> Result<()> {
-        self.clear_probe_states_for_pod(pod_name);
+    pub async fn stop_and_remove_pod(&self, namespace: &str, pod_name: &str) -> Result<()> {
+        self.clear_probe_states_for_pod(namespace, pod_name);
 
-        for container in self.cri.containers_for_pod(pod_name).await? {
+        for container in self.cri.containers_for_pod(namespace, pod_name).await? {
             let _ = self.cri.stop_container(&container.id, 0).await;
             let _ = self.cri.remove_container(&container.id).await;
         }
-        for sandbox in self.cri.sandboxes_for_pod(pod_name).await? {
+        for sandbox in self.cri.sandboxes_for_pod(namespace, pod_name).await? {
             let _ = self.cri.stop_pod_sandbox(&sandbox.id).await;
             let _ = self.cri.remove_pod_sandbox(&sandbox.id).await;
         }
 
         if self.use_cni {
-            let _ = self.teardown_pod_network(pod_name).await;
+            let _ = self.teardown_pod_network(namespace, pod_name).await;
         }
-        self.cleanup_pod_volumes(pod_name).await?;
+        self.cleanup_pod_volumes(namespace, pod_name).await?;
         Ok(())
     }
 
@@ -4158,6 +4249,7 @@ impl ContainerRuntime {
     /// Stops the pause container last to keep the network namespace alive.
     pub async fn stop_pod_with_grace_period(
         &self,
+        namespace: &str,
         pod_name: &str,
         grace_period_seconds: i64,
     ) -> Result<()> {
@@ -4169,7 +4261,7 @@ impl ContainerRuntime {
         // Stop app containers first, then the sandbox last. The sandbox owns
         // the network namespace — stopping it first would destroy networking
         // for containers still shutting down.
-        for container in self.cri.containers_for_pod(pod_name).await? {
+        for container in self.cri.containers_for_pod(namespace, pod_name).await? {
             if Self::cri_state(container.state) != v1::ContainerState::ContainerRunning {
                 continue;
             }
@@ -4190,7 +4282,7 @@ impl ContainerRuntime {
         }
 
         // Stop the sandbox last
-        for sandbox in self.cri.sandboxes_for_pod(pod_name).await? {
+        for sandbox in self.cri.sandboxes_for_pod(namespace, pod_name).await? {
             if sandbox.state == v1::PodSandboxState::SandboxReady as i32 {
                 info!("Stopping sandbox: {} (last)", sandbox.id);
                 if let Err(e) = self.cri.stop_pod_sandbox(&sandbox.id).await {
@@ -4201,14 +4293,14 @@ impl ContainerRuntime {
 
         // Teardown CNI networking if enabled
         if self.use_cni {
-            if let Err(e) = self.teardown_pod_network(pod_name).await {
+            if let Err(e) = self.teardown_pod_network(namespace, pod_name).await {
                 warn!("Failed to teardown CNI network for pod {}: {}", pod_name, e);
                 // Continue with cleanup even if CNI teardown fails
             }
         }
 
         // Clean up emptyDir volumes (but keep container data for logs)
-        self.cleanup_pod_volumes(pod_name).await?;
+        self.cleanup_pod_volumes(namespace, pod_name).await?;
 
         Ok(())
     }
@@ -4217,8 +4309,8 @@ impl ContainerRuntime {
     /// Clean up volumes for a pod. Called by the TerminatedPod handler
     /// after all containers are stopped, and by the container GC for
     /// orphaned pods. K8s ref: pkg/kubelet/kubelet.go:2484
-    pub async fn cleanup_pod_volumes(&self, pod_name: &str) -> Result<()> {
-        let volume_dir = format!("{}/{}", self.volumes_base_path, pod_name);
+    pub async fn cleanup_pod_volumes(&self, namespace: &str, pod_name: &str) -> Result<()> {
+        let volume_dir = self.pod_volume_root(namespace, pod_name);
 
         if std::path::Path::new(&volume_dir).exists() {
             if let Err(e) = std::fs::remove_dir_all(&volume_dir) {
@@ -4240,9 +4332,13 @@ impl ContainerRuntime {
     }
 
     /// Check if a specific container is running (name in `{pod}_{container}` form)
-    pub async fn is_container_running(&self, container_name: &str) -> Result<bool> {
+    pub async fn is_container_running(
+        &self,
+        namespace: &str,
+        container_name: &str,
+    ) -> Result<bool> {
         let (pod_name, name) = Self::split_compound_name(container_name);
-        match self.cri.find_container(pod_name, name).await {
+        match self.cri.find_container(namespace, pod_name, name).await {
             Ok(Some(c)) => Ok(Self::cri_state(c.state) == v1::ContainerState::ContainerRunning),
             _ => Ok(false),
         }
@@ -4250,15 +4346,18 @@ impl ContainerRuntime {
 
     /// Check if the pod has a READY sandbox (the CRI equivalent of the old
     /// "pause container is running" check).
-    pub async fn is_sandbox_ready(&self, pod_name: &str) -> Result<bool> {
-        Ok(self.get_ready_sandbox(pod_name).await?.is_some())
+    pub async fn is_sandbox_ready(&self, namespace: &str, pod_name: &str) -> Result<bool> {
+        Ok(self.get_ready_sandbox(namespace, pod_name).await?.is_some())
     }
 
     /// Check if a container exists in the runtime (in any state: running,
     /// exited, created, etc.). Name in `{pod}_{container}` form.
-    pub async fn container_exists(&self, container_name: &str) -> bool {
+    pub async fn container_exists(&self, namespace: &str, container_name: &str) -> bool {
         let (pod_name, name) = Self::split_compound_name(container_name);
-        matches!(self.cri.find_container(pod_name, name).await, Ok(Some(_)))
+        matches!(
+            self.cri.find_container(namespace, pod_name, name).await,
+            Ok(Some(_))
+        )
     }
 
     /// Check if any spec container in a pod has terminated (exited).
@@ -4266,10 +4365,15 @@ impl ContainerRuntime {
     /// run any probes, unlike `get_container_statuses`.
     pub async fn has_terminated_containers(&self, pod: &Pod) -> bool {
         let pod_name = &pod.metadata.name;
+        let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
         if let Some(spec) = &pod.spec {
             for container in &spec.containers {
                 // find_container returns the newest attempt for that name
-                if let Ok(Some(c)) = self.cri.find_container(pod_name, &container.name).await {
+                if let Ok(Some(c)) = self
+                    .cri
+                    .find_container(namespace, pod_name, &container.name)
+                    .await
+                {
                     if Self::cri_state(c.state) == v1::ContainerState::ContainerExited {
                         return true;
                     }
@@ -4280,11 +4384,11 @@ impl ContainerRuntime {
     }
 
     /// Check if a pod's containers are running
-    pub async fn is_pod_running(&self, pod_name: &str) -> Result<bool> {
+    pub async fn is_pod_running(&self, namespace: &str, pod_name: &str) -> Result<bool> {
         // At least one running container counts. A bare READY sandbox does
         // not — the app containers may have failed to start (e.g.,
         // CreateContainerConfigError from subpath validation).
-        let containers = self.cri.containers_for_pod(pod_name).await?;
+        let containers = self.cri.containers_for_pod(namespace, pod_name).await?;
         Ok(containers
             .iter()
             .any(|c| Self::cri_state(c.state) == v1::ContainerState::ContainerRunning))
@@ -4294,7 +4398,12 @@ impl ContainerRuntime {
     /// K8s ref: kubelet_pods.go:2689 — HasAnyRegularContainerCreated.
     /// If app containers exist, all init containers must have completed successfully.
     async fn has_any_app_container(&self, pod: &Pod) -> bool {
-        let containers = match self.cri.containers_for_pod(&pod.metadata.name).await {
+        let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
+        let containers = match self
+            .cri
+            .containers_for_pod(namespace, &pod.metadata.name)
+            .await
+        {
             Ok(c) => c,
             Err(_) => return false,
         };
@@ -4311,12 +4420,13 @@ impl ContainerRuntime {
         }
 
         let pod_name = &pod.metadata.name;
+        let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
         let mut statuses = Vec::new();
 
         for ic in init_containers {
             let container_name = format!("{}_{}", pod_name, ic.name);
 
-            let cri_status = self.cri_status_for(pod_name, &ic.name).await;
+            let cri_status = self.cri_status_for(namespace, pod_name, &ic.name).await;
 
             let (state, container_id, image_id): (ContainerState, Option<String>, Option<String>) =
                 match cri_status {
@@ -4331,7 +4441,12 @@ impl ContainerRuntime {
                         v1::ContainerState::ContainerExited => {
                             let code = cs.exit_code;
                             let term_msg = self
-                                .read_termination_message(&container_name, ic, code as i64)
+                                .read_termination_message(
+                                    namespace,
+                                    &container_name,
+                                    ic,
+                                    code as i64,
+                                )
                                 .await;
                             let terminated = ContainerState::Terminated {
                                 exit_code: code,
@@ -4619,6 +4734,7 @@ impl ContainerRuntime {
         };
 
         let pod_name = &pod.metadata.name;
+        let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
         let restart_on_failure = pod
             .spec
             .as_ref()
@@ -4633,7 +4749,7 @@ impl ContainerRuntime {
                 continue; // Sidecar init containers are handled separately
             }
 
-            match self.cri_status_for(pod_name, &ic.name).await {
+            match self.cri_status_for(namespace, pod_name, &ic.name).await {
                 Some((cs, _, _)) => match Self::cri_state(cs.state) {
                     v1::ContainerState::ContainerRunning => {
                         // Init container is still running — wait for it
@@ -4679,10 +4795,11 @@ impl ContainerRuntime {
         }
 
         let pod_name = &pod.metadata.name;
+        let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
         let mut statuses = Vec::new();
 
         for ec in ecs {
-            let status = match self.cri_status_for(pod_name, &ec.name).await {
+            let status = match self.cri_status_for(namespace, pod_name, &ec.name).await {
                 Some((cs, cid, iid)) => {
                     let running = Self::cri_state(cs.state) == v1::ContainerState::ContainerRunning;
 
@@ -4759,11 +4876,15 @@ impl ContainerRuntime {
     pub async fn get_container_statuses(&self, pod: &Pod) -> Result<Vec<ContainerStatus>> {
         let mut statuses = Vec::new();
         let pod_name = &pod.metadata.name;
+        let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
 
         for container in &pod.spec.as_ref().unwrap().containers {
             let container_name = format!("{}_{}", pod_name, container.name);
 
-            let status = match self.cri_status_for(pod_name, &container.name).await {
+            let status = match self
+                .cri_status_for(namespace, pod_name, &container.name)
+                .await
+            {
                 Some((cs, cid, iid)) => {
                     let cri_state = Self::cri_state(cs.state);
                     let running = cri_state == v1::ContainerState::ContainerRunning;
@@ -4807,7 +4928,12 @@ impl ContainerRuntime {
                         //   empty AND exit != 0, fall back to container logs
                         // Both policies always read from the file when it has content.
                         let termination_msg = self
-                            .read_termination_message(&container_name, container, exit_code)
+                            .read_termination_message(
+                                namespace,
+                                &container_name,
+                                container,
+                                exit_code,
+                            )
                             .await;
 
                         // Container has exited (any exit code, including 0)
@@ -4841,11 +4967,14 @@ impl ContainerRuntime {
                     let startup_passed = if running {
                         if let Some(startup_probe) = &container.startup_probe {
                             let raw = self
-                                .check_probe(&container_name, container, startup_probe)
+                                .check_probe(namespace, &container_name, container, startup_probe)
                                 .await
                                 .unwrap_or(false);
                             let success_threshold = startup_probe.success_threshold.unwrap_or(1);
-                            let key = format!("{}/{}/startup_status", pod_name, container.name);
+                            let key = format!(
+                                "{}/{}/{}/startup_status",
+                                namespace, pod_name, container.name
+                            );
                             let mut states = self.probe_states.lock().unwrap();
                             let state = states.entry(key).or_default();
                             if raw {
@@ -4897,12 +5026,15 @@ impl ContainerRuntime {
                                 false // Not ready yet, still within initial delay
                             } else {
                                 let raw = self
-                                    .check_probe(&container_name, container, probe)
+                                    .check_probe(namespace, &container_name, container, probe)
                                     .await
                                     .unwrap_or(false);
                                 let _failure_threshold = probe.failure_threshold.unwrap_or(3);
                                 let success_threshold = probe.success_threshold.unwrap_or(1);
-                                let key = format!("{}/{}/readiness", pod_name, container.name);
+                                let key = format!(
+                                    "{}/{}/{}/readiness",
+                                    namespace, pod_name, container.name
+                                );
                                 let mut states = self.probe_states.lock().unwrap();
                                 let state = states.entry(key).or_default();
                                 if raw {
@@ -5039,6 +5171,7 @@ impl ContainerRuntime {
     /// so that a single probe failure does not immediately trigger a restart.
     pub async fn check_liveness(&self, pod: &Pod) -> Result<bool> {
         let pod_name = &pod.metadata.name;
+        let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
 
         for container in &pod.spec.as_ref().unwrap().containers {
             let container_name = format!("{}_{}", pod_name, container.name);
@@ -5046,9 +5179,9 @@ impl ContainerRuntime {
             // If a startup probe is defined, check it first.
             // Liveness probes are disabled until the startup probe succeeds.
             if let Some(startup_probe) = &container.startup_probe {
-                let startup_key = format!("{}/{}/startup", pod_name, container.name);
+                let startup_key = format!("{}/{}/{}/startup", namespace, pod_name, container.name);
                 let raw_result = self
-                    .check_probe(&container_name, container, startup_probe)
+                    .check_probe(namespace, &container_name, container, startup_probe)
                     .await
                     .unwrap_or(false);
 
@@ -5089,7 +5222,10 @@ impl ContainerRuntime {
                 let initial_delay = probe.initial_delay_seconds.unwrap_or(0);
                 if initial_delay > 0 {
                     // Check container start time
-                    if let Some((cs, _, _)) = self.cri_status_for(pod_name, &container.name).await {
+                    if let Some((cs, _, _)) = self
+                        .cri_status_for(namespace, pod_name, &container.name)
+                        .await
+                    {
                         if cs.started_at > 0 {
                             let now_nanos = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
                             let elapsed_secs = (now_nanos - cs.started_at) / 1_000_000_000;
@@ -5102,11 +5238,14 @@ impl ContainerRuntime {
                 }
 
                 // Check liveness with threshold tracking
-                let healthy = self.check_probe(&container_name, container, probe).await?;
+                let healthy = self
+                    .check_probe(namespace, &container_name, container, probe)
+                    .await?;
                 let failure_threshold = probe.failure_threshold.unwrap_or(3);
                 // For liveness probes, Kubernetes requires successThreshold=1
                 let _success_threshold = probe.success_threshold.unwrap_or(1);
-                let liveness_key = format!("{}/{}/liveness", pod_name, container.name);
+                let liveness_key =
+                    format!("{}/{}/{}/liveness", namespace, pod_name, container.name);
 
                 let needs_restart = {
                     let mut states = self.probe_states.lock().unwrap();
@@ -5148,6 +5287,7 @@ impl ContainerRuntime {
     /// Execute a probe check
     async fn check_probe(
         &self,
+        namespace: &str,
         container_name: &str,
         container: &Container,
         probe: &Probe,
@@ -5159,28 +5299,28 @@ impl ContainerRuntime {
         // HTTP GET probe
         if let Some(http_get) = &probe.http_get {
             return self
-                .check_http_probe(container_name, container, http_get, timeout)
+                .check_http_probe(namespace, container_name, container, http_get, timeout)
                 .await;
         }
 
         // TCP Socket probe
         if let Some(tcp_socket) = &probe.tcp_socket {
             return self
-                .check_tcp_probe(container_name, container, tcp_socket, timeout)
+                .check_tcp_probe(namespace, container_name, container, tcp_socket, timeout)
                 .await;
         }
 
         // Exec probe
         if let Some(exec) = &probe.exec {
             return self
-                .check_exec_probe(container_name, container, exec, timeout)
+                .check_exec_probe(namespace, container_name, container, exec, timeout)
                 .await;
         }
 
         // gRPC probe
         if let Some(grpc) = &probe.grpc {
             return self
-                .check_grpc_probe(container_name, container, grpc, timeout)
+                .check_grpc_probe(namespace, container_name, container, grpc, timeout)
                 .await;
         }
 
@@ -5188,17 +5328,18 @@ impl ContainerRuntime {
     }
 
     /// Clear all probe states for a given pod (e.g., on restart or deletion).
-    pub fn clear_probe_states_for_pod(&self, pod_name: &str) {
-        let prefix = format!("{}/", pod_name);
+    pub fn clear_probe_states_for_pod(&self, namespace: &str, pod_name: &str) {
+        let prefix = format!("{}/{}/", namespace, pod_name);
         let mut states = self.probe_states.lock().unwrap();
         states.retain(|key, _| !key.starts_with(&prefix));
-        debug!("Cleared probe states for pod {}", pod_name);
+        debug!("Cleared probe states for pod {}/{}", namespace, pod_name);
     }
 
     /// Read the termination message from a stopped container.
     /// First tries reading from the host-side bind-mounted file, then falls back to docker cp.
     async fn read_termination_message(
         &self,
+        namespace: &str,
         container_name: &str,
         container: &Container,
         exit_code: i64,
@@ -5206,6 +5347,7 @@ impl ContainerRuntime {
         let msg_path = container
             .termination_message_path
             .as_deref()
+            .filter(|s| !s.is_empty())
             .unwrap_or("/dev/termination-log");
 
         debug!(
@@ -5221,8 +5363,9 @@ impl ContainerRuntime {
 
         // Try host-side file first (bind-mounted during container creation)
         let term_host_file = format!(
-            "{}/{}/termination/{}",
-            self.volumes_base_path, pod_name, container.name
+            "{}/termination/{}",
+            self.pod_volume_root(namespace, pod_name),
+            container.name
         );
         if std::path::Path::new(&term_host_file).exists() {
             // Host file exists — read from it (authoritative, not docker cp)
@@ -5249,7 +5392,9 @@ impl ContainerRuntime {
             if container.termination_message_policy.as_deref() == Some("FallbackToLogsOnError")
                 && exit_code != 0
             {
-                return self.read_container_logs_tail(container_name, 80).await;
+                return self
+                    .read_container_logs_tail(namespace, container_name, 80)
+                    .await;
             }
             return None;
         }
@@ -5264,16 +5409,27 @@ impl ContainerRuntime {
         if container.termination_message_policy.as_deref() == Some("FallbackToLogsOnError")
             && exit_code != 0
         {
-            return self.read_container_logs_tail(container_name, 80).await;
+            return self
+                .read_container_logs_tail(namespace, container_name, 80)
+                .await;
         }
         None
     }
 
     /// Read the last N lines of container logs (for FallbackToLogsOnError),
     /// from the CRI log file the runtime writes for the container.
-    async fn read_container_logs_tail(&self, container_name: &str, lines: usize) -> Option<String> {
+    async fn read_container_logs_tail(
+        &self,
+        namespace: &str,
+        container_name: &str,
+        lines: usize,
+    ) -> Option<String> {
         let (pod_name, name) = Self::split_compound_name(container_name);
-        let container = self.cri.find_container(pod_name, name).await.ok()??;
+        let container = self
+            .cri
+            .find_container(namespace, pod_name, name)
+            .await
+            .ok()??;
         let status = self.cri.container_status(&container.id).await.ok()?;
         if status.log_path.is_empty() {
             return None;
@@ -5305,9 +5461,9 @@ impl ContainerRuntime {
 
     /// Get the effective IP for a container: the pod's sandbox IP (all
     /// containers share the sandbox network namespace under CRI).
-    async fn get_effective_container_ip(&self, container_name: &str) -> String {
+    async fn get_effective_container_ip(&self, namespace: &str, container_name: &str) -> String {
         let (pod_name, _) = Self::split_compound_name(container_name);
-        match self.get_pod_ip(pod_name).await {
+        match self.get_pod_ip(namespace, pod_name).await {
             Ok(Some(ip)) => ip,
             _ => "127.0.0.1".to_string(),
         }
@@ -5315,6 +5471,7 @@ impl ContainerRuntime {
 
     async fn check_http_probe(
         &self,
+        namespace: &str,
         container_name: &str,
         container: &Container,
         http_get: &HTTPGetAction,
@@ -5324,7 +5481,8 @@ impl ContainerRuntime {
         let ip = if let Some(ref host) = http_get.host {
             host.clone()
         } else {
-            self.get_effective_container_ip(container_name).await
+            self.get_effective_container_ip(namespace, container_name)
+                .await
         };
 
         // Resolve named port via container.ports[].name lookup (K8s IntOrString).
@@ -5382,13 +5540,16 @@ impl ContainerRuntime {
 
     async fn check_tcp_probe(
         &self,
+        namespace: &str,
         container_name: &str,
         container: &Container,
         tcp_socket: &TCPSocketAction,
         timeout: Duration,
     ) -> Result<bool> {
         // Get container IP (resolving through pause container if needed)
-        let ip = self.get_effective_container_ip(container_name).await;
+        let ip = self
+            .get_effective_container_ip(namespace, container_name)
+            .await;
 
         let port =
             match rusternetes_common::resources::resolve_probe_port(&tcp_socket.port, container) {
@@ -5415,6 +5576,7 @@ impl ContainerRuntime {
     /// container id by looking it up via the pod-name + container-name labels.
     async fn cri_container_id(
         &self,
+        namespace: &str,
         container_name: &str,
         container: &Container,
     ) -> Option<String> {
@@ -5422,7 +5584,7 @@ impl ContainerRuntime {
             .strip_suffix(&format!("_{}", container.name))
             .unwrap_or(container_name);
         self.cri
-            .find_container(pod_name, &container.name)
+            .find_container(namespace, pod_name, &container.name)
             .await
             .ok()
             .flatten()
@@ -5431,6 +5593,7 @@ impl ContainerRuntime {
 
     async fn check_exec_probe(
         &self,
+        namespace: &str,
         container_name: &str,
         container: &Container,
         exec: &ExecAction,
@@ -5438,7 +5601,10 @@ impl ContainerRuntime {
     ) -> Result<bool> {
         debug!("Exec probe: {:?}", exec.command);
 
-        let Some(container_id) = self.cri_container_id(container_name, container).await else {
+        let Some(container_id) = self
+            .cri_container_id(namespace, container_name, container)
+            .await
+        else {
             debug!("Exec probe: container {} not found in CRI", container_name);
             return Ok(false);
         };
@@ -5460,12 +5626,15 @@ impl ContainerRuntime {
     /// Sends a raw grpc.health.v1.Health/Check request over HTTP/2 via tonic Channel.
     async fn check_grpc_probe(
         &self,
+        namespace: &str,
         container_name: &str,
         container: &Container,
         grpc: &GRPCAction,
         timeout: Duration,
     ) -> Result<bool> {
-        let ip = self.get_effective_container_ip(container_name).await;
+        let ip = self
+            .get_effective_container_ip(namespace, container_name)
+            .await;
         let port = match rusternetes_common::resources::resolve_probe_port(&grpc.port, container) {
             Some(p) => p,
             None => {
@@ -5552,6 +5721,7 @@ impl ContainerRuntime {
     async fn execute_lifecycle_handler(
         &self,
         handler: &LifecycleHandler,
+        namespace: &str,
         container_name: &str,
         container: &Container,
     ) -> Result<()> {
@@ -5562,7 +5732,7 @@ impl ContainerRuntime {
                 exec.command, container_name
             );
             let container_id = self
-                .cri_container_id(container_name, container)
+                .cri_container_id(namespace, container_name, container)
                 .await
                 .with_context(|| {
                     format!(
@@ -5689,7 +5859,8 @@ impl ContainerRuntime {
                 // Resolve the container IP from its pod sandbox via CRI. The
                 // sandbox owns the network namespace, so this also covers
                 // container: network-mode containers.
-                self.get_effective_container_ip(container_name).await
+                self.get_effective_container_ip(namespace, container_name)
+                    .await
             };
 
             let scheme = http_get.scheme.as_deref().unwrap_or("HTTP").to_lowercase();
@@ -5738,7 +5909,9 @@ impl ContainerRuntime {
         } else if let Some(ref tcp_socket) = handler.tcp_socket {
             // Open TCP connection to the container (IP resolved from the pod
             // sandbox via CRI).
-            let ip = self.get_effective_container_ip(container_name).await;
+            let ip = self
+                .get_effective_container_ip(namespace, container_name)
+                .await;
 
             let port =
                 rusternetes_common::resources::resolve_probe_port(&tcp_socket.port, container)
@@ -5781,7 +5954,8 @@ impl ContainerRuntime {
     /// allows preStop hooks to be executed before container termination.
     pub async fn stop_pod_for(&self, pod: &Pod, grace_period_seconds: i64) -> Result<()> {
         let pod_name = &pod.metadata.name;
-        self.clear_probe_states_for_pod(pod_name);
+        let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
+        self.clear_probe_states_for_pod(namespace, pod_name);
         info!(
             "Stopping pod: {} (grace period: {}s, with lifecycle hooks)",
             pod_name, grace_period_seconds
@@ -5818,7 +5992,7 @@ impl ContainerRuntime {
             );
         }
 
-        let containers = self.cri.containers_for_pod(pod_name).await?;
+        let containers = self.cri.containers_for_pod(namespace, pod_name).await?;
 
         // First pass: execute preStop hooks on all running containers.
         // We must run ALL preStop hooks before stopping ANY containers, because
@@ -5890,7 +6064,12 @@ impl ContainerRuntime {
                 .map(|(container_name, pre_stop, spec_container)| async move {
                     info!("Executing preStop hook for container {}", container_name);
                     match self
-                        .execute_lifecycle_handler(&pre_stop, &container_name, &spec_container)
+                        .execute_lifecycle_handler(
+                            &pre_stop,
+                            namespace,
+                            &container_name,
+                            &spec_container,
+                        )
                         .await
                     {
                         Ok(()) => info!(
@@ -5964,7 +6143,7 @@ impl ContainerRuntime {
         }
 
         // Stop the sandbox last — the network namespace dies with it
-        for sandbox in self.cri.sandboxes_for_pod(pod_name).await? {
+        for sandbox in self.cri.sandboxes_for_pod(namespace, pod_name).await? {
             if sandbox.state == v1::PodSandboxState::SandboxReady as i32 {
                 info!("Stopping sandbox: {} (last)", sandbox.id);
                 if let Err(e) = self.cri.stop_pod_sandbox(&sandbox.id).await {
@@ -5975,7 +6154,7 @@ impl ContainerRuntime {
 
         // Teardown CNI networking if enabled
         if self.use_cni {
-            if let Err(e) = self.teardown_pod_network(pod_name).await {
+            if let Err(e) = self.teardown_pod_network(namespace, pod_name).await {
                 warn!("Failed to teardown CNI network for pod {}: {}", pod_name, e);
             }
         }
@@ -5985,18 +6164,22 @@ impl ContainerRuntime {
         // pods that exist in etcd. If a pod is deleted from etcd before
         // TerminatedPod runs, volumes would never be cleaned. So we clean
         // here to ensure volumes are always cleaned when containers stop.
-        self.cleanup_pod_volumes(pod_name).await?;
+        self.cleanup_pod_volumes(namespace, pod_name).await?;
 
         Ok(())
     }
 
     /// Get the exit code of a terminated container.
     /// Returns the exit code or an error if the container doesn't exist.
-    pub async fn get_container_exit_code(&self, container_name: &str) -> Result<i64> {
+    pub async fn get_container_exit_code(
+        &self,
+        namespace: &str,
+        container_name: &str,
+    ) -> Result<i64> {
         let (pod_name, name) = Self::split_compound_name(container_name);
         let container = self
             .cri
-            .find_container(pod_name, name)
+            .find_container(namespace, pod_name, name)
             .await?
             .with_context(|| format!("container {} not found", container_name))?;
         let status = self.cri.container_status(&container.id).await?;
@@ -6004,9 +6187,13 @@ impl ContainerRuntime {
     }
 
     /// Remove a terminated container so it can be recreated for restart.
-    pub async fn remove_terminated_container(&self, container_name: &str) -> Result<()> {
+    pub async fn remove_terminated_container(
+        &self,
+        namespace: &str,
+        container_name: &str,
+    ) -> Result<()> {
         let (pod_name, name) = Self::split_compound_name(container_name);
-        if let Ok(Some(container)) = self.cri.find_container(pod_name, name).await {
+        if let Ok(Some(container)) = self.cri.find_container(namespace, pod_name, name).await {
             if Self::cri_state(container.state) != v1::ContainerState::ContainerRunning {
                 self.cri.remove_container(&container.id).await?;
                 debug!(
@@ -6037,7 +6224,11 @@ impl ContainerRuntime {
         };
 
         for volume in volumes {
-            let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
+            let volume_dir = format!(
+                "{}/{}",
+                self.pod_volume_root(namespace, pod_name),
+                volume.name
+            );
 
             // Refresh Secret volumes
             if let Some(secret_source) = &volume.secret {
@@ -6157,11 +6348,11 @@ impl ContainerRuntime {
     }
 
     /// Get the pod IP address from the first running container
-    pub async fn get_pod_ip(&self, pod_name: &str) -> Result<Option<String>> {
+    pub async fn get_pod_ip(&self, namespace: &str, pod_name: &str) -> Result<Option<String>> {
         // If using CNI, get IP from CNI runtime
         if self.use_cni {
             if let Some(cni) = &self.cni {
-                if let Some(ip) = cni.get_container_ip(pod_name) {
+                if let Some(ip) = cni.get_container_ip(&format!("{}_{}", namespace, pod_name)) {
                     debug!("Retrieved pod IP {} from CNI for pod {}", ip, pod_name);
                     return Ok(Some(ip));
                 }
@@ -6170,7 +6361,7 @@ impl ContainerRuntime {
 
         // Sandbox networking is the runtime's job under CRI: the pod IP
         // comes from PodSandboxStatus.network.ip of the READY sandbox.
-        if let Some(sandbox) = self.get_ready_sandbox(pod_name).await? {
+        if let Some(sandbox) = self.get_ready_sandbox(namespace, pod_name).await? {
             if let Some(ip) = self.sandbox_ip(&sandbox.id).await? {
                 debug!("Retrieved pod IP {} from sandbox for pod {}", ip, pod_name);
                 return Ok(Some(ip));
@@ -6429,6 +6620,7 @@ impl ContainerRuntime {
     /// Update container resource limits in-place (for pod resize)
     pub async fn update_container_resources(
         &self,
+        namespace: &str,
         container_name: &str,
         cpu_period: Option<i64>,
         cpu_quota: Option<i64>,
@@ -6438,7 +6630,7 @@ impl ContainerRuntime {
         let (pod_name, name) = Self::split_compound_name(container_name);
         let container = self
             .cri
-            .find_container(pod_name, name)
+            .find_container(namespace, pod_name, name)
             .await?
             .with_context(|| format!("container {} not found", container_name))?;
         // memory_swap_limit = memory limit (no swap), matching the previous
@@ -6458,9 +6650,10 @@ impl ContainerRuntime {
         Ok(())
     }
 
-    /// List all running pod names from the container runtime
+    /// List all running pods from the container runtime as `(namespace, name)`.
+    /// Namespaced because pod names are only unique within a namespace.
     #[allow(dead_code)]
-    pub async fn list_running_pods(&self) -> Result<Vec<String>> {
+    pub async fn list_running_pods(&self) -> Result<Vec<(String, String)>> {
         let containers = self
             .cri
             .list_containers(Some(v1::ContainerFilter {
@@ -6471,14 +6664,19 @@ impl ContainerRuntime {
             }))
             .await?;
 
-        let mut pod_names = std::collections::HashSet::new();
+        let mut pods = std::collections::HashSet::new();
         for container in containers {
             if let Some(pod_name) = container.labels.get(cri_labels::POD_NAME) {
-                pod_names.insert(pod_name.clone());
+                let namespace = container
+                    .labels
+                    .get(cri_labels::POD_NAMESPACE)
+                    .cloned()
+                    .unwrap_or_else(|| "default".to_string());
+                pods.insert((namespace, pod_name.clone()));
             }
         }
 
-        Ok(pod_names.into_iter().collect())
+        Ok(pods.into_iter().collect())
     }
 
     /// Container garbage collector — removes dead containers to prevent buildup.
@@ -6496,25 +6694,37 @@ impl ContainerRuntime {
     ) -> Result<usize> {
         let containers = self.cri.list_containers(None).await?;
 
-        // Group exited containers by pod name, track which pods have running containers
+        // Identity key for a pod from CRI labels: `{namespace}/{name}`. Pod names
+        // are only unique within a namespace, so grouping by name alone would
+        // merge same-named pods across namespaces and GC the wrong containers.
+        fn pod_identity(labels: &HashMap<String, String>) -> Option<String> {
+            let name = labels.get(cri_labels::POD_NAME)?;
+            let ns = labels
+                .get(cri_labels::POD_NAMESPACE)
+                .map(String::as_str)
+                .unwrap_or("default");
+            Some(format!("{}/{}", ns, name))
+        }
+
+        // Group exited containers by pod identity, track which pods have running containers
         let mut exited_by_pod: HashMap<String, Vec<(String, i64)>> = HashMap::new();
         let mut pods_with_running: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let mut stale_created: Vec<String> = Vec::new();
 
         for container in &containers {
-            let pod_name = match container.labels.get(cri_labels::POD_NAME) {
-                Some(p) => p.clone(),
+            let pod_key = match pod_identity(&container.labels) {
+                Some(p) => p,
                 None => continue, // not one of ours
             };
 
             match Self::cri_state(container.state) {
                 v1::ContainerState::ContainerRunning => {
-                    pods_with_running.insert(pod_name);
+                    pods_with_running.insert(pod_key);
                 }
                 v1::ContainerState::ContainerExited => {
                     exited_by_pod
-                        .entry(pod_name)
+                        .entry(pod_key)
                         .or_default()
                         .push((container.id.clone(), container.created_at));
                 }
@@ -6535,13 +6745,13 @@ impl ContainerRuntime {
         // 1. Remove exited containers.
         // K8s ref: evictContainers — for deleted pods (allSourcesReady), remove ALL.
         // For existing pods, keep at most MaxPerPodContainerCount (default 1).
-        for (pod_name, mut exited) in exited_by_pod {
+        for (pod_key, mut exited) in exited_by_pod {
             // Sort by created time descending — keep the newest
             exited.sort_by_key(|e| std::cmp::Reverse(e.1));
 
             // For pods still in etcd, keep 1 dead container for log access.
             // For deleted pods, remove ALL dead containers.
-            let keep_count = if existing_pods.contains(&pod_name) {
+            let keep_count = if existing_pods.contains(&pod_key) {
                 1
             } else {
                 0
@@ -6554,14 +6764,16 @@ impl ContainerRuntime {
 
             // If the pod has no running containers, remove the last dead one too
             // and clean up the orphaned sandbox
-            if !pods_with_running.contains(&pod_name) {
+            if !pods_with_running.contains(&pod_key) {
                 for (container_id, _) in exited.iter().take(keep_count) {
                     if self.cri.remove_container(container_id).await.is_ok() {
                         removed += 1;
                     }
                 }
+                let (namespace, pod_name) =
+                    pod_key.split_once('/').unwrap_or(("default", &pod_key));
                 // Remove orphaned sandboxes
-                if let Ok(sandboxes) = self.cri.sandboxes_for_pod(&pod_name).await {
+                if let Ok(sandboxes) = self.cri.sandboxes_for_pod(namespace, pod_name).await {
                     for sandbox in sandboxes {
                         let _ = self.cri.stop_pod_sandbox(&sandbox.id).await;
                         if self.cri.remove_pod_sandbox(&sandbox.id).await.is_ok() {
@@ -6570,7 +6782,7 @@ impl ContainerRuntime {
                     }
                 }
                 // Clean up volumes
-                let _ = self.cleanup_pod_volumes(&pod_name).await;
+                let _ = self.cleanup_pod_volumes(namespace, pod_name).await;
             }
         }
 
@@ -6585,15 +6797,15 @@ impl ContainerRuntime {
         // (e.g. sandbox created but containers never started).
         if let Ok(sandboxes) = self.cri.list_pod_sandbox(None).await {
             for sandbox in sandboxes {
-                let Some(pod_name) = sandbox.labels.get(cri_labels::POD_NAME) else {
+                let Some(pod_key) = pod_identity(&sandbox.labels) else {
                     continue;
                 };
-                if existing_pods.contains(pod_name) {
+                if existing_pods.contains(&pod_key) {
                     continue;
                 }
                 if containers
                     .iter()
-                    .any(|c| c.labels.get(cri_labels::POD_NAME) == Some(pod_name))
+                    .any(|c| pod_identity(&c.labels).as_deref() == Some(pod_key.as_str()))
                 {
                     continue; // handled above
                 }
@@ -6610,28 +6822,43 @@ impl ContainerRuntime {
     /// List all pods with containers in Docker, including exited/stopped.
     /// Used by orphan cleanup to find and remove stopped containers from
     /// pods that have been deleted from storage.
-    pub async fn list_all_pods(&self) -> Result<Vec<String>> {
+    pub async fn list_all_pods(&self) -> Result<Vec<(String, String)>> {
         // Union of sandbox and container labels: containers can outlive
         // their sandbox (kept for logs after the sandbox is stopped).
-        let mut pod_names = std::collections::HashSet::new();
+        // Returns `(namespace, name)` — pod names are only unique per namespace.
+        let mut pods = std::collections::HashSet::new();
         for sandbox in self.cri.list_pod_sandbox(None).await? {
             if let Some(pod_name) = sandbox.labels.get(cri_labels::POD_NAME) {
-                pod_names.insert(pod_name.clone());
+                let namespace = sandbox
+                    .labels
+                    .get(cri_labels::POD_NAMESPACE)
+                    .cloned()
+                    .unwrap_or_else(|| "default".to_string());
+                pods.insert((namespace, pod_name.clone()));
             }
         }
         for container in self.cri.list_containers(None).await? {
             if let Some(pod_name) = container.labels.get(cri_labels::POD_NAME) {
-                pod_names.insert(pod_name.clone());
+                let namespace = container
+                    .labels
+                    .get(cri_labels::POD_NAMESPACE)
+                    .cloned()
+                    .unwrap_or_else(|| "default".to_string());
+                pods.insert((namespace, pod_name.clone()));
             }
         }
 
-        Ok(pod_names.into_iter().collect())
+        Ok(pods.into_iter().collect())
     }
 
     /// Get the age of a pod's sandbox (time since creation).
     /// Returns Duration::ZERO if no sandbox can be found.
-    pub async fn get_container_age(&self, pod_name: &str) -> Result<std::time::Duration> {
-        match self.get_any_sandbox(pod_name).await {
+    pub async fn get_container_age(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+    ) -> Result<std::time::Duration> {
+        match self.get_any_sandbox(namespace, pod_name).await {
             Ok(Some(sandbox)) if sandbox.created_at > 0 => {
                 let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
                 let age_nanos = (now_nanos - sandbox.created_at).max(0);
@@ -7781,54 +8008,73 @@ mod tests {
 
     #[test]
     fn test_probe_state_map_key_format() {
+        // Probe-state keys are namespaced: `{namespace}/{pod}/{container}/{kind}`.
+        // Namespace is required because pod names are only unique within a
+        // namespace — two same-named pods in different namespaces must not share
+        // probe state.
+        let namespace = "default";
         let pod_name = "web-0";
         let container_name = "nginx";
-        let liveness_key = format!("{}/{}/liveness", pod_name, container_name);
-        let readiness_key = format!("{}/{}/readiness", pod_name, container_name);
-        let startup_key = format!("{}/{}/startup", pod_name, container_name);
+        let liveness_key = format!("{}/{}/{}/liveness", namespace, pod_name, container_name);
+        let readiness_key = format!("{}/{}/{}/readiness", namespace, pod_name, container_name);
+        let startup_key = format!("{}/{}/{}/startup", namespace, pod_name, container_name);
 
-        assert_eq!(liveness_key, "web-0/nginx/liveness");
-        assert_eq!(readiness_key, "web-0/nginx/readiness");
-        assert_eq!(startup_key, "web-0/nginx/startup");
+        assert_eq!(liveness_key, "default/web-0/nginx/liveness");
+        assert_eq!(readiness_key, "default/web-0/nginx/readiness");
+        assert_eq!(startup_key, "default/web-0/nginx/startup");
 
         // Keys for different probe types should be distinct
         assert_ne!(liveness_key, readiness_key);
         assert_ne!(readiness_key, startup_key);
+
+        // Same pod name in a different namespace must produce a distinct key.
+        let other_ns_key = format!("{}/{}/{}/liveness", "other", pod_name, container_name);
+        assert_ne!(liveness_key, other_ns_key);
     }
 
     #[test]
     fn test_clear_probe_states_removes_pod_entries() {
+        // clear_probe_states_for_pod retains by the `{namespace}/{pod}/` prefix.
         let mut states = std::collections::HashMap::new();
         states.insert(
-            "web-0/nginx/liveness".to_string(),
+            "default/web-0/nginx/liveness".to_string(),
             super::ProbeState {
                 consecutive_failures: 2,
                 consecutive_successes: 0,
             },
         );
         states.insert(
-            "web-0/nginx/readiness".to_string(),
+            "default/web-0/nginx/readiness".to_string(),
             super::ProbeState {
                 consecutive_failures: 0,
                 consecutive_successes: 3,
             },
         );
         states.insert(
-            "redis-0/redis/liveness".to_string(),
+            "default/redis-0/redis/liveness".to_string(),
+            super::ProbeState {
+                consecutive_failures: 1,
+                consecutive_successes: 0,
+            },
+        );
+        // Same pod name in a different namespace must NOT be cleared.
+        states.insert(
+            "other/web-0/nginx/liveness".to_string(),
             super::ProbeState {
                 consecutive_failures: 1,
                 consecutive_successes: 0,
             },
         );
 
-        let prefix = "web-0/";
+        let prefix = "default/web-0/";
         states.retain(|key, _| !key.starts_with(prefix));
 
-        // web-0 entries should be removed
-        assert!(!states.contains_key("web-0/nginx/liveness"));
-        assert!(!states.contains_key("web-0/nginx/readiness"));
-        // redis-0 should remain
-        assert!(states.contains_key("redis-0/redis/liveness"));
+        // default/web-0 entries should be removed
+        assert!(!states.contains_key("default/web-0/nginx/liveness"));
+        assert!(!states.contains_key("default/web-0/nginx/readiness"));
+        // Other pods and other namespaces should remain
+        assert!(states.contains_key("default/redis-0/redis/liveness"));
+        assert!(states.contains_key("other/web-0/nginx/liveness"));
     }
 
     // --- service environment variable tests ---

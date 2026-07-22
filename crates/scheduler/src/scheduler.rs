@@ -210,6 +210,11 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             .spec
             .as_ref()
             .and_then(|s| s.scheduler_name.as_deref())
+            // An empty schedulerName means "unset" — K8s defaults it to
+            // "default-scheduler". Clients (notably the e2e protobuf path) send
+            // it as "" rather than omitting it; without this filter the pod is
+            // silently never scheduled.
+            .filter(|s| !s.is_empty())
             .unwrap_or("default-scheduler");
         if pod_scheduler != self.scheduler_name {
             return Ok(()); // wrong scheduler
@@ -290,12 +295,16 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     return false;
                 }
 
-                // Check if pod is assigned to this scheduler
-                // If schedulerName is not specified, defaults to "default-scheduler"
+                // Check if pod is assigned to this scheduler.
+                // If schedulerName is unset OR empty (""), it defaults to
+                // "default-scheduler". The empty-string case matters: the e2e
+                // protobuf path sends "" rather than omitting the field, and
+                // treating that as a distinct scheduler name silently drops the pod.
                 let pod_scheduler_name = p
                     .spec
                     .as_ref()
                     .and_then(|s| s.scheduler_name.as_deref())
+                    .filter(|s| !s.is_empty())
                     .unwrap_or("default-scheduler");
 
                 pod_scheduler_name == self.scheduler_name
@@ -1659,6 +1668,45 @@ mod tests {
             .iter()
             .any(|c| c.condition_type == "PodScheduled" && c.status == "True");
         assert!(has_scheduled, "Pod should have PodScheduled=True condition");
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_schedules_pod_with_empty_scheduler_name() {
+        // Regression: the e2e protobuf path sends schedulerName as "" rather than
+        // omitting it. An empty schedulerName means "default scheduler" in K8s, so
+        // the scheduler must still bind the pod. Before the fix,
+        // `Some("").unwrap_or("default-scheduler")` yielded "", which never matched
+        // the scheduler name, and the pod was silently left Pending forever.
+        let storage = Arc::new(MemoryStorage::new());
+        let scheduler =
+            Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
+
+        storage
+            .create("/registry/nodes/node-1", &make_node("node-1"))
+            .await
+            .unwrap();
+
+        let mut pod = make_pending_pod("empty-sched", "default");
+        pod.spec.as_mut().unwrap().scheduler_name = Some(String::new());
+        storage
+            .create("/registry/pods/default/empty-sched", &pod)
+            .await
+            .unwrap();
+
+        scheduler.schedule_pending_pods().await.unwrap();
+
+        let scheduled: Pod = storage
+            .get("/registry/pods/default/empty-sched")
+            .await
+            .unwrap();
+        assert_eq!(
+            scheduled
+                .spec
+                .as_ref()
+                .and_then(|s| s.node_name.as_deref()),
+            Some("node-1"),
+            "pod with empty schedulerName must be scheduled (empty == default-scheduler)"
+        );
     }
 
     #[tokio::test]

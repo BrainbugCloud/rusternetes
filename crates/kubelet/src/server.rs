@@ -81,7 +81,7 @@ async fn logs_response(
 ) -> Result<Response> {
     let cri_container = state
         .cri
-        .find_container_scoped(namespace, pod, container)
+        .find_container(namespace, pod, container)
         .await?
         .with_context(|| {
             format!(
