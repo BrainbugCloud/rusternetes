@@ -377,7 +377,7 @@ The ginkgo binary ran, reported results to the aggregator, but found zero
 matching specs → 0 pass, 0 fail. The infrastructure worked: the e2e container
 created a namespace, watched for pods, then cleaned up.
 
-### Gotcha G — scheduler silently drops pods in fresh namespaces (open bug)
+### Gotcha G — pod name collision kills sandboxes in fresh namespaces (partially fixed)
 
 When the e2e framework creates a new namespace and immediately creates a pod
 inside it, the pod sometimes never gets scheduled:
@@ -389,28 +389,33 @@ inside it, the pod sometimes never gets scheduled:
 - Pod stays Pending until the test times out (default 5m), then fails with
   `Expected <v1.PodPhase>: Pending to equal <v1.PodPhase>: Running`
 
-Manually-created pods (`kubectl run foo --image=...`) in `default` or any
-existing namespace schedule fine, so the bug is specific to freshly-created
-namespaces + the e2e pod shape. Prime suspects:
+**Root cause identified (2026-07-22):** the kubelet identifies pods by
+**name only** (not `namespace/name`). When two pods have the same name in
+different namespaces (e.g. `pods-6553/pod-test` colliding with
+`repro-fresh/pod-test`), the kubelet's orphan cleanup and `stop_pod`
+functions kill the wrong sandbox. The pause container dies with exit code
+137 (SIGKILL), the sandbox fails, and the app containers can't start.
 
-1. **Race between namespace-controller SA creation and scheduler's
-   `enqueue_all`** — the scheduler's Pending filter may reject a pod whose
-   SA reference is empty-string rather than `None`.
-2. **Watch event never delivered** to the scheduler for the new pod key.
-   `enqueue_all` only fires every resync interval; the watch should pick it
-   up immediately but appears not to.
-3. **`try_schedule_pod` early-return on empty-string `scheduler_name`** — if
-   the e2e pod has `schedulerName: ""` instead of omitted, the
-   `unwrap_or("default-scheduler")` comparison would fail and skip it.
+**Partial fix committed (`8580d32d`):**
+1. `ensure_sandbox` no longer removes sandboxes created within the last 10s
+   as "stale" — they may still be initializing.
+2. Orphan cleanup re-fetches the pod list from storage instead of using a
+   stale snapshot from the start of the sync loop.
 
-**Workaround**: none yet. Affects every e2e test that creates its own
-namespace, which is most of them. Needs investigation in
-`crates/scheduler/src/scheduler.rs::try_schedule_pod` and
-`crates/api-server/src/handlers/pod.rs` (the Pod Create path).
+**Remaining issue:** the fundamental name collision bug is NOT fixed. If two
+pods share the same name in different namespaces, the kubelet can still kill
+the wrong sandbox. The proper fix is to use `namespace/name` as the pod
+identifier throughout the kubelet (worker map keys, sandbox lookups, CNI
+netns names, etc.). This is a larger refactor.
 
-**To debug**: rerun with `--log-level debug` and check whether the pod's key
-appears in the scheduler's `enqueue_all` listing, in the watch stream, and
-what `try_schedule_pod` does with it.
+**Workaround for e2e:** ensure no leftover pods from previous runs share
+the same name as the e2e test pod (`pod-test`). Delete old test pods before
+running conformance.
+
+**To debug:** if a pod stays Pending, check `containerd.log` for
+`StopPodSandbox` calls within seconds of `RunPodSandbox`. If the kubelet
+killed the sandbox, the pause container exits with code 137 and the app
+containers fail with `sandbox container is not running`.
 
 ### CA cert rotation pitfall
 
