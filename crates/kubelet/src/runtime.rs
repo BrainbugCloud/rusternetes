@@ -549,13 +549,31 @@ impl ContainerRuntime {
     /// Ensure a READY sandbox exists for the pod; returns (sandbox_id, config).
     ///
     /// Not-ready leftovers from earlier runs are removed first (their netns
-    /// is gone; containers can't join them).
+    /// is gone; containers can't join them). However, a sandbox that was
+    /// created very recently (< 10s) may still be initializing (CNI, mounts,
+    /// etc.) — don't treat it as stale; wait for it to become ready.
     async fn ensure_sandbox(&self, pod: &Pod) -> Result<(String, v1::PodSandboxConfig)> {
         let config = self.sandbox_config_for_pod(pod);
         if let Some(sandbox) = self.get_ready_sandbox(&pod.metadata.name).await? {
             return Ok((sandbox.id, config));
         }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
         for stale in self.cri.sandboxes_for_pod(&pod.metadata.name).await? {
+            // Don't remove a sandbox that was just created — it may still be
+            // initializing. The sync loop will retry on the next cycle.
+            if stale.created_at > now - 10 {
+                debug!(
+                    "Sandbox {} for pod {} was just created ({}s ago), waiting for it to become ready",
+                    stale.id, pod.metadata.name, now - stale.created_at
+                );
+                return Err(anyhow::anyhow!(
+                    "Sandbox {} still initializing, retry next cycle",
+                    stale.id
+                ));
+            }
             debug!(
                 "Removing stale sandbox {} for pod {}",
                 stale.id, pod.metadata.name
