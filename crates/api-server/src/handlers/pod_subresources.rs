@@ -488,7 +488,8 @@ pub async fn exec(
     // ── Proxy to kubelet streaming server ──
 
     // Resolve kubelet streaming endpoint from Node status
-    let kubelet_addr = kubelet_proxy::kubelet_streaming_endpoint(&state, &pod).await
+    let kubelet_addr = kubelet_proxy::kubelet_streaming_endpoint(&state, &pod)
+        .await
         .map_err(|e| Error::Internal(format!("Failed to resolve kubelet: {e}")))?;
 
     // Build the kubelet streaming path
@@ -504,7 +505,9 @@ pub async fn exec(
         info!("SPDY exec → kubelet at {kubelet_addr}{kubelet_path}");
         let upgrade = hyper::upgrade::on(req);
         return Ok(kubelet_proxy::spdy_proxy_response(
-            upgrade, &kubelet_addr, &kubelet_path,
+            upgrade,
+            &kubelet_addr,
+            &kubelet_path,
         ));
     }
 
@@ -547,7 +550,6 @@ pub async fn exec(
         }
         Err(e) => Err(Error::Internal(format!("kubelet proxy error: {e}"))),
     }
-
 }
 
 /// GET/POST /api/v1/namespaces/{namespace}/pods/{name}/attach
@@ -670,7 +672,8 @@ pub async fn attach(
     // ── Proxy to kubelet streaming server ──
 
     // Resolve kubelet streaming endpoint from Node status
-    let kubelet_addr = kubelet_proxy::kubelet_streaming_endpoint(&state, &pod).await
+    let kubelet_addr = kubelet_proxy::kubelet_streaming_endpoint(&state, &pod)
+        .await
         .map_err(|e| Error::Internal(format!("Failed to resolve kubelet: {e}")))?;
 
     // Build the kubelet streaming path
@@ -687,7 +690,9 @@ pub async fn attach(
         info!("SPDY attach → kubelet at {kubelet_addr}{kubelet_path}");
         let upgrade = hyper::upgrade::on(req);
         return Ok(kubelet_proxy::spdy_proxy_response(
-            upgrade, &kubelet_addr, &kubelet_path,
+            upgrade,
+            &kubelet_addr,
+            &kubelet_path,
         ));
     }
 
@@ -697,11 +702,7 @@ pub async fn attach(
         return Ok(ws
             .protocols(["v5.channel.k8s.io", "v4.channel.k8s.io", "channel.k8s.io"])
             .on_upgrade(move |socket| {
-                streaming::handle_attach_websocket_via_kubelet(
-                    socket,
-                    kubelet_addr,
-                    kubelet_path,
-                )
+                streaming::handle_attach_websocket_via_kubelet(socket, kubelet_addr, kubelet_path)
             })
             .into_response());
     }
@@ -773,7 +774,8 @@ pub async fn portforward(
     // ── Proxy to kubelet streaming server ──
 
     // Resolve kubelet streaming endpoint from Node status
-    let kubelet_addr = kubelet_proxy::kubelet_streaming_endpoint(&state, &pod).await
+    let kubelet_addr = kubelet_proxy::kubelet_streaming_endpoint(&state, &pod)
+        .await
         .map_err(|e| Error::Internal(format!("Failed to resolve kubelet: {e}")))?;
 
     // Build the kubelet streaming path for port-forward
@@ -790,7 +792,9 @@ pub async fn portforward(
         info!("SPDY portforward → kubelet at {kubelet_addr}{kubelet_path}");
         let upgrade = hyper::upgrade::on(req);
         return Ok(kubelet_proxy::spdy_proxy_response(
-            upgrade, &kubelet_addr, &kubelet_path,
+            upgrade,
+            &kubelet_addr,
+            &kubelet_path,
         ));
     }
 

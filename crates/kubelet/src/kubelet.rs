@@ -883,9 +883,13 @@ impl Kubelet {
         // Error handling is in each spawned task above.
         // This matches K8s podWorkerLoop which runs independently per pod.
 
-        // Clean up orphaned containers using the pod list we already fetched
+        // Clean up orphaned containers using a FRESH pod list, not the stale
+        // snapshot from the start of the sync loop. Pods created during the
+        // sync would otherwise be killed as orphans because their sandboxes
+        // exist but the pod list doesn't include them yet.
+        let fresh_pods: Vec<Pod> = self.storage.list(&all_pods_prefix).await.unwrap_or_default();
         if let Err(e) = self
-            .cleanup_orphaned_containers(&node_pods, &all_pods)
+            .cleanup_orphaned_containers(&node_pods, &fresh_pods)
             .await
         {
             error!("Error cleaning up orphaned containers: {}", e);

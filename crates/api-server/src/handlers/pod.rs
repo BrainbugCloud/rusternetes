@@ -43,9 +43,6 @@ pub async fn create(
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("duplicate field") {
-                // Re-parse via Value (lenient — takes last duplicate) so the
-                // strict-decode error path can synthesize a parity-shaped
-                // message that names every duplicate.
                 let value: serde_json::Value = serde_json::from_slice(&body).map_err(|e2| {
                     rusternetes_common::Error::BadRequest(format!("failed to decode: {}", e2))
                 })?;

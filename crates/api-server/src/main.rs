@@ -8,6 +8,7 @@ mod flow_control;
 mod gnostic;
 mod handlers;
 mod ip_allocator;
+mod kubelet_proxy;
 mod middleware;
 mod openapi;
 mod patch;
@@ -18,7 +19,6 @@ mod response;
 mod router;
 #[allow(dead_code)]
 mod spdy;
-mod kubelet_proxy;
 mod state;
 #[allow(dead_code)]
 mod streaming;

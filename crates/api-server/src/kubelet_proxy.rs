@@ -25,10 +25,7 @@ use crate::state::ApiServerState;
 use rusternetes_storage::Storage;
 
 /// The kubelet streaming server endpoint (IP:port) for a pod's node.
-pub async fn kubelet_streaming_endpoint(
-    state: &ApiServerState,
-    pod: &Pod,
-) -> Result<String> {
+pub async fn kubelet_streaming_endpoint(state: &ApiServerState, pod: &Pod) -> Result<String> {
     let node_name = pod
         .spec
         .as_ref()
@@ -69,12 +66,7 @@ pub async fn kubelet_streaming_endpoint(
 /// Route an SPDY upgrade request to the kubelet streaming server and relay
 /// data bidirectionally. Returns `None` if the request doesn't have SPDY
 /// upgrade headers (caller should fall back to another path).
-pub fn spdy_proxy_response(
-    upgrade: OnUpgrade,
-    kubelet_addr: &str,
-    kubelet_path: &str,
-) -> Response {
-
+pub fn spdy_proxy_response(upgrade: OnUpgrade, kubelet_addr: &str, kubelet_path: &str) -> Response {
     info!("SPDY proxy → kubelet at {kubelet_addr}{kubelet_path}");
 
     let kubelet_addr = kubelet_addr.to_string();

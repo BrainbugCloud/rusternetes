@@ -45,6 +45,10 @@ pub enum FieldType {
     MessageMap(String),
     /// K8s JSON type — a message with a single `raw` bytes field containing JSON
     JsonRaw,
+    /// Inlined nested message — the named message is decoded and its keys are
+    /// merged directly into the PARENT object (used for K8s `VolumeSource`,
+    /// which is a nested proto message but flattened in rusternetes' JSON structs).
+    Inlined(String),
 }
 
 /// Schema for a single protobuf message type
@@ -575,7 +579,248 @@ impl ProtoRegistry {
             Self::resource_requirements_schema(),
         );
         schemas.insert("Volume".into(), Self::volume_schema());
+        schemas.insert("VolumeSource".into(), Self::volume_source_schema());
         schemas.insert("VolumeMount".into(), Self::volume_mount_schema());
+        // Volume source submessages (K8s core/v1). Without these, the generic
+        // decoder emits `{}` for each source and required fields (e.g.
+        // HostPathVolumeSource.path, ConfigMapVolumeSource keys) go missing,
+        // causing pod-create JSON decode failures.
+        schemas.insert(
+            "HostPathVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("path".into(), FieldType::String)),
+                    (2, ("type".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "EmptyDirVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("medium".into(), FieldType::String)),
+                    (2, ("sizeLimit".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "KeyToPath".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("key".into(), FieldType::String)),
+                    (2, ("path".into(), FieldType::String)),
+                    (3, ("mode".into(), FieldType::Int)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ConfigMapVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    // localObjectReference{name=1} is embedded; rusternetes JSON
+                    // flattens `name` to the top level, so inline it.
+                    (
+                        1,
+                        (
+                            "localObjectReference".into(),
+                            FieldType::Inlined("LocalObjectReference".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "items".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("KeyToPath".into()))),
+                        ),
+                    ),
+                    (3, ("defaultMode".into(), FieldType::Int)),
+                    (4, ("optional".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "SecretVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("secretName".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "items".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("KeyToPath".into()))),
+                        ),
+                    ),
+                    (3, ("defaultMode".into(), FieldType::Int)),
+                    (4, ("optional".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "LocalObjectReference".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("name".into(), FieldType::String))]),
+            },
+        );
+        schemas.insert(
+            "ProjectedVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "sources".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "VolumeProjection".into(),
+                            ))),
+                        ),
+                    ),
+                    (2, ("defaultMode".into(), FieldType::Int)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "VolumeProjection".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "secret".into(),
+                            FieldType::Message("SecretProjection".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "downwardAPI".into(),
+                            FieldType::Message("DownwardAPIProjection".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "configMap".into(),
+                            FieldType::Message("ConfigMapProjection".into()),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "serviceAccountToken".into(),
+                            FieldType::Message("ServiceAccountTokenProjection".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ConfigMapProjection".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "localObjectReference".into(),
+                            FieldType::Inlined("LocalObjectReference".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "items".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("KeyToPath".into()))),
+                        ),
+                    ),
+                    (4, ("optional".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "SecretProjection".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "localObjectReference".into(),
+                            FieldType::Inlined("LocalObjectReference".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "items".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("KeyToPath".into()))),
+                        ),
+                    ),
+                    (4, ("optional".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ServiceAccountTokenProjection".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("audience".into(), FieldType::String)),
+                    (2, ("expirationSeconds".into(), FieldType::Int)),
+                    (3, ("path".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "DownwardAPIProjection".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "items".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message(
+                            "DownwardAPIVolumeFile".into(),
+                        ))),
+                    ),
+                )]),
+            },
+        );
+        schemas.insert(
+            "DownwardAPIVolumeSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "items".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "DownwardAPIVolumeFile".into(),
+                            ))),
+                        ),
+                    ),
+                    (2, ("defaultMode".into(), FieldType::Int)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "DownwardAPIVolumeFile".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("path".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "fieldRef".into(),
+                            FieldType::Message("ObjectFieldSelector".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "resourceFieldRef".into(),
+                            FieldType::Message("ResourceFieldSelector".into()),
+                        ),
+                    ),
+                    (4, ("mode".into(), FieldType::Int)),
+                ]),
+            },
+        );
         schemas.insert("EnvVar".into(), Self::env_var_schema());
         schemas.insert("EnvVarSource".into(), Self::env_var_source_schema());
         schemas.insert(
@@ -2424,21 +2669,42 @@ impl ProtoRegistry {
     }
 
     fn volume_schema() -> MessageSchema {
-        // Volumes have many source types — we handle the most common
+        // K8s proto: Volume { name = 1, volumeSource = 2 }
+        // The VolumeSource is a NESTED message at field 2 (NOT inlined).
+        // Its inner source types (hostPath=1, emptyDir=2, ... configMap=19) are
+        // decoded by the VolumeSource schema. Because rusternetes' JSON structs
+        // inline the source fields directly into Volume (no `volumeSource` key),
+        // we mark field 2 as an inlined VolumeSource so its decoded keys are
+        // merged up into the Volume object.
         MessageSchema {
             fields: HashMap::from([
                 (1, ("name".into(), FieldType::String)),
-                // VolumeSource is inlined — each source type has its own field number
-                // We handle the most common ones
                 (
                     2,
+                    (
+                        "volumeSource".into(),
+                        FieldType::Inlined("VolumeSource".into()),
+                    ),
+                ),
+            ]),
+        }
+    }
+
+    fn volume_source_schema() -> MessageSchema {
+        // K8s proto VolumeSource — field numbers per
+        // k8s.io/api/core/v1/generated.proto. Only the source types rusternetes
+        // supports are listed; unknown ones are skipped harmlessly.
+        MessageSchema {
+            fields: HashMap::from([
+                (
+                    1,
                     (
                         "hostPath".into(),
                         FieldType::Message("HostPathVolumeSource".into()),
                     ),
                 ),
                 (
-                    3,
+                    2,
                     (
                         "emptyDir".into(),
                         FieldType::Message("EmptyDirVolumeSource".into()),
@@ -2452,10 +2718,21 @@ impl ProtoRegistry {
                     ),
                 ),
                 (
-                    9,
+                    7,
+                    ("nfs".into(), FieldType::Message("NFSVolumeSource".into())),
+                ),
+                (
+                    10,
                     (
                         "persistentVolumeClaim".into(),
                         FieldType::Message("PersistentVolumeClaimVolumeSource".into()),
+                    ),
+                ),
+                (
+                    16,
+                    (
+                        "downwardAPI".into(),
+                        FieldType::Message("DownwardAPIVolumeSource".into()),
                     ),
                 ),
                 (
@@ -2474,9 +2751,13 @@ impl ProtoRegistry {
                 ),
                 (
                     28,
+                    ("csi".into(), FieldType::Message("CSIVolumeSource".into())),
+                ),
+                (
+                    29,
                     (
-                        "downwardAPI".into(),
-                        FieldType::Message("DownwardAPIVolumeSource".into()),
+                        "ephemeral".into(),
+                        FieldType::Message("EphemeralVolumeSource".into()),
                     ),
                 ),
             ]),
@@ -2738,6 +3019,17 @@ impl ProtoRegistry {
                                     m.insert(key, val);
                                 }
                             }
+                            FieldType::Inlined(ref msg_type) => {
+                                // Nested message whose decoded keys are merged
+                                // directly into THIS object (e.g. VolumeSource).
+                                if let Some(Value::Object(inner)) =
+                                    self.decode_message(msg_type, field_data)
+                                {
+                                    for (k, v) in inner {
+                                        obj.insert(k, v);
+                                    }
+                                }
+                            }
                             _ => {
                                 obj.insert(name.clone(), json_val);
                             }
@@ -2872,6 +3164,12 @@ impl ProtoRegistry {
                     }
                 }
                 Value::Null
+            }
+            FieldType::Inlined(msg_type) => {
+                // Standalone decode of an inlined message returns the object as-is
+                // (merging into a parent is handled in decode_with_schema).
+                self.decode_message(msg_type, data)
+                    .unwrap_or_else(|| Value::Object(Map::new()))
             }
         }
     }
@@ -3253,6 +3551,107 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_volume_with_nested_configmap_source() {
+        // Regression: K8s proto Volume{name=1, volumeSource=2}; VolumeSource is a
+        // NESTED message, and configMap is field 19 inside it. A previous bug
+        // treated field 2 of Volume as `hostPath` directly, so every volume
+        // decoded to `hostPath: {}` and pod-create JSON decode failed with
+        // `missing field 'path'`. Verify a configMap volume round-trips.
+        let registry = ProtoRegistry::new();
+
+        // ConfigMapVolumeSource: localObjectReference{name=1}="my-configmap"
+        //   localObjectReference is a nested message (field 1) with name=1.
+        let local_obj_ref = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&[0x0a, 0x0c]); // field 1 (name), len=12
+            b.extend_from_slice(b"my-configmap");
+            b
+        };
+        let configmap_source = {
+            let mut b = Vec::new();
+            // field 1 (localObjectReference), wire 2
+            b.push(0x0a);
+            b.push(local_obj_ref.len() as u8);
+            b.extend_from_slice(&local_obj_ref);
+            b
+        };
+        // VolumeSource: configMap = field 19 (tag = 19<<3 | 2 = 0x9a 0x01)
+        let volume_source = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&[0x9a, 0x01]); // field 19, wire 2
+            b.push(configmap_source.len() as u8);
+            b.extend_from_slice(&configmap_source);
+            b
+        };
+        // Volume: name = field 1, volumeSource = field 2
+        let volume = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&[0x0a, 0x0b]); // field 1 (name), len=11
+            b.extend_from_slice(b"test-volume");
+            b.push(0x12); // field 2 (volumeSource), wire 2
+            b.push(volume_source.len() as u8);
+            b.extend_from_slice(&volume_source);
+            b
+        };
+
+        let val = registry
+            .decode_message("Volume", &volume)
+            .expect("Volume should decode");
+
+        // Must NOT contain a bogus hostPath
+        assert!(
+            val.pointer("/hostPath").is_none(),
+            "configMap volume must not decode as hostPath: {val:?}"
+        );
+        assert_eq!(
+            val.pointer("/name"),
+            Some(&Value::String("test-volume".into()))
+        );
+        // configMap.name flattened from localObjectReference
+        assert_eq!(
+            val.pointer("/configMap/name"),
+            Some(&Value::String("my-configmap".into())),
+            "expected configMap.name=my-configmap, got {val:?}"
+        );
+    }
+
+    #[test]
+    fn test_decode_volume_with_hostpath_source() {
+        // hostPath is field 1 inside VolumeSource; its `path` must survive.
+        let registry = ProtoRegistry::new();
+        let hostpath_source = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&[0x0a, 0x04]); // field 1 (path), len=4
+            b.extend_from_slice(b"/tmp");
+            b
+        };
+        let volume_source = {
+            let mut b = Vec::new();
+            b.push(0x0a); // field 1 (hostPath), wire 2
+            b.push(hostpath_source.len() as u8);
+            b.extend_from_slice(&hostpath_source);
+            b
+        };
+        let volume = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&[0x0a, 0x02]); // field 1 (name), len=2
+            b.extend_from_slice(b"hp");
+            b.push(0x12); // field 2 (volumeSource), wire 2
+            b.push(volume_source.len() as u8);
+            b.extend_from_slice(&volume_source);
+            b
+        };
+        let val = registry
+            .decode_message("Volume", &volume)
+            .expect("Volume should decode");
+        assert_eq!(
+            val.pointer("/hostPath/path"),
+            Some(&Value::String("/tmp".into())),
+            "expected hostPath.path=/tmp, got {val:?}"
+        );
+    }
+
+    #[test]
     fn test_decode_deployment_spec_with_template() {
         let registry = ProtoRegistry::new();
 
@@ -3312,5 +3711,147 @@ mod tests {
         let first = &containers.as_array().unwrap()[0];
         assert_eq!(first.get("name"), Some(&Value::String("test".into())));
         assert_eq!(first.get("image"), Some(&Value::String("nginx".into())));
+    }
+
+    #[test]
+    fn test_decode_e2e_pod_with_empty_service_account() {
+        // Regression: e2e "lifecycle of Pods" test creates a Pod via protobuf with
+        // serviceAccountName explicitly set to "". The scheduler must still see this
+        // pod as schedulable (no nodeName, Pending/None phase).
+        let registry = ProtoRegistry::new();
+
+        // Build a protobuf-encoded Pod that matches the e2e "lifecycle of Pods" test:
+        // metadata: name="pod-test", namespace="pods-6553", uid="..."
+        // spec: containers=[{name:"agnhost", image:"agnhost:2.55"}],
+        //       restartPolicy="Always", serviceAccountName=""
+        // status: {} (empty PodStatus message)
+        let mut pod = Vec::new();
+
+        // Field 1: metadata (ObjectMeta)
+        let mut meta = Vec::new();
+        // name = "pod-test" (field 1)
+        meta.push(0x0A); // field 1, wire 2
+        meta.push(8);
+        meta.extend_from_slice(b"pod-test");
+        // namespace = "pods-6553" (field 3)
+        meta.push(0x1A); // field 3, wire 2
+        meta.push(9);
+        meta.extend_from_slice(b"pods-6553");
+        // uid = "test-uid-123" (field 5)
+        meta.push(0x2A); // field 5, wire 2
+        meta.push(11);
+        meta.extend_from_slice(b"test-uid-123");
+
+        pod.push(0x0A); // field 1, wire 2
+        pod.push(meta.len() as u8);
+        pod.extend_from_slice(&meta);
+
+        // Field 2: spec (PodSpec)
+        let mut spec = Vec::new();
+
+        // containers = [{name: "agnhost", image: "agnhost:2.55"}]
+        let mut container = Vec::new();
+        container.push(0x0A); // field 1 (name), wire 2
+        container.push(7);
+        container.extend_from_slice(b"agnhost");
+        container.push(0x12); // field 2 (image), wire 2
+        container.push(12);
+        container.extend_from_slice(b"agnhost:2.55");
+        // args = ["pause"]
+        container.push(0x22); // field 4 (args), wire 2
+        container.push(5);
+        container.extend_from_slice(b"pause");
+
+        spec.push(0x12); // field 2 (containers), wire 2
+        spec.push(container.len() as u8);
+        spec.extend_from_slice(&container);
+
+        // restartPolicy = "Always"
+        spec.push(0x1A); // field 3, wire 2
+        spec.push(6);
+        spec.extend_from_slice(b"Always");
+
+        // serviceAccountName = "" (explicitly set in proto3 optional)
+        spec.push(0x42); // field 8, wire 2
+        spec.push(0); // empty string
+
+        // NOTE: field 10 (nodeName) and field 19 (schedulerName) are NOT present
+        // because they are proto3 optional and not explicitly set
+
+        pod.push(0x12); // field 2 (spec), wire 2
+        pod.push(spec.len() as u8);
+        pod.extend_from_slice(&spec);
+
+        // Field 3: status (empty PodStatus)
+        pod.push(0x1A); // field 3, wire 2
+        pod.push(0); // empty message
+
+        let result = registry.decode_message("Pod", &pod);
+        assert!(result.is_some(), "Pod should decode");
+        let val = result.unwrap();
+
+        // Verify the decoded JSON has the right shape for the scheduler
+        assert_eq!(
+            val.pointer("/metadata/name"),
+            Some(&Value::String("pod-test".into()))
+        );
+        assert_eq!(
+            val.pointer("/metadata/namespace"),
+            Some(&Value::String("pods-6553".into()))
+        );
+        assert_eq!(
+            val.pointer("/spec/serviceAccountName"),
+            Some(&Value::String("".into())),
+            "serviceAccountName should be empty string"
+        );
+        // nodeName should be absent (not set in protobuf)
+        assert!(
+            val.pointer("/spec/nodeName").is_none(),
+            "nodeName should be absent"
+        );
+        // schedulerName should be absent
+        assert!(
+            val.pointer("/spec/schedulerName").is_none(),
+            "schedulerName should be absent"
+        );
+
+        // Now deserialize into Pod struct and check scheduler-facing fields
+        let pod_struct: rusternetes_common::resources::Pod =
+            serde_json::from_value(val).expect("Pod should deserialize");
+
+        let spec = pod_struct.spec.as_ref().expect("spec should exist");
+        assert_eq!(
+            spec.service_account_name.as_deref(),
+            Some(""),
+            "serviceAccountName should be Some(\"\")"
+        );
+        assert!(
+            spec.node_name.is_none(),
+            "nodeName should be None (not set in protobuf)"
+        );
+        assert!(
+            spec.scheduler_name.is_none(),
+            "schedulerName should be None (not set in protobuf)"
+        );
+
+        // The scheduler's filter: !has_node && (phase is None or Pending)
+        let has_node = spec.node_name.as_deref().is_some_and(|n| !n.is_empty());
+        let phase = pod_struct
+            .status
+            .as_ref()
+            .and_then(|s| s.phase.as_ref());
+        let is_pending = matches!(phase, None | Some(rusternetes_common::types::Phase::Pending));
+        assert!(!has_node, "pod should have no node assigned");
+        assert!(is_pending, "pod should be pending");
+
+        // Scheduler name check: unwrap_or("default-scheduler")
+        let pod_scheduler = spec
+            .scheduler_name
+            .as_deref()
+            .unwrap_or("default-scheduler");
+        assert_eq!(
+            pod_scheduler, "default-scheduler",
+            "scheduler name should default correctly"
+        );
     }
 }
