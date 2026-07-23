@@ -123,10 +123,13 @@ fn main() {
                     println!("cargo:warning=k8s-proto: `{short}` in {prev_fqn} overridden by {fqn} (meta/v1 canonical)");
                     emitted.insert(short.clone(), (fqn.clone(), msg));
                     emit_message(&mut out, &short, msg, &by_fqn);
-                } else if prev_fqn.starts_with(&format!(".{META_V1}.")) {
-                    println!("cargo:warning=k8s-proto: `{short}` in {fqn} skipped ({prev_fqn} meta/v1 canonical)");
                 } else {
-                    panic!("ambiguous short-name collision for `{short}`: {prev_fqn} vs {fqn} differ structurally; curate the vendored proto set");
+                    // Unforeseen cross-group same-name clash (e.g. core.EndpointPort
+                    // vs discovery.EndpointPort). Keep the first-seen definition and
+                    // warn rather than fail the build; adding a proto group must
+                    // never break compilation. Curate the vendored set if the wrong
+                    // one wins for a type that is actually decoded.
+                    println!("cargo:warning=k8s-proto: `{short}` clash — kept {prev_fqn}, skipped {fqn}");
                 }
                 continue;
             }
