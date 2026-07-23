@@ -1,5 +1,26 @@
 # Plan 12 — Sonobuoy conformance via containerd CRI in a privileged Ubuntu pod
 
+> ## Lima path (Mac) — `scripts/lima-conformance.sh` (added 2026-07-23)
+>
+> The body of this plan targets a **privileged Ubuntu pod on the Talos cluster**.
+> On a Mac, the same all-in-one-binary → native-containerd conformance runs in the
+> **lima `default` VM**, and several workarounds below are Talos-only and are
+> **NOT needed on lima**:
+>
+> | Talos workaround (below) | lima status |
+> |---|---|
+> | containerd `native` snapshotter + explicit `unpack_config` (Pitfalls A/B) | **Unneeded** — no `/etc/containerd/config.toml` exists; default overlayfs on the ext4 root works (containerd is not nested-in-overlay). |
+> | iptables nft→legacy shims (§4) | **Unneeded** — lima's Ubuntu kernel has `iptables-legacy`; kube-proxy works as-is. |
+> | Re-extract live cert + recreate every `kube-root-ca.crt` after each restart (CA-rotation pitfall, Gotcha E) | **Replaced** by a **persistent** self-signed cert passed via `--tls-cert-file`/`--tls-key-file` (api-server loads it with `from_pem_files`). The CA is then stable across restarts and the namespace controller (reads `/etc/kubernetes/pki/ca.crt`) auto-mints a correct, stable `kube-root-ca.crt` in every namespace — verified: kube-system/default/sonobuoy serials all match the persistent CA. |
+> | "delete leftover same-name pods before a run" (Gotcha G workaround) | **Fixed at the source** in `f8ab90ab` (kubelet keys pods by `namespace/name`; scheduler treats empty `schedulerName` as default; empty `terminationMessagePath` defaults to `/dev/termination-log`). |
+>
+> `bash scripts/lima-conformance.sh [mode]` does the whole lima bringup:
+> rsync→build (glibc, native, TLS works), generate the persistent cert once,
+> wipe the bloat-prone sqlite DB, start rusternetes, bootstrap, pre-create the
+> sonobuoy ns, and launch sonobuoy (default `certified-conformance`, v1.35.0).
+> DB note: the all-in-one's startup VACUUM stalls badly once `rusternetes.db`
+> bloats (110 MB seen after days of a crash-looping pod) — the script wipes it.
+
 Follow-up to plan 11. Replaces the DinD + bollard-cri stack with **real containerd
 as the CRI** inside a privileged `ubuntu:24.04` pod. This sidesteps the two big
 problems of plan 11 in one move:
