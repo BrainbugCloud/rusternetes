@@ -12,6 +12,7 @@ members = [
     "crates/cloud-providers",
     "crates/rusternetes",
     "crates/cri-proto",
+    "crates/k8s-proto",
     "crates/cri-server",
     "crates/bollard-cri",
 ]

@@ -13,7 +13,6 @@ pub mod middleware;
 pub mod openapi;
 pub mod patch;
 pub mod prometheus_client;
-pub mod protobuf;
 #[allow(dead_code)]
 pub mod response;
 pub mod router;

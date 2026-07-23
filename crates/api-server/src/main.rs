@@ -13,7 +13,6 @@ mod middleware;
 mod openapi;
 mod patch;
 mod prometheus_client;
-pub mod protobuf;
 #[allow(dead_code)]
 mod response;
 mod router;

@@ -11,8 +11,8 @@ use std::sync::{Arc, LazyLock};
 use tracing::{debug, info, warn};
 
 /// Global protobuf schema registry — initialized once on first use
-static PROTO_REGISTRY: LazyLock<crate::protobuf::ProtoRegistry> =
-    LazyLock::new(crate::protobuf::ProtoRegistry::new);
+static PROTO_REGISTRY: LazyLock<k8s_proto::ProtoRegistry> =
+    LazyLock::new(k8s_proto::ProtoRegistry::new);
 
 /// Extension type to carry UserInfo through the request
 #[derive(Clone, Debug)]
