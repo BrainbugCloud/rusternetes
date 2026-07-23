@@ -495,7 +495,9 @@ impl ProtoRegistry {
                         ),
                     ),
                     (4, ("minReadySeconds".into(), FieldType::Int)),
-                    (5, ("revisionHistoryLimit".into(), FieldType::Int)),
+                    // field 5 (templateGeneration) was removed in apps/v1;
+                    // revisionHistoryLimit is field 6 per generated.proto.
+                    (6, ("revisionHistoryLimit".into(), FieldType::Int)),
                 ]),
             },
         );
@@ -570,6 +572,28 @@ impl ProtoRegistry {
         // ========== core/v1 types ==========
 
         schemas.insert("PodTemplateSpec".into(), Self::pod_template_spec_schema());
+        // core/v1 PodTemplate { metadata=1, template=2 }. Without this,
+        // protobuf-encoded PodTemplate creates fell through to the best-effort
+        // decoder; the [sig-api-machinery] chunking test bulk-creates
+        // PodTemplates and its failure panicked the whole e2e suite (0 results).
+        schemas.insert(
+            "PodTemplate".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "template".into(),
+                            FieldType::Message("PodTemplateSpec".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
         schemas.insert("PodSpec".into(), Self::pod_spec_schema());
         schemas.insert("Container".into(), Self::container_schema());
         schemas.insert("ContainerPort".into(), Self::container_port_schema());
@@ -1304,17 +1328,19 @@ impl ProtoRegistry {
                     (8, ("ttlSecondsAfterFinished".into(), FieldType::Int)),
                     (9, ("completionMode".into(), FieldType::String)),
                     (10, ("suspend".into(), FieldType::Bool)),
-                    (11, ("podReplacementPolicy".into(), FieldType::String)),
-                    (12, ("managedBy".into(), FieldType::String)),
-                    (13, ("backoffLimitPerIndex".into(), FieldType::Int)),
-                    (14, ("maxFailedIndexes".into(), FieldType::Int)),
+                    // Field numbers 11-15 per k8s.io/api/batch/v1 generated.proto.
+                    // (Previously mis-assigned, silently corrupting these fields.)
                     (
-                        15,
+                        11,
                         (
                             "podFailurePolicy".into(),
                             FieldType::Message("PodFailurePolicy".into()),
                         ),
                     ),
+                    (12, ("backoffLimitPerIndex".into(), FieldType::Int)),
+                    (13, ("maxFailedIndexes".into(), FieldType::Int)),
+                    (14, ("podReplacementPolicy".into(), FieldType::String)),
+                    (15, ("managedBy".into(), FieldType::String)),
                     (
                         16,
                         (
@@ -1341,6 +1367,85 @@ impl ProtoRegistry {
             "SuccessPolicy".into(),
             MessageSchema {
                 fields: HashMap::new(),
+            },
+        );
+        // batch/v1 CronJob (field numbers per k8s.io/api/batch/v1 generated.proto).
+        // Without these, protobuf-encoded CronJob creates fell through to the
+        // best-effort decoder and lost spec.schedule → "missing field `schedule`".
+        schemas.insert(
+            "CronJob".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (2, ("spec".into(), FieldType::Message("CronJobSpec".into()))),
+                    (
+                        3,
+                        ("status".into(), FieldType::Message("CronJobStatus".into())),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "CronJobSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("schedule".into(), FieldType::String)),
+                    (2, ("startingDeadlineSeconds".into(), FieldType::Int)),
+                    (3, ("concurrencyPolicy".into(), FieldType::String)),
+                    (4, ("suspend".into(), FieldType::Bool)),
+                    (
+                        5,
+                        (
+                            "jobTemplate".into(),
+                            FieldType::Message("JobTemplateSpec".into()),
+                        ),
+                    ),
+                    (6, ("successfulJobsHistoryLimit".into(), FieldType::Int)),
+                    (7, ("failedJobsHistoryLimit".into(), FieldType::Int)),
+                    (8, ("timeZone".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "CronJobStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "active".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ObjectReference".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        4,
+                        ("lastScheduleTime".into(), FieldType::Message("Time".into())),
+                    ),
+                    (
+                        5,
+                        (
+                            "lastSuccessfulTime".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "JobTemplateSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (2, ("spec".into(), FieldType::Message("JobSpec".into()))),
+                ]),
             },
         );
 
@@ -2424,25 +2529,31 @@ impl ProtoRegistry {
                         FieldType::Repeated(Box::new(FieldType::Message("Toleration".into()))),
                     ),
                 ),
+                // Field numbers 23-40 per k8s.io/api/core/v1 generated.proto.
+                // Previously field 23 (hostAliases) was skipped, shifting every
+                // field from here up by one: upstream `priority` (int32, field
+                // 25, defaulted to 0 by admission) landed on our String
+                // `priorityClassName` → "invalid type: integer 0, expected a
+                // string" on every scheduled-pod update.
                 (
-                    24,
+                    23,
                     (
                         "hostAliases".into(),
                         FieldType::Repeated(Box::new(FieldType::Message("HostAlias".into()))),
                     ),
                 ),
-                (25, ("priorityClassName".into(), FieldType::String)),
-                (26, ("priority".into(), FieldType::Int)),
+                (24, ("priorityClassName".into(), FieldType::String)),
+                (25, ("priority".into(), FieldType::Int)),
                 (
-                    27,
+                    26,
                     (
                         "dnsConfig".into(),
                         FieldType::Message("PodDNSConfig".into()),
                     ),
                 ),
-                (28, ("shareProcessNamespace".into(), FieldType::Bool)),
+                (27, ("shareProcessNamespace".into(), FieldType::Bool)),
                 (
-                    29,
+                    28,
                     (
                         "readinessGates".into(),
                         FieldType::Repeated(Box::new(FieldType::Message(
@@ -2450,18 +2561,12 @@ impl ProtoRegistry {
                         ))),
                     ),
                 ),
-                (30, ("runtimeClassName".into(), FieldType::String)),
+                (29, ("runtimeClassName".into(), FieldType::String)),
+                (30, ("enableServiceLinks".into(), FieldType::Bool)),
+                (31, ("preemptionPolicy".into(), FieldType::String)),
                 (32, ("overhead".into(), FieldType::StringMap)),
-                (33, ("enableServiceLinks".into(), FieldType::Bool)),
                 (
-                    34,
-                    (
-                        "ephemeralContainers".into(),
-                        FieldType::Repeated(Box::new(FieldType::Message("Container".into()))),
-                    ),
-                ),
-                (
-                    35,
+                    33,
                     (
                         "topologySpreadConstraints".into(),
                         FieldType::Repeated(Box::new(FieldType::Message(
@@ -2469,8 +2574,25 @@ impl ProtoRegistry {
                         ))),
                     ),
                 ),
-                (36, ("setHostnameAsFQDN".into(), FieldType::Bool)),
-                (37, ("os".into(), FieldType::Message("PodOS".into()))),
+                (
+                    34,
+                    (
+                        "ephemeralContainers".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message("Container".into()))),
+                    ),
+                ),
+                (35, ("setHostnameAsFQDN".into(), FieldType::Bool)),
+                (36, ("os".into(), FieldType::Message("PodOS".into()))),
+                (37, ("hostUsers".into(), FieldType::Bool)),
+                (
+                    38,
+                    (
+                        "schedulingGates".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message(
+                            "PodSchedulingGate".into(),
+                        ))),
+                    ),
+                ),
                 (
                     39,
                     (
@@ -2483,10 +2605,8 @@ impl ProtoRegistry {
                 (
                     40,
                     (
-                        "schedulingGates".into(),
-                        FieldType::Repeated(Box::new(FieldType::Message(
-                            "PodSchedulingGate".into(),
-                        ))),
+                        "resources".into(),
+                        FieldType::Message("ResourceRequirements".into()),
                     ),
                 ),
             ]),
@@ -2573,6 +2693,17 @@ impl ProtoRegistry {
                     ),
                 ),
                 (20, ("terminationMessagePolicy".into(), FieldType::String)),
+                // Field numbers 21-24 per k8s.io/api/core/v1 generated.proto.
+                // Previously volumeDevices/resizePolicy/restartPolicy were at
+                // 23/24/25 (shifted), so restartPolicy (field 24) was dropped
+                // and resizePolicy mis-decoded.
+                (
+                    21,
+                    (
+                        "volumeDevices".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message("VolumeDevice".into()))),
+                    ),
+                ),
                 (
                     22,
                     ("startupProbe".into(), FieldType::Message("Probe".into())),
@@ -2580,20 +2711,13 @@ impl ProtoRegistry {
                 (
                     23,
                     (
-                        "volumeDevices".into(),
-                        FieldType::Repeated(Box::new(FieldType::Message("VolumeDevice".into()))),
-                    ),
-                ),
-                (
-                    24,
-                    (
                         "resizePolicy".into(),
                         FieldType::Repeated(Box::new(FieldType::Message(
                             "ContainerResizePolicy".into(),
                         ))),
                     ),
                 ),
-                (25, ("restartPolicy".into(), FieldType::String)),
+                (24, ("restartPolicy".into(), FieldType::String)),
             ]),
         }
     }
@@ -3852,6 +3976,125 @@ mod tests {
         assert_eq!(
             pod_scheduler, "default-scheduler",
             "scheduler name should default correctly"
+        );
+    }
+
+    #[test]
+    fn test_decode_cronjob_with_nested_job_template() {
+        // Regression: batch/v1 CronJob had NO registered schema, so protobuf
+        // creates fell through to the best-effort decoder and lost
+        // spec.schedule → "missing field `schedule`" (400 Invalid) on every
+        // conformance CronJob test. Also exercises the JobSpec field 14/15 fix
+        // (podReplacementPolicy=14, managedBy=15 — previously mis-numbered).
+        let registry = ProtoRegistry::new();
+
+        // JobSpec { backoffLimit=7:int, podReplacementPolicy=14:str, managedBy=15:str }
+        let job_spec = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&[0x38, 0x04]); // field 7 (backoffLimit) varint = 4
+            b.push(0x72); // field 14 (podReplacementPolicy), wire 2
+            b.push(6);
+            b.extend_from_slice(b"Failed");
+            b.push(0x7a); // field 15 (managedBy), wire 2
+            b.push(1);
+            b.extend_from_slice(b"x");
+            b
+        };
+        // JobTemplateSpec { spec=2:JobSpec }
+        let job_template = {
+            let mut b = Vec::new();
+            b.push(0x12); // field 2 (spec), wire 2
+            b.push(job_spec.len() as u8);
+            b.extend_from_slice(&job_spec);
+            b
+        };
+        // CronJobSpec { schedule=1:str, concurrencyPolicy=3:str, jobTemplate=5:msg }
+        let cronjob_spec = {
+            let mut b = Vec::new();
+            b.push(0x0a); // field 1 (schedule), wire 2
+            b.push(11);
+            b.extend_from_slice(b"*/1 * * * *");
+            b.push(0x1a); // field 3 (concurrencyPolicy), wire 2
+            b.push(6);
+            b.extend_from_slice(b"Forbid");
+            b.push(0x2a); // field 5 (jobTemplate), wire 2
+            b.push(job_template.len() as u8);
+            b.extend_from_slice(&job_template);
+            b
+        };
+        // CronJob { spec=2:CronJobSpec }
+        let cronjob = {
+            let mut b = Vec::new();
+            b.push(0x12); // field 2 (spec), wire 2
+            b.push(cronjob_spec.len() as u8);
+            b.extend_from_slice(&cronjob_spec);
+            b
+        };
+
+        let val = registry
+            .decode_message("CronJob", &cronjob)
+            .expect("CronJob should decode");
+
+        assert_eq!(
+            val.pointer("/spec/schedule"),
+            Some(&Value::String("*/1 * * * *".into())),
+            "spec.schedule must decode, got {val:?}"
+        );
+        assert_eq!(
+            val.pointer("/spec/concurrencyPolicy"),
+            Some(&Value::String("Forbid".into()))
+        );
+        assert_eq!(
+            val.pointer("/spec/jobTemplate/spec/backoffLimit"),
+            Some(&json!(4))
+        );
+        // JobSpec field-number fix: 14=podReplacementPolicy, 15=managedBy.
+        assert_eq!(
+            val.pointer("/spec/jobTemplate/spec/podReplacementPolicy"),
+            Some(&Value::String("Failed".into())),
+            "JobSpec field 14 must be podReplacementPolicy, got {val:?}"
+        );
+        assert_eq!(
+            val.pointer("/spec/jobTemplate/spec/managedBy"),
+            Some(&Value::String("x".into())),
+            "JobSpec field 15 must be managedBy, got {val:?}"
+        );
+    }
+
+    #[test]
+    fn test_decode_podspec_priority_field_numbers() {
+        // Regression: PodSpec skipped field 23 (hostAliases), shifting every
+        // field up by one. Upstream `priority` (int32, field 25) is defaulted
+        // to 0 by admission; on a pod UPDATE round-trip that varint 0 landed on
+        // our String `priorityClassName` → "invalid type: integer 0, expected a
+        // string" (the [sig-node] var-expansion update failure). Verify field 24
+        // decodes as the priorityClassName string and field 25 as the priority
+        // integer.
+        let registry = ProtoRegistry::new();
+
+        let pod_spec = {
+            let mut b = Vec::new();
+            // field 24 (priorityClassName), wire 2: tag = 24<<3|2 = 194 → varint C2 01
+            b.extend_from_slice(&[0xc2, 0x01, 0x04]);
+            b.extend_from_slice(b"high");
+            // field 25 (priority), wire 0 (varint): tag = 25<<3|0 = 200 → varint C8 01, value 0
+            b.extend_from_slice(&[0xc8, 0x01, 0x00]);
+            b
+        };
+
+        let val = registry
+            .decode_message("PodSpec", &pod_spec)
+            .expect("PodSpec should decode");
+
+        assert_eq!(
+            val.pointer("/priorityClassName"),
+            Some(&Value::String("high".into())),
+            "field 24 must be priorityClassName string, got {val:?}"
+        );
+        assert_eq!(
+            val.pointer("/priority"),
+            Some(&json!(0)),
+            "field 25 must be priority integer 0 (not on priorityClassName), got {val:?}"
         );
     }
 }
