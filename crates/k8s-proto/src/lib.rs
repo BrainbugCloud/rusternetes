@@ -16,6 +16,10 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use tracing::{debug, warn};
 
+// Registry entries generated at build time from the vendored k8s.io/api protos.
+// Defines `fn generated_schemas(&mut HashMap<String, MessageSchema>)`.
+include!(concat!(env!("OUT_DIR"), "/generated_registry.rs"));
+
 /// Wire types in protobuf encoding
 const WIRE_VARINT: u8 = 0;
 const WIRE_64BIT: u8 = 1;
@@ -2271,6 +2275,14 @@ impl ProtoRegistry {
             },
         );
 
+        // Overlay schemas generated at build time from the vendored upstream
+        // k8s.io/api protos (see build.rs). Generated entries replace the
+        // hand-written ones above for the vendored groups (core/apps/batch +
+        // apimachinery), so their field numbers come straight from protoc and
+        // can't drift. The hand-written base still covers groups not yet
+        // vendored (e.g. apiextensions CRD types).
+        generated_schemas(&mut schemas);
+
         ProtoRegistry { schemas }
     }
 
@@ -4059,6 +4071,27 @@ mod tests {
             Some(&Value::String("x".into())),
             "JobSpec field 15 must be managedBy, got {val:?}"
         );
+    }
+
+    #[test]
+    fn test_generated_registry_covers_core_kinds() {
+        // Guards the build.rs codegen: every kind below must resolve to a
+        // schema (decoding empty bytes yields an empty object, not None). If
+        // vendoring or codegen regresses and drops a group, this fails instead
+        // of silently mis-decoding at runtime.
+        let r = ProtoRegistry::new();
+        for kind in [
+            "Pod", "PodSpec", "Container", "PodTemplate", "PodTemplateSpec",
+            "Deployment", "DeploymentSpec", "ReplicaSet", "StatefulSet",
+            "DaemonSet", "Job", "JobSpec", "CronJob", "CronJobSpec",
+            "JobTemplateSpec", "Service", "ServiceSpec", "ConfigMap", "Secret",
+            "ObjectMeta", "Namespace",
+        ] {
+            assert!(
+                r.decode_message(kind, &[]).is_some(),
+                "generated registry missing kind `{kind}`"
+            );
+        }
     }
 
     #[test]
