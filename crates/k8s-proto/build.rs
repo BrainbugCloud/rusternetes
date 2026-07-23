@@ -287,8 +287,14 @@ fn scalar_or_message_expr(
                 _ => {}
             }
             // Go `,inline` embeds surface as these named message fields; K8s
-            // JSON flattens them into the parent object.
-            if matches!(json, "volumeSource" | "persistentVolumeSource" | "localObjectReference") {
+            // JSON flattens them into the parent object. `handler` is Probe's
+            // embedded ProbeHandler (exec/httpGet/tcpSocket/grpc) — without
+            // inlining it, readiness/liveness probes decode with no handler and
+            // the kubelet can never run them.
+            if matches!(
+                json,
+                "volumeSource" | "persistentVolumeSource" | "localObjectReference" | "handler"
+            ) {
                 return format!("FieldType::Inlined({short:?}.to_string())");
             }
             format!("FieldType::Message({short:?}.to_string())")

@@ -4095,6 +4095,52 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_probe_inlines_handler() {
+        // Regression: proto Probe embeds ProbeHandler as field 1 (`handler`,
+        // Go ,inline), so K8s JSON flattens the handler (httpGet/exec/...) onto
+        // the Probe. If `handler` is not inlined, the decoded probe has no
+        // handler and the kubelet can't run it — a readiness probe silently
+        // becomes a no-op, and the [sig-apps] "halt if unhealthy" StatefulSet
+        // test hangs forever waiting for Ready=false.
+        let registry = ProtoRegistry::new();
+
+        // HTTPGetAction { path=1:"/healthz" }
+        let httpget = {
+            let mut b = vec![0x0a, 0x08];
+            b.extend_from_slice(b"/healthz");
+            b
+        };
+        // ProbeHandler { httpGet=2:HTTPGetAction }
+        let handler = {
+            let mut b = vec![0x12, httpget.len() as u8];
+            b.extend_from_slice(&httpget);
+            b
+        };
+        // Probe { handler=1:ProbeHandler, initialDelaySeconds=2:5 }
+        let probe = {
+            let mut b = vec![0x0a, handler.len() as u8];
+            b.extend_from_slice(&handler);
+            b.extend_from_slice(&[0x10, 0x05]);
+            b
+        };
+
+        let val = registry
+            .decode_message("Probe", &probe)
+            .expect("Probe should decode");
+
+        assert_eq!(
+            val.pointer("/httpGet/path"),
+            Some(&Value::String("/healthz".into())),
+            "httpGet must be flattened onto the Probe, got {val:?}"
+        );
+        assert!(
+            val.pointer("/handler").is_none(),
+            "handler must be inlined, not left nested: {val:?}"
+        );
+        assert_eq!(val.pointer("/initialDelaySeconds"), Some(&json!(5)));
+    }
+
+    #[test]
     fn test_decode_podspec_priority_field_numbers() {
         // Regression: PodSpec skipped field 23 (hostAliases), shifting every
         // field up by one. Upstream `priority` (int32, field 25) is defaulted
