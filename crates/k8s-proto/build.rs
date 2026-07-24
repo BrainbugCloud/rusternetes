@@ -95,17 +95,17 @@ fn main() {
         }
         for msg in &file.message_type {
             let short = msg.name().to_string();
-            if msg
-                .options
-                .as_ref()
-                .map(|o| o.map_entry())
-                .unwrap_or(false)
-            {
+            if msg.options.as_ref().map(|o| o.map_entry()).unwrap_or(false) {
                 continue;
             }
             let fqn = format!(".{pkg}.{short}");
+            // The registry is keyed by short name (how field references resolve),
+            // except for a few structurally-distinct messages that share a short
+            // name across groups — those get a package-qualified key so both can
+            // coexist (see `registry_key`). e.g. flowcontrol.Subject vs rbac.Subject.
+            let key = registry_key(&fqn);
             const META_V1: &str = "k8s.io.apimachinery.pkg.apis.meta.v1";
-            if let Some((prev_fqn, prev_msg)) = emitted.get(&short).cloned() {
+            if let Some((prev_fqn, prev_msg)) = emitted.get(&key).cloned() {
                 if prev_fqn == fqn {
                     continue;
                 }
@@ -118,23 +118,25 @@ fn main() {
                 // apimachinery meta/v1 and core/v1 with different shapes; the
                 // meta/v1 definition is the canonical one referenced by generic
                 // options types, so it wins. Anything else is an unexpected
-                // cross-group clash that must be curated.
+                // cross-group clash that must be curated (add it to `registry_key`
+                // so both variants get distinct keys).
                 if pkg == META_V1 {
                     println!("cargo:warning=k8s-proto: `{short}` in {prev_fqn} overridden by {fqn} (meta/v1 canonical)");
-                    emitted.insert(short.clone(), (fqn.clone(), msg));
-                    emit_message(&mut out, &short, msg, &by_fqn);
+                    emitted.insert(key.clone(), (fqn.clone(), msg));
+                    emit_message(&mut out, &key, msg, &by_fqn);
                 } else {
-                    // Unforeseen cross-group same-name clash (e.g. core.EndpointPort
-                    // vs discovery.EndpointPort). Keep the first-seen definition and
-                    // warn rather than fail the build; adding a proto group must
-                    // never break compilation. Curate the vendored set if the wrong
-                    // one wins for a type that is actually decoded.
-                    println!("cargo:warning=k8s-proto: `{short}` clash — kept {prev_fqn}, skipped {fqn}");
+                    // Unforeseen cross-group same-name clash. Keep the first-seen
+                    // definition and warn rather than fail the build; adding a proto
+                    // group must never break compilation. Curate via `registry_key`
+                    // if the wrong one wins for a type that is actually decoded.
+                    println!(
+                        "cargo:warning=k8s-proto: `{short}` clash — kept {prev_fqn}, skipped {fqn}"
+                    );
                 }
                 continue;
             }
-            emitted.insert(short.clone(), (fqn.clone(), msg));
-            emit_message(&mut out, &short, msg, &by_fqn);
+            emitted.insert(key.clone(), (fqn.clone(), msg));
+            emit_message(&mut out, &key, msg, &by_fqn);
         }
     }
     out.push_str("}\n");
@@ -210,7 +212,7 @@ fn emit_message(
     ));
     for field in &msg.field {
         let number = field.number();
-        let json = field.json_name();
+        let json = json_name_override(short, number).unwrap_or_else(|| field.json_name());
         let ft = field_type_expr(field, by_fqn);
         out.push_str(&format!(
             "        ({number}u32, ({json:?}.to_string(), {ft})),\n"
@@ -219,28 +221,82 @@ fn emit_message(
     out.push_str("    ]) });\n");
 }
 
+/// A few upstream k8s protos declare a field with a capitalized name while the
+/// Go JSON tag (the real wire key) is lowerCamelCase. protoc's `json_name()`
+/// preserves the capital, so the generated registry would emit the wrong key
+/// and decoded requests would be missing the lowercase field. Override those
+/// specific (message, field-number) pairs.
+///
+/// NOTE: `DaemonEndpoint.Port` is deliberately absent — upstream genuinely uses
+/// `json:"Port"` (capital P) there, so protoc's `Port` is already correct.
+fn json_name_override(msg_short: &str, number: i32) -> Option<&'static str> {
+    match (msg_short, number) {
+        // admissionregistration ValidatingAdmissionPolicy CEL types
+        ("Validation", 1) => Some("expression"),
+        ("Variable", 1) => Some("name"),
+        ("Variable", 2) => Some("expression"),
+        // admissionregistration webhook configuration lists
+        ("MutatingWebhookConfiguration", 2) => Some("webhooks"),
+        ("ValidatingWebhookConfiguration", 2) => Some("webhooks"),
+        _ => None,
+    }
+}
+
 /// Short name = last dotted segment of a `.pkg.Msg` type_name.
 fn short_of(type_name: &str) -> &str {
     type_name.rsplit('.').next().unwrap_or(type_name)
 }
 
+/// Registry key for a message, given its fully-qualified proto name (leading-dot
+/// form, e.g. `.k8s.io.api.rbac.v1.Subject`). Normally the short name — that's how
+/// `FieldType::Message(short)` references resolve. A handful of messages share a
+/// short name across API groups with *different* shapes; those get a package-
+/// qualified key so both can live in the flat, short-name-keyed registry.
+///
+/// Used for BOTH the schema map key (from the message's own fqn) and reference
+/// resolution (from a field's `type_name`), so the two always agree.
+///
+/// Currently only `flowcontrol.v1.Subject` (kind + user/group/serviceAccount
+/// submessages) which is unrelated to `rbac.v1.Subject` (kind/apiGroup/name/
+/// namespace strings) — rbac's keeps the plain `Subject` key since it is
+/// referenced cluster-wide by RoleBinding/ClusterRoleBinding.
+fn registry_key(fqn: &str) -> String {
+    match fqn {
+        ".k8s.io.api.flowcontrol.v1.Subject" => "flowcontrol.Subject".to_string(),
+        _ => short_of(fqn).to_string(),
+    }
+}
+
 /// Render a `FieldType` constructor expression for one field.
-fn field_type_expr(field: &FieldDescriptorProto, by_fqn: &HashMap<String, &DescriptorProto>) -> String {
+fn field_type_expr(
+    field: &FieldDescriptorProto,
+    by_fqn: &HashMap<String, &DescriptorProto>,
+) -> String {
     let json = field.json_name();
 
     // map<K,V> is a repeated synthetic entry message.
     if field.label() == Label::Repeated && field.r#type() == Type::Message {
         if let Some(entry) = by_fqn.get(field.type_name()) {
-            if entry.options.as_ref().map(|o| o.map_entry()).unwrap_or(false) {
+            if entry
+                .options
+                .as_ref()
+                .map(|o| o.map_entry())
+                .unwrap_or(false)
+            {
                 let value = entry.field.iter().find(|f| f.number() == 2);
                 return match value {
                     Some(v) if v.r#type() == Type::Message => {
-                        // map<string, Quantity> is stored as string values by K8s
-                        // JSON; other message maps decode each value.
+                        // map<string, Quantity> (ResourceList): each value is a
+                        // Quantity submessage (string in field 1), NOT a bare
+                        // string — QuantityMap unwraps it. Other message maps
+                        // decode each value.
                         if short_of(v.type_name()) == "Quantity" {
-                            "FieldType::StringMap".to_string()
+                            "FieldType::QuantityMap".to_string()
                         } else {
-                            format!("FieldType::MessageMap({:?}.to_string())", short_of(v.type_name()))
+                            format!(
+                                "FieldType::MessageMap({:?}.to_string())",
+                                short_of(v.type_name())
+                            )
                         }
                     }
                     _ => "FieldType::StringMap".to_string(),
@@ -267,9 +323,19 @@ fn scalar_or_message_expr(
         Type::String => "FieldType::String".to_string(),
         Type::Bool => "FieldType::Bool".to_string(),
         Type::Bytes => "FieldType::Bytes".to_string(),
-        Type::Int32 | Type::Int64 | Type::Uint32 | Type::Uint64 | Type::Sint32
-        | Type::Sint64 | Type::Fixed32 | Type::Fixed64 | Type::Sfixed32
-        | Type::Sfixed64 | Type::Enum | Type::Double | Type::Float => "FieldType::Int".to_string(),
+        Type::Int32
+        | Type::Int64
+        | Type::Uint32
+        | Type::Uint64
+        | Type::Sint32
+        | Type::Sint64
+        | Type::Fixed32
+        | Type::Fixed64
+        | Type::Sfixed32
+        | Type::Sfixed64
+        | Type::Enum
+        | Type::Double
+        | Type::Float => "FieldType::Int".to_string(),
         Type::Message | Type::Group => {
             let tn = field.type_name();
             let short = short_of(tn);
@@ -282,7 +348,11 @@ fn scalar_or_message_expr(
                     return "FieldType::JsonRaw".to_string()
                 }
                 ".k8s.io.apimachinery.pkg.api.resource.Quantity" => {
-                    return "FieldType::String".to_string()
+                    // Quantity is a submessage { optional string string = 1; }
+                    // on the wire, though K8s JSON marshals it as a bare string.
+                    // Quantity unwraps field 1 rather than reading the submessage
+                    // bytes as a raw string.
+                    return "FieldType::Quantity".to_string();
                 }
                 _ => {}
             }
@@ -290,14 +360,25 @@ fn scalar_or_message_expr(
             // JSON flattens them into the parent object. `handler` is Probe's
             // embedded ProbeHandler (exec/httpGet/tcpSocket/grpc) — without
             // inlining it, readiness/liveness probes decode with no handler and
-            // the kubelet can never run them.
+            // the kubelet can never run them. `rule` is RuleWithOperations'
+            // embedded Rule (apiGroups/apiVersions/resources) — the vendored
+            // admissionregistration proto dropped the upstream
+            // (gogoproto.embed)=true marker, so it must be listed here or
+            // webhook-config creates 422 with "missing field `apiGroups`".
             if matches!(
                 json,
-                "volumeSource" | "persistentVolumeSource" | "localObjectReference" | "handler"
+                "volumeSource"
+                    | "persistentVolumeSource"
+                    | "localObjectReference"
+                    | "handler"
+                    | "rule"
             ) {
                 return format!("FieldType::Inlined({short:?}.to_string())");
             }
-            format!("FieldType::Message({short:?}.to_string())")
+            // Use the (possibly package-qualified) registry key so references to
+            // cross-group same-name messages resolve to the correct schema.
+            let key = registry_key(tn);
+            format!("FieldType::Message({key:?}.to_string())")
         }
     }
 }

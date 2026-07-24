@@ -53,6 +53,14 @@ pub enum FieldType {
     /// merged directly into the PARENT object (used for K8s `VolumeSource`,
     /// which is a nested proto message but flattened in rusternetes' JSON structs).
     Inlined(String),
+    /// K8s `resource.Quantity`. On the wire it is a submessage
+    /// `message Quantity { optional string string = 1; }`, but K8s JSON marshals
+    /// it as the bare string. Decode by unwrapping field 1, NOT by reading the
+    /// submessage bytes as a raw string.
+    Quantity,
+    /// map<string, Quantity> — repeated MapEntry where each value is a Quantity
+    /// submessage (see `Quantity`).
+    QuantityMap,
 }
 
 /// Schema for a single protobuf message type
@@ -1692,8 +1700,9 @@ impl ProtoRegistry {
             "VolumeResourceRequirements".into(),
             MessageSchema {
                 fields: HashMap::from([
-                    (1, ("limits".into(), FieldType::StringMap)),
-                    (2, ("requests".into(), FieldType::StringMap)),
+                    // ResourceList values are Quantity submessages, not raw strings.
+                    (1, ("limits".into(), FieldType::QuantityMap)),
+                    (2, ("requests".into(), FieldType::QuantityMap)),
                 ]),
             },
         );
@@ -2275,6 +2284,61 @@ impl ProtoRegistry {
             },
         );
 
+        // events.k8s.io/v1 Event. This is a DIFFERENT message from core/v1
+        // Event (kind "Event" in both groups) with different wire field
+        // numbers, so it needs its own schema keyed distinctly; decode_k8s_resource
+        // dispatches to it by apiVersion. Without this, an events.k8s.io/v1 Event
+        // decoded with the core/v1 field map mis-places every field (its
+        // eventTime MicroTime lands in involvedObject → deserialize fails with
+        // "involvedObject.kind: invalid type: integer, expected a string").
+        // Field numbers per k8s.io/api/events/v1/generated.proto.
+        schemas.insert(
+            "EventsV1Event".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("metadata".into(), FieldType::Message("ObjectMeta".into()))),
+                    (2, ("eventTime".into(), FieldType::Message("MicroTime".into()))),
+                    (3, ("series".into(), FieldType::Message("EventSeries".into()))),
+                    (4, ("reportingController".into(), FieldType::String)),
+                    (5, ("reportingInstance".into(), FieldType::String)),
+                    (6, ("action".into(), FieldType::String)),
+                    (7, ("reason".into(), FieldType::String)),
+                    (
+                        8,
+                        ("regarding".into(), FieldType::Message("ObjectReference".into())),
+                    ),
+                    (
+                        9,
+                        ("related".into(), FieldType::Message("ObjectReference".into())),
+                    ),
+                    (10, ("note".into(), FieldType::String)),
+                    (11, ("type".into(), FieldType::String)),
+                    (
+                        12,
+                        (
+                            "deprecatedSource".into(),
+                            FieldType::Message("EventSource".into()),
+                        ),
+                    ),
+                    (
+                        13,
+                        (
+                            "deprecatedFirstTimestamp".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                    (
+                        14,
+                        (
+                            "deprecatedLastTimestamp".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                    (15, ("deprecatedCount".into(), FieldType::Int)),
+                ]),
+            },
+        );
+
         // Overlay schemas generated at build time from the vendored upstream
         // k8s.io/api protos (see build.rs). Generated entries replace the
         // hand-written ones above for the vendored groups (core/apps/batch +
@@ -2576,7 +2640,7 @@ impl ProtoRegistry {
                 (29, ("runtimeClassName".into(), FieldType::String)),
                 (30, ("enableServiceLinks".into(), FieldType::Bool)),
                 (31, ("preemptionPolicy".into(), FieldType::String)),
-                (32, ("overhead".into(), FieldType::StringMap)),
+                (32, ("overhead".into(), FieldType::QuantityMap)),
                 (
                     33,
                     (
@@ -2791,8 +2855,9 @@ impl ProtoRegistry {
     fn resource_requirements_schema() -> MessageSchema {
         MessageSchema {
             fields: HashMap::from([
-                (1, ("limits".into(), FieldType::StringMap)),
-                (2, ("requests".into(), FieldType::StringMap)),
+                // ResourceList values are Quantity submessages, not raw strings.
+                (1, ("limits".into(), FieldType::QuantityMap)),
+                (2, ("requests".into(), FieldType::QuantityMap)),
                 (
                     3,
                     (
@@ -3155,6 +3220,18 @@ impl ProtoRegistry {
                                     m.insert(key, val);
                                 }
                             }
+                            FieldType::QuantityMap => {
+                                // map<string, Quantity> (ResourceList) — the value
+                                // is a Quantity submessage, so unwrap it rather than
+                                // reading its bytes as a raw string.
+                                let (key, val) = decode_quantity_map_entry(field_data);
+                                let map = obj
+                                    .entry(name.clone())
+                                    .or_insert_with(|| Value::Object(Map::new()));
+                                if let Value::Object(ref mut m) = map {
+                                    m.insert(key, Value::String(val));
+                                }
+                            }
                             FieldType::Inlined(ref msg_type) => {
                                 // Nested message whose decoded keys are merged
                                 // directly into THIS object (e.g. VolumeSource).
@@ -3167,7 +3244,24 @@ impl ProtoRegistry {
                                 }
                             }
                             _ => {
-                                obj.insert(name.clone(), json_val);
+                                // Match Go's `omitempty`: K8s gogo-protobuf marshals
+                                // optional scalar strings tagged (gogoproto.nullable)=false
+                                // by writing an EMPTY STRING onto the wire, whereas a JSON
+                                // client omits the field entirely. Emitting the key here
+                                // would yield `Some("")` in Rust structs that treat `None`
+                                // as "unset", the root cause of a whole class of decode bugs
+                                // (empty subPath/host/scheme/podManagementPolicy/phase/...).
+                                // Skipping the insert makes protobuf decode produce exactly
+                                // what JSON does. Scoped to scalar String/Quantity only:
+                                // map values (StringMap), repeated elements, and IntOrString
+                                // go through other branches and are untouched.
+                                let skip_empty = matches!(
+                                    field_type,
+                                    FieldType::String | FieldType::Quantity
+                                ) && json_val.as_str() == Some("");
+                                if !skip_empty {
+                                    obj.insert(name.clone(), json_val);
+                                }
                             }
                         }
                     }
@@ -3198,6 +3292,12 @@ impl ProtoRegistry {
     fn decode_field_value(&self, field_type: &FieldType, data: &[u8]) -> Value {
         match field_type {
             FieldType::String => Value::String(String::from_utf8_lossy(data).to_string()),
+            FieldType::Quantity => {
+                // K8s resource.Quantity is a submessage { string string = 1; }.
+                // Unwrap field 1 — reading the raw submessage bytes as a string
+                // yields corrupted values (e.g. `0a 01 35` -> "\n\u{1}5" not "5").
+                Value::String(decode_quantity_submessage(data))
+            }
             FieldType::Bytes => {
                 use base64::Engine;
                 Value::String(base64::engine::general_purpose::STANDARD.encode(data))
@@ -3205,7 +3305,15 @@ impl ProtoRegistry {
             FieldType::Message(msg_type) => {
                 if msg_type == "Time" {
                     // K8s Time is a Timestamp proto — decode to RFC3339 string
-                    return decode_timestamp(data);
+                    return decode_timestamp(data, false);
+                }
+                if msg_type == "MicroTime" {
+                    // K8s MicroTime has the same wire shape as Time (seconds #1,
+                    // nanos #2) but marshals to JSON with microsecond precision.
+                    // Without this, fields like Event.eventTime decode to a map
+                    // and fail deserialization ("invalid type: map, expected a
+                    // string").
+                    return decode_timestamp(data, true);
                 }
                 match self.decode_message(msg_type, data) {
                     Some(v) => v,
@@ -3241,6 +3349,10 @@ impl ProtoRegistry {
             }
             FieldType::MessageMap(_) => {
                 // Should be handled at the caller level as MessageMapEntry
+                Value::Object(Map::new())
+            }
+            FieldType::QuantityMap => {
+                // Should be handled at the caller level as a Quantity MapEntry
                 Value::Object(Map::new())
             }
             FieldType::IntOrString => {
@@ -3450,8 +3562,16 @@ impl ProtoRegistry {
             return Some(raw.to_vec());
         }
 
-        // Look up the schema for this kind
-        if let Some(json_obj) = self.decode_message(&kind, raw) {
+        // Look up the schema. Most kinds are unique, but "Event" exists in BOTH
+        // core/v1 and events.k8s.io/v1 with DIFFERENT wire field numbers, so
+        // dispatch by apiVersion — otherwise an events.k8s.io/v1 Event decoded
+        // with the core/v1 schema mis-maps every field.
+        let schema_key: &str = if kind == "Event" && api_version.starts_with("events.k8s.io/") {
+            "EventsV1Event"
+        } else {
+            kind.as_str()
+        };
+        if let Some(json_obj) = self.decode_message(schema_key, raw) {
             // Add apiVersion and kind to the JSON
             let result = match json_obj {
                 Value::Object(m) => {
@@ -3546,8 +3666,99 @@ fn decode_map_entry(data: &[u8]) -> (String, String) {
     (key, val)
 }
 
+/// Decode a K8s `resource.Quantity` submessage to its string value.
+///
+/// On the wire a Quantity is `message Quantity { optional string string = 1; }`,
+/// even though K8s JSON marshals it as a bare string. The bytes `0a 01 35` are
+/// `Quantity{ string: "5" }`, which must decode to `"5"` — reading them as a raw
+/// UTF-8 string would yield the corrupted `"\n\u{1}5"`.
+fn decode_quantity_submessage(data: &[u8]) -> String {
+    let mut pos = 0;
+    while pos < data.len() {
+        let (tag, new_pos) = match read_varint(data, pos) {
+            Some(v) => v,
+            None => break,
+        };
+        pos = new_pos;
+        let field_num = (tag >> 3) as u32;
+        let wire_type = (tag & 0x07) as u8;
+        match wire_type {
+            WIRE_LENGTH_DELIMITED => {
+                let (len, new_pos) = match read_varint(data, pos) {
+                    Some(v) => v,
+                    None => break,
+                };
+                pos = new_pos;
+                let len = len as usize;
+                if pos + len > data.len() {
+                    break;
+                }
+                if field_num == 1 {
+                    return String::from_utf8_lossy(&data[pos..pos + len]).to_string();
+                }
+                pos += len;
+            }
+            WIRE_VARINT => {
+                if let Some((_, new_pos)) = read_varint(data, pos) {
+                    pos = new_pos;
+                } else {
+                    break;
+                }
+            }
+            WIRE_64BIT => pos += 8,
+            WIRE_32BIT => pos += 4,
+            _ => break,
+        }
+    }
+    String::new()
+}
+
+/// Decode a map<string, Quantity> entry: field 1 = key (string),
+/// field 2 = value (Quantity submessage, unwrapped via `decode_quantity_submessage`).
+fn decode_quantity_map_entry(data: &[u8]) -> (String, String) {
+    let mut key = String::new();
+    let mut val = String::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let (tag, new_pos) = match read_varint(data, pos) {
+            Some(v) => v,
+            None => break,
+        };
+        pos = new_pos;
+        let field_num = (tag >> 3) as u32;
+        let wire_type = (tag & 0x07) as u8;
+        if wire_type == WIRE_LENGTH_DELIMITED {
+            let (len, new_pos) = match read_varint(data, pos) {
+                Some(v) => v,
+                None => break,
+            };
+            pos = new_pos;
+            let len = len as usize;
+            if pos + len > data.len() {
+                break;
+            }
+            let bytes = &data[pos..pos + len];
+            match field_num {
+                1 => key = String::from_utf8_lossy(bytes).to_string(),
+                2 => val = decode_quantity_submessage(bytes),
+                _ => {}
+            }
+            pos += len;
+        } else if wire_type == WIRE_VARINT {
+            if let Some((_, new_pos)) = read_varint(data, pos) {
+                pos = new_pos;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    (key, val)
+}
+
 /// Decode a K8s Timestamp protobuf to RFC3339 string
-fn decode_timestamp(data: &[u8]) -> Value {
+fn decode_timestamp(data: &[u8], micro: bool) -> Value {
     let mut seconds: i64 = 0;
     let mut nanos: i32 = 0;
     let mut pos = 0;
@@ -3577,9 +3788,12 @@ fn decode_timestamp(data: &[u8]) -> Value {
     if seconds == 0 && nanos == 0 {
         return Value::Null;
     }
-    // Convert to RFC3339
+    // Convert to RFC3339. K8s metav1.MicroTime marshals with microsecond
+    // precision (e.g. 2006-01-02T15:04:05.000000Z), whereas metav1.Time uses
+    // second precision (2006-01-02T15:04:05Z).
     let dt = chrono::DateTime::from_timestamp(seconds, nanos as u32);
     match dt {
+        Some(dt) if micro => Value::String(dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()),
         Some(dt) => Value::String(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
         None => Value::String(format!("{}s", seconds)),
     }
@@ -3907,7 +4121,8 @@ mod tests {
         spec.push(6);
         spec.extend_from_slice(b"Always");
 
-        // serviceAccountName = "" (explicitly set in proto3 optional)
+        // serviceAccountName = "" — gogo-proto writes this empty scalar onto the
+        // wire (nullable=false), but decode must OMIT it to match Go's JSON omitempty.
         spec.push(0x42); // field 8, wire 2
         spec.push(0); // empty string
 
@@ -3935,10 +4150,11 @@ mod tests {
             val.pointer("/metadata/namespace"),
             Some(&Value::String("pods-6553".into()))
         );
-        assert_eq!(
-            val.pointer("/spec/serviceAccountName"),
-            Some(&Value::String("".into())),
-            "serviceAccountName should be empty string"
+        // An empty serviceAccountName on the wire must decode as ABSENT (not
+        // Some("")), so downstream defaulting treats it as unset → "default".
+        assert!(
+            val.pointer("/spec/serviceAccountName").is_none(),
+            "empty serviceAccountName must be omitted, got {val:?}"
         );
         // nodeName should be absent (not set in protobuf)
         assert!(
@@ -3956,10 +4172,9 @@ mod tests {
             serde_json::from_value(val).expect("Pod should deserialize");
 
         let spec = pod_struct.spec.as_ref().expect("spec should exist");
-        assert_eq!(
-            spec.service_account_name.as_deref(),
-            Some(""),
-            "serviceAccountName should be Some(\"\")"
+        assert!(
+            spec.service_account_name.is_none(),
+            "empty serviceAccountName must decode to None, not Some(\"\")"
         );
         assert!(
             spec.node_name.is_none(),
@@ -3972,11 +4187,11 @@ mod tests {
 
         // The scheduler's filter: !has_node && (phase is None or Pending)
         let has_node = spec.node_name.as_deref().is_some_and(|n| !n.is_empty());
-        let phase = pod_struct
-            .status
-            .as_ref()
-            .and_then(|s| s.phase.as_ref());
-        let is_pending = matches!(phase, None | Some(rusternetes_common::types::Phase::Pending));
+        let phase = pod_struct.status.as_ref().and_then(|s| s.phase.as_ref());
+        let is_pending = matches!(
+            phase,
+            None | Some(rusternetes_common::types::Phase::Pending)
+        );
         assert!(!has_node, "pod should have no node assigned");
         assert!(is_pending, "pod should be pending");
 
@@ -4081,11 +4296,27 @@ mod tests {
         // of silently mis-decoding at runtime.
         let r = ProtoRegistry::new();
         for kind in [
-            "Pod", "PodSpec", "Container", "PodTemplate", "PodTemplateSpec",
-            "Deployment", "DeploymentSpec", "ReplicaSet", "StatefulSet",
-            "DaemonSet", "Job", "JobSpec", "CronJob", "CronJobSpec",
-            "JobTemplateSpec", "Service", "ServiceSpec", "ConfigMap", "Secret",
-            "ObjectMeta", "Namespace",
+            "Pod",
+            "PodSpec",
+            "Container",
+            "PodTemplate",
+            "PodTemplateSpec",
+            "Deployment",
+            "DeploymentSpec",
+            "ReplicaSet",
+            "StatefulSet",
+            "DaemonSet",
+            "Job",
+            "JobSpec",
+            "CronJob",
+            "CronJobSpec",
+            "JobTemplateSpec",
+            "Service",
+            "ServiceSpec",
+            "ConfigMap",
+            "Secret",
+            "ObjectMeta",
+            "Namespace",
         ] {
             assert!(
                 r.decode_message(kind, &[]).is_some(),
@@ -4174,6 +4405,400 @@ mod tests {
             val.pointer("/priority"),
             Some(&json!(0)),
             "field 25 must be priority integer 0 (not on priorityClassName), got {val:?}"
+        );
+    }
+
+    #[test]
+    fn test_decode_scale_subresource() {
+        // Regression: the /scale subresource (ReplicationController/ReplicaSet/
+        // Deployment/StatefulSet) serves autoscaling.v1.Scale, which had no
+        // protobuf schema until the autoscaling/v1 group was vendored. Verify a
+        // Scale{metadata, spec.replicas, status.replicas, status.selector}
+        // round-trips. Proto: Scale{metadata=1, spec=2, status=3},
+        // ScaleSpec{replicas=1}, ScaleStatus{replicas=1, selector=2}.
+        let registry = ProtoRegistry::new();
+
+        let metadata = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&[0x0a, 0x03]); // ObjectMeta.name (field 1), len 3
+            b.extend_from_slice(b"web");
+            b
+        };
+        let spec = vec![0x08, 0x03]; // ScaleSpec.replicas (field 1, varint) = 3
+        let status = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&[0x08, 0x05]); // ScaleStatus.replicas (field 1) = 5
+            b.extend_from_slice(&[0x12, 0x07]); // ScaleStatus.selector (field 2), len 7
+            b.extend_from_slice(b"app=web");
+            b
+        };
+        let scale = {
+            let mut b = Vec::new();
+            b.push(0x0a); // field 1 (metadata), wire 2
+            b.push(metadata.len() as u8);
+            b.extend_from_slice(&metadata);
+            b.push(0x12); // field 2 (spec), wire 2
+            b.push(spec.len() as u8);
+            b.extend_from_slice(&spec);
+            b.push(0x1a); // field 3 (status), wire 2
+            b.push(status.len() as u8);
+            b.extend_from_slice(&status);
+            b
+        };
+
+        let val = registry
+            .decode_message("Scale", &scale)
+            .expect("Scale should decode");
+        assert_eq!(
+            val.pointer("/metadata/name"),
+            Some(&Value::String("web".into()))
+        );
+        assert_eq!(val.pointer("/spec/replicas"), Some(&json!(3)));
+        assert_eq!(val.pointer("/status/replicas"), Some(&json!(5)));
+        assert_eq!(
+            val.pointer("/status/selector"),
+            Some(&Value::String("app=web".into())),
+            "expected Scale to decode fully, got {val:?}"
+        );
+    }
+
+    #[test]
+    fn test_decode_event_micro_time() {
+        // Regression: Event.eventTime is a metav1.MicroTime (field 10). MicroTime
+        // has the same wire shape as Time but was not special-cased in
+        // decode_field_value, so it decoded to a map and Event deserialization
+        // failed with "eventTime: invalid type: map, expected a string"
+        // ([sig-instrumentation] Events should delete a collection of events).
+        // Verify eventTime decodes to a microsecond-precision RFC3339 string.
+        let registry = ProtoRegistry::new();
+
+        // MicroTime{ seconds=1136214245 (2006-01-02T22:04:05Z), nanos=123456000 }
+        let micro_time = {
+            let mut b = Vec::new();
+            b.push(0x08); // field 1 (seconds), varint
+                          // 1136214245 as varint
+            let mut n = 1136214245u64;
+            loop {
+                let mut byte = (n & 0x7f) as u8;
+                n >>= 7;
+                if n != 0 {
+                    byte |= 0x80;
+                }
+                b.push(byte);
+                if n == 0 {
+                    break;
+                }
+            }
+            b.push(0x10); // field 2 (nanos), varint
+            let mut nanos = 123456000u64;
+            loop {
+                let mut byte = (nanos & 0x7f) as u8;
+                nanos >>= 7;
+                if nanos != 0 {
+                    byte |= 0x80;
+                }
+                b.push(byte);
+                if nanos == 0 {
+                    break;
+                }
+            }
+            b
+        };
+        let event = {
+            let mut b = Vec::new();
+            // field 10 (eventTime), wire 2: tag = 10<<3|2 = 82 → 0x52
+            b.push(0x52);
+            b.push(micro_time.len() as u8);
+            b.extend_from_slice(&micro_time);
+            b
+        };
+
+        let val = registry
+            .decode_message("Event", &event)
+            .expect("Event should decode");
+        let et = val
+            .pointer("/eventTime")
+            .expect("eventTime should be present");
+        let s = et.as_str().unwrap_or_else(|| {
+            panic!("eventTime must decode to a string, not {et:?}");
+        });
+        assert!(
+            s.ends_with('Z') && s.contains('T'),
+            "eventTime must be an RFC3339 string, got {s:?}"
+        );
+        assert!(
+            s.contains(".123456"),
+            "MicroTime must serialize with microsecond precision, got {s:?}"
+        );
+    }
+
+    #[test]
+    fn test_decode_lease_acquire_time_micro_time() {
+        // Regression: LeaseSpec.acquireTime/renewTime (fields 3/4) are MicroTime.
+        // Without the MicroTime special-case they decoded to a map and Lease
+        // deserialization failed with "spec.acquireTime: invalid type: map,
+        // expected a string" ([sig-node] Lease lease API should be available).
+        let registry = ProtoRegistry::new();
+        // MicroTime{ seconds=1136214245, nanos=0 }
+        let micro_time = {
+            let mut b = Vec::new();
+            b.push(0x08); // field 1 (seconds), varint
+            let mut n = 1136214245u64;
+            loop {
+                let mut byte = (n & 0x7f) as u8;
+                n >>= 7;
+                if n != 0 {
+                    byte |= 0x80;
+                }
+                b.push(byte);
+                if n == 0 {
+                    break;
+                }
+            }
+            b
+        };
+        let lease_spec = {
+            let mut b = Vec::new();
+            b.push(0x1a); // field 3 (acquireTime), wire 2
+            b.push(micro_time.len() as u8);
+            b.extend_from_slice(&micro_time);
+            b
+        };
+        let val = registry
+            .decode_message("LeaseSpec", &lease_spec)
+            .expect("LeaseSpec should decode");
+        assert!(
+            val.pointer("/acquireTime")
+                .and_then(|v| v.as_str())
+                .is_some(),
+            "acquireTime must decode to a string, got {val:?}"
+        );
+    }
+
+    #[test]
+    fn test_decode_volume_attributes_class() {
+        // Regression: VolumeAttributesClass (storage.k8s.io) had no protobuf
+        // schema at all, so protobuf creates/gets of the resource could not be
+        // decoded. Proto: VolumeAttributesClass{metadata=1, driverName=2,
+        // parameters=3 (map<string,string>)}.
+        let registry = ProtoRegistry::new();
+
+        let metadata = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&[0x0a, 0x04]); // ObjectMeta.name (field 1), len 4
+            b.extend_from_slice(b"fast");
+            b
+        };
+        let param_entry = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&[0x0a, 0x04]); // MapEntry.key (field 1), len 4
+            b.extend_from_slice(b"iops");
+            b.extend_from_slice(&[0x12, 0x04]); // MapEntry.value (field 2), len 4
+            b.extend_from_slice(b"1000");
+            b
+        };
+        let vac = {
+            let mut b = Vec::new();
+            b.push(0x0a); // field 1 (metadata), wire 2
+            b.push(metadata.len() as u8);
+            b.extend_from_slice(&metadata);
+            b.extend_from_slice(&[0x12, 0x0f]); // field 2 (driverName), wire 2, len 15
+            b.extend_from_slice(b"csi.example.com");
+            b.push(0x1a); // field 3 (parameters), wire 2
+            b.push(param_entry.len() as u8);
+            b.extend_from_slice(&param_entry);
+            b
+        };
+
+        let val = registry
+            .decode_message("VolumeAttributesClass", &vac)
+            .expect("VolumeAttributesClass should decode");
+        assert_eq!(
+            val.pointer("/metadata/name"),
+            Some(&Value::String("fast".into()))
+        );
+        assert_eq!(
+            val.pointer("/driverName"),
+            Some(&Value::String("csi.example.com".into()))
+        );
+        assert_eq!(
+            val.pointer("/parameters/iops"),
+            Some(&Value::String("1000".into())),
+            "expected parameters map to decode, got {val:?}"
+        );
+    }
+
+    #[test]
+    fn test_decode_quantity_submessage_unwraps_string() {
+        // Regression: a K8s resource.Quantity is `message Quantity { string = 1 }`
+        // on the wire, NOT a bare string. Bytes `0a 01 35` = Quantity{string:"5"}
+        // must decode to "5"; reading the submessage bytes as a raw UTF-8 string
+        // produced the corrupted "\n\u{1}5" that failed the client-side
+        // resource.ParseQuantity regex (ResourceQuota / Downward API specs).
+        assert_eq!(decode_quantity_submessage(&[0x0a, 0x01, 0x35]), "5");
+        // "500m"
+        assert_eq!(
+            decode_quantity_submessage(&[0x0a, 0x04, b'5', b'0', b'0', b'm']),
+            "500m"
+        );
+    }
+
+    #[test]
+    fn test_decode_scalar_quantity_field() {
+        // EmptyDirVolumeSource.sizeLimit (field 2) is a scalar Quantity.
+        let registry = ProtoRegistry::new();
+        // Quantity{ string: "1Gi" }
+        let quantity = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&[0x0a, 0x03]); // Quantity.string (field 1), len 3
+            b.extend_from_slice(b"1Gi");
+            b
+        };
+        let empty_dir = {
+            let mut b = Vec::new();
+            b.push(0x12); // field 2 (sizeLimit), wire 2
+            b.push(quantity.len() as u8);
+            b.extend_from_slice(&quantity);
+            b
+        };
+        let val = registry
+            .decode_message("EmptyDirVolumeSource", &empty_dir)
+            .expect("EmptyDirVolumeSource should decode");
+        assert_eq!(
+            val.pointer("/sizeLimit"),
+            Some(&Value::String("1Gi".into())),
+            "scalar Quantity must unwrap to a plain string, got {val:?}"
+        );
+    }
+
+    #[test]
+    fn test_decode_events_k8s_io_event_by_apiversion() {
+        // Regression: kind "Event" exists in BOTH core/v1 and events.k8s.io/v1
+        // with different wire field numbers. decode_k8s_resource must pick the
+        // events.k8s.io schema by apiVersion; otherwise the eventTime MicroTime
+        // (field 2) is decoded as core/v1 involvedObject and its inner varint
+        // lands in involvedObject.kind → "invalid type: integer".
+        fn ld(field: u32, bytes: &[u8]) -> Vec<u8> {
+            let mut v = vec![((field << 3) | 2) as u8, bytes.len() as u8];
+            v.extend_from_slice(bytes);
+            v
+        }
+        let registry = ProtoRegistry::new();
+        // MicroTime { seconds=1 (varint) } — field 1 varint tag 0x08
+        let micro = vec![0x08, 0x80, 0x80, 0x80, 0x80, 0x06]; // seconds ≈ 1.6e9
+        // ObjectReference { kind=1 "Pod", name=3 "mypod" }
+        let mut regarding = Vec::new();
+        regarding.extend(ld(1, b"Pod"));
+        regarding.extend(ld(3, b"mypod"));
+        // events.k8s.io/v1 Event { metadata=1, eventTime=2, regarding=8, note=10, type=11 }
+        let meta = ld(1, b"ev1"); // ObjectMeta { name=1 "ev1" }
+        let mut ev = Vec::new();
+        ev.extend(ld(1, &meta));
+        ev.extend(ld(2, &micro));
+        ev.extend(ld(8, &regarding));
+        ev.extend(ld(10, b"hello"));
+        ev.extend(ld(11, b"Normal"));
+        // Unknown envelope: typeMeta{apiVersion=1, kind=2}, raw=2
+        let mut tm = Vec::new();
+        tm.extend(ld(1, b"events.k8s.io/v1"));
+        tm.extend(ld(2, b"Event"));
+        let mut unknown = Vec::new();
+        unknown.extend(ld(1, &tm));
+        unknown.extend(ld(2, &ev));
+        let mut body = b"k8s\0".to_vec();
+        body.extend_from_slice(&unknown);
+
+        let json_bytes = registry
+            .decode_k8s_resource(&body)
+            .expect("events.k8s.io Event should decode");
+        let val: Value = serde_json::from_slice(&json_bytes).unwrap();
+        assert_eq!(val.pointer("/note"), Some(&Value::String("hello".into())));
+        assert_eq!(val.pointer("/type"), Some(&Value::String("Normal".into())));
+        assert_eq!(
+            val.pointer("/regarding/kind"),
+            Some(&Value::String("Pod".into())),
+            "regarding must map correctly, got {val}"
+        );
+        assert!(
+            val.pointer("/eventTime").is_some(),
+            "eventTime must be present, got {val}"
+        );
+        assert!(
+            val.pointer("/involvedObject").is_none(),
+            "must NOT mis-decode as core/v1 involvedObject, got {val}"
+        );
+        // And it must deserialize into the Rust Event struct.
+        let de: std::result::Result<rusternetes_common::resources::Event, _> =
+            serde_json::from_slice(&json_bytes);
+        assert!(de.is_ok(), "events.k8s.io Event must deserialize: {de:?}");
+    }
+
+    #[test]
+    fn test_empty_scalar_string_is_omitted_not_some_empty() {
+        // Root-cause regression: K8s gogo-protobuf writes optional scalar strings
+        // tagged (gogoproto.nullable)=false onto the wire even when empty. Decoding
+        // must OMIT them (like Go's JSON omitempty) rather than emit "", which would
+        // become Some("") in Rust and defeat every `Option::is_none()` "unset" check.
+        let registry = ProtoRegistry::new();
+        // VolumeMount{ name="data", mountPath="/data", subPath="" }
+        let vm = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&[0x0a, 0x04]); // field 1 (name), wire 2, len 4
+            b.extend_from_slice(b"data");
+            b.extend_from_slice(&[0x1a, 0x05]); // field 3 (mountPath), wire 2, len 5
+            b.extend_from_slice(b"/data");
+            b.extend_from_slice(&[0x22, 0x00]); // field 4 (subPath), wire 2, len 0 (empty)
+            b
+        };
+        let val = registry
+            .decode_message("VolumeMount", &vm)
+            .expect("VolumeMount should decode");
+        assert_eq!(
+            val.pointer("/name"),
+            Some(&Value::String("data".into())),
+            "non-empty scalar must be kept, got {val:?}"
+        );
+        assert_eq!(
+            val.pointer("/mountPath"),
+            Some(&Value::String("/data".into())),
+            "non-empty scalar must be kept, got {val:?}"
+        );
+        assert!(
+            val.pointer("/subPath").is_none(),
+            "empty scalar string must be OMITTED (absent), not Some(\"\"), got {val:?}"
+        );
+    }
+
+    #[test]
+    fn test_decode_resource_quota_spec_hard_quantity_map() {
+        // Regression: ResourceQuotaSpec.hard (field 1) is a map<string, Quantity>
+        // (ResourceList). Each value is a Quantity submessage — decoding it as a
+        // raw string corrupted every quota value ([sig-api-machinery]
+        // ResourceQuota status specs). Verify hard["cpu"] decodes to "5".
+        let registry = ProtoRegistry::new();
+        // MapEntry{ key="cpu", value=Quantity{string:"5"} }
+        let entry = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&[0x0a, 0x03]); // key (field 1), len 3
+            b.extend_from_slice(b"cpu");
+            b.extend_from_slice(&[0x12, 0x03]); // value (field 2, Quantity submessage), len 3
+            b.extend_from_slice(&[0x0a, 0x01, 0x35]); // Quantity{ string: "5" }
+            b
+        };
+        let spec = {
+            let mut b = Vec::new();
+            b.push(0x0a); // field 1 (hard), wire 2
+            b.push(entry.len() as u8);
+            b.extend_from_slice(&entry);
+            b
+        };
+        let val = registry
+            .decode_message("ResourceQuotaSpec", &spec)
+            .expect("ResourceQuotaSpec should decode");
+        assert_eq!(
+            val.pointer("/hard/cpu"),
+            Some(&Value::String("5".into())),
+            "map<string,Quantity> value must unwrap to \"5\", got {val:?}"
         );
     }
 }

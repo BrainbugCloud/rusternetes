@@ -3,6 +3,7 @@ use chrono::Utc;
 use rusternetes_common::resources::{
     ConfigMap, Container, ContainerState, ContainerStatus, ExecAction, GRPCAction, HTTPGetAction,
     LifecycleHandler, PersistentVolume, PersistentVolumeClaim, Pod, Probe, Secret, TCPSocketAction,
+    VolumeMount,
 };
 use rusternetes_storage::{build_key, Storage};
 use std::collections::HashMap;
@@ -162,21 +163,140 @@ fn needs_shell_quoting(s: &str) -> bool {
 /// that left stale state). This guarantees the host-side directory always exposes
 /// mode 0o777 to bind-mount consumers.
 ///
-/// On Linux — where Kubernetes conformance runs — bind mounts preserve these mode
-/// bits inside the container. On macOS dev VMs (Podman Machine / Docker Desktop
-/// virtiofs) the host mode bits are NOT propagated through the shared-filesystem
-/// layer; that is a known dev-env limitation and not a kubelet bug. The
-/// `[Conformance] EmptyDir.*(mode|0644|0666|0777)` tests are all `[LinuxOnly]`,
-/// so the chmod path here is the production code path.
-pub(crate) fn setup_emptydir_dir(path: &str) -> std::io::Result<()> {
+/// For `medium: Memory`, a real `tmpfs` is mounted at `path` so the container
+/// sees an in-memory filesystem (`statfs` magic `0x01021994`) rather than the
+/// backing directory's filesystem.
+///
+/// Mode-bit fidelity depends on the filesystem `volumes_base_path` lives on: an
+/// ext4/tmpfs-backed path honors the 0o777 chmod (and container-side chmod),
+/// whereas a virtiofs/reverse-sshfs share (used to mount a macOS host dir into a
+/// dev VM, and also the default Lima host mount) reports `FUSE` and silently
+/// drops mode bits. The `[LinuxOnly]` EmptyDir mode tests therefore require the
+/// backing path to be a VM-local real filesystem, not a shared FUSE mount.
+pub(crate) fn setup_emptydir_dir(
+    path: &str,
+    medium: Option<&str>,
+    size_limit: Option<&str>,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))?;
     }
+    if medium == Some("Memory") {
+        mount_emptydir_tmpfs(path, size_limit)?;
+    }
     Ok(())
 }
+
+/// Mount a `tmpfs` at `path` for a `medium: Memory` emptyDir (Linux only).
+/// Idempotent: a no-op if `path` is already a mountpoint (e.g. re-setup after a
+/// kubelet restart). Sizing follows the volume's `sizeLimit` when parseable,
+/// otherwise the kernel default (half of RAM), matching upstream kubelet.
+#[cfg(target_os = "linux")]
+fn mount_emptydir_tmpfs(path: &str, size_limit: Option<&str>) -> std::io::Result<()> {
+    use std::process::Command;
+    let already_mounted = Command::new("mountpoint")
+        .arg("-q")
+        .arg(path)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if already_mounted {
+        return Ok(());
+    }
+    let mut opts = String::from("mode=0777");
+    if let Some(bytes) = size_limit.and_then(parse_quantity_to_bytes) {
+        opts.push_str(&format!(",size={bytes}"));
+    }
+    let status = Command::new("mount")
+        .args(["-t", "tmpfs", "-o", &opts, "tmpfs", path])
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "failed to mount tmpfs at {path}"
+        )));
+    }
+    Ok(())
+}
+
+/// Non-Linux hosts have no usable `tmpfs` mount path here; the plain directory is
+/// used as-is (`medium: Memory` degrades to disk-backed, as it did before).
+#[cfg(not(target_os = "linux"))]
+fn mount_emptydir_tmpfs(_path: &str, _size_limit: Option<&str>) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Parse a Kubernetes resource quantity (the `sizeLimit` subset) into bytes.
+/// Handles binary suffixes (Ki/Mi/Gi/Ti/Pi/Ei) and decimal SI suffixes
+/// (k/M/G/T/P/E) plus a bare integer. Returns `None` on anything unrecognized
+/// so callers fall back to the kernel default rather than erroring.
+/// Linux-only: only the tmpfs mount path (also Linux-only) consumes it.
+#[cfg(target_os = "linux")]
+fn parse_quantity_to_bytes(q: &str) -> Option<u64> {
+    let q = q.trim();
+    if let Ok(n) = q.parse::<u64>() {
+        return Some(n);
+    }
+    let (num, mult) = if let Some(n) = q.strip_suffix("Ki") {
+        (n, 1u64 << 10)
+    } else if let Some(n) = q.strip_suffix("Mi") {
+        (n, 1u64 << 20)
+    } else if let Some(n) = q.strip_suffix("Gi") {
+        (n, 1u64 << 30)
+    } else if let Some(n) = q.strip_suffix("Ti") {
+        (n, 1u64 << 40)
+    } else if let Some(n) = q.strip_suffix("Pi") {
+        (n, 1u64 << 50)
+    } else if let Some(n) = q.strip_suffix("Ei") {
+        (n, 1u64 << 60)
+    } else if let Some(n) = q.strip_suffix('k') {
+        (n, 1_000)
+    } else if let Some(n) = q.strip_suffix('M') {
+        (n, 1_000_000)
+    } else if let Some(n) = q.strip_suffix('G') {
+        (n, 1_000_000_000)
+    } else if let Some(n) = q.strip_suffix('T') {
+        (n, 1_000_000_000_000)
+    } else if let Some(n) = q.strip_suffix('P') {
+        (n, 1_000_000_000_000_000)
+    } else if let Some(n) = q.strip_suffix('E') {
+        (n, 1_000_000_000_000_000_000)
+    } else {
+        return None;
+    };
+    num.trim().parse::<u64>().ok().map(|n| n * mult)
+}
+
+/// Unmount every mountpoint at or under `root` (Linux only), used before
+/// removing a pod's volume tree so a live `medium: Memory` tmpfs doesn't cause
+/// `remove_dir_all` to fail with EBUSY. Uses a lazy unmount (`umount -l`) so a
+/// still-referenced mount detaches once the last user goes away. Best-effort:
+/// failures are logged, not propagated.
+#[cfg(target_os = "linux")]
+fn unmount_tmpfs_under(root: &str) {
+    use std::process::Command;
+    let mountinfo = match std::fs::read_to_string("/proc/self/mountinfo") {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    // Deepest paths first so nested mounts unmount before their parents.
+    let mut targets: Vec<&str> = mountinfo
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(4)) // field 5 = mount point
+        .filter(|mp| *mp == root || mp.starts_with(&format!("{root}/")))
+        .collect();
+    targets.sort_by_key(|b| std::cmp::Reverse(b.len()));
+    for mp in targets {
+        if let Err(e) = Command::new("umount").arg("-l").arg(mp).status() {
+            warn!("Failed to unmount {}: {}", mp, e);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unmount_tmpfs_under(_root: &str) {}
 
 impl ContainerRuntime {
     pub async fn new(
@@ -2050,6 +2170,74 @@ impl ContainerRuntime {
         Ok(result)
     }
 
+    /// Resolve the effective subpath for a volume mount, mirroring upstream kubelet.
+    ///
+    /// Returns `Ok(Some(path))` when the mount specifies a usable subpath (either a
+    /// non-empty `subPathExpr` that expands successfully, or a non-empty `subPath`),
+    /// and `Ok(None)` when neither is meaningfully set.
+    ///
+    /// Both `subPathExpr` and `subPath` are treated as "not set" when they are empty
+    /// strings. This matters for protobuf-decoded pods: a `VolumeMount` that never set
+    /// `subPathExpr` still round-trips through the protobuf decoder as `Some("")` (a
+    /// zero-value string), unlike JSON where the field is simply omitted. Upstream
+    /// kubelet only acts on `subPathExpr` when `mount.SubPathExpr != ""`, so an empty
+    /// value must fall through to the `subPath` check (and then to no subpath), exactly
+    /// like an empty `subPath` does.
+    ///
+    /// A `subPathExpr` that is non-empty but expands to an empty string (e.g. all env
+    /// vars resolved away) is still a genuine user error and is rejected.
+    fn resolve_mount_sub_path(
+        mount: &VolumeMount,
+        container_name: &str,
+        resolved_env_pairs: &[(String, String)],
+    ) -> anyhow::Result<Option<String>> {
+        if let Some(expr) = mount.sub_path_expr.as_deref().filter(|e| !e.is_empty()) {
+            debug!(
+                "subPathExpr='{}' for container {} mount {}, env_pairs={:?}",
+                expr, container_name, mount.name, resolved_env_pairs
+            );
+            match Self::expand_subpath_expr(expr, resolved_env_pairs) {
+                Ok(expanded) => {
+                    if expanded.is_empty() {
+                        return Err(anyhow::anyhow!(
+                            "CreateContainerConfigError: subPathExpr '{}' expanded to empty string in container {}",
+                            expr, container_name
+                        ));
+                    }
+                    Ok(Some(expanded))
+                }
+                Err(e) => Err(anyhow::anyhow!(
+                    "CreateContainerConfigError: subPathExpr expansion failed for container {}: {}",
+                    container_name,
+                    e
+                )),
+            }
+        } else if let Some(sub_path) = mount.sub_path.as_deref().filter(|s| !s.is_empty()) {
+            // Validate plain subPath for path traversal / absolute path
+            if sub_path.starts_with('/') {
+                return Err(anyhow::anyhow!(
+                    "CreateContainerConfigError: subPath must not be an absolute path in container {}",
+                    container_name
+                ));
+            }
+            if sub_path.contains('`') {
+                return Err(anyhow::anyhow!(
+                    "CreateContainerConfigError: subPath must not contain backticks in container {}",
+                    container_name
+                ));
+            }
+            if sub_path.split('/').any(|c| c == "..") {
+                return Err(anyhow::anyhow!(
+                    "CreateContainerConfigError: subPath must not contain '..' in container {}",
+                    container_name
+                ));
+            }
+            Ok(Some(sub_path.to_string()))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Expand environment variables in a string (e.g., ${VAR_NAME} or $VAR_NAME)
     fn expand_env_vars(input: &str) -> String {
         let mut result = input.to_string();
@@ -2100,21 +2288,24 @@ impl ContainerRuntime {
         let pod_name = &pod.metadata.name;
         let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
 
-        // EmptyDir: create a directory on the shared volumes path.
-        // K8s ref: pkg/volume/emptydir/empty_dir.go — setupDir() sets mode 0777.
-        // Note: host bind mounts through virtiofs (Podman Machine / Docker Desktop)
-        // may not enforce chmod correctly. The emptyDir 0777/0666 permission tests
-        // are pre-existing failures on macOS VM-based runtimes. On Linux (where
-        // conformance actually runs), bind mounts preserve mode bits, so setup_emptydir_dir
-        // ensures the directory exists with mode 0o777 and idempotently re-chmods even
-        // when the directory pre-exists from a prior run.
-        if volume.empty_dir.is_some() {
+        // EmptyDir: create a directory under volumes_base_path (mode 0777, per
+        // pkg/volume/emptydir/empty_dir.go setupDir()). For `medium: Memory` a
+        // real tmpfs is mounted there. Mode-bit fidelity requires volumes_base_path
+        // to be on a VM-local real filesystem — a virtiofs/reverse-sshfs share
+        // (macOS host mount, or Lima's default host mount) reports FUSE and drops
+        // chmod; see setup_emptydir_dir.
+        if let Some(empty_dir) = &volume.empty_dir {
             let volume_dir = format!(
                 "{}/{}",
                 self.pod_volume_root(namespace, pod_name),
                 volume.name
             );
-            setup_emptydir_dir(&volume_dir).context("Failed to create emptyDir volume")?;
+            setup_emptydir_dir(
+                &volume_dir,
+                empty_dir.medium.as_deref(),
+                empty_dir.size_limit.as_deref(),
+            )
+            .context("Failed to create emptyDir volume")?;
             info!("Created emptyDir volume {} at {}", volume.name, volume_dir);
             return Ok(volume_dir);
         }
@@ -3601,9 +3792,17 @@ impl ContainerRuntime {
         // Add user-defined environment variables
         if let Some(env_vars) = &container.env {
             for env_var in env_vars {
-                // Direct value — expand $(VAR) references using previously set env vars
-                if let Some(value) = &env_var.value {
-                    let mut expanded = value.clone();
+                // Direct value — expand $(VAR) references using previously set env vars.
+                //
+                // `value` and `valueFrom` are mutually exclusive in the API, but the
+                // Kubernetes protobuf wire form marshals `value` as an empty string even
+                // when only `valueFrom` is set. Guarding on `Some(value)` alone would
+                // match that empty string and `continue` past the `valueFrom` resolution
+                // below, leaving every configMap/secret/fieldRef/resourceFieldRef env var
+                // as `NAME=` (empty). Only take the direct-value path when there is no
+                // `valueFrom` source; an env var with neither still yields `NAME=`.
+                if env_var.value_from.is_none() {
+                    let mut expanded = env_var.value.clone().unwrap_or_default();
                     while let Some(start) = expanded.find("$(") {
                         let end = match expanded[start..].find(')') {
                             Some(e) => start + e,
@@ -3749,57 +3948,8 @@ impl ContainerRuntime {
                 // Validate subPathExpr / subPath BEFORE looking up the volume.
                 // Kubernetes rejects containers whose expanded subpath contains
                 // ".." or is absolute, regardless of whether the volume exists.
-                let expanded_sub_path: Option<String> = if let Some(ref expr) = mount.sub_path_expr
-                {
-                    debug!(
-                        "subPathExpr='{}' for container {} mount {}, env_pairs={:?}",
-                        expr, container.name, mount.name, resolved_env_pairs
-                    );
-                    match Self::expand_subpath_expr(expr, &resolved_env_pairs) {
-                        Ok(expanded) => {
-                            if expanded.is_empty() {
-                                return Err(anyhow::anyhow!(
-                                        "CreateContainerConfigError: subPathExpr '{}' expanded to empty string in container {}",
-                                        expr, container.name
-                                    ));
-                            }
-                            Some(expanded)
-                        }
-                        Err(e) => {
-                            return Err(anyhow::anyhow!(
-                                    "CreateContainerConfigError: subPathExpr expansion failed for container {}: {}",
-                                    container.name, e
-                                ));
-                        }
-                    }
-                } else if let Some(ref sub_path) = mount.sub_path {
-                    if !sub_path.is_empty() {
-                        // Validate plain subPath for path traversal / absolute path
-                        if sub_path.starts_with('/') {
-                            return Err(anyhow::anyhow!(
-                                    "CreateContainerConfigError: subPath must not be an absolute path in container {}",
-                                    container.name
-                                ));
-                        }
-                        if sub_path.contains('`') {
-                            return Err(anyhow::anyhow!(
-                                    "CreateContainerConfigError: subPath must not contain backticks in container {}",
-                                    container.name
-                                ));
-                        }
-                        if sub_path.split('/').any(|c| c == "..") {
-                            return Err(anyhow::anyhow!(
-                                    "CreateContainerConfigError: subPath must not contain '..' in container {}",
-                                    container.name
-                                ));
-                        }
-                        Some(sub_path.clone())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                let expanded_sub_path: Option<String> =
+                    Self::resolve_mount_sub_path(mount, &container.name, &resolved_env_pairs)?;
 
                 if let Some(host_path) = volume_paths.get(&mount.name) {
                     let read_only = mount.read_only.unwrap_or(false);
@@ -4313,6 +4463,10 @@ impl ContainerRuntime {
         let volume_dir = self.pod_volume_root(namespace, pod_name);
 
         if std::path::Path::new(&volume_dir).exists() {
+            // Unmount any tmpfs (medium: Memory emptyDir) under this pod's volume
+            // tree first — remove_dir_all would hit EBUSY on a live mountpoint and
+            // leak both the mount and its RAM across pod churn.
+            unmount_tmpfs_under(&volume_dir);
             if let Err(e) = std::fs::remove_dir_all(&volume_dir) {
                 warn!("Failed to remove volume directory {}: {}", volume_dir, e);
             } else {
@@ -5169,7 +5323,10 @@ impl ContainerRuntime {
     ///
     /// Respects `failureThreshold` (default 3) and `successThreshold` (default 1)
     /// so that a single probe failure does not immediately trigger a restart.
-    pub async fn check_liveness(&self, pod: &Pod) -> Result<bool> {
+    /// Returns `Some(container_name)` for the first container whose liveness
+    /// probe has crossed its failure threshold (so the caller restarts just
+    /// that container), or `None` if all probes are healthy.
+    pub async fn check_liveness(&self, pod: &Pod) -> Result<Option<String>> {
         let pod_name = &pod.metadata.name;
         let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
 
@@ -5276,12 +5433,12 @@ impl ContainerRuntime {
                 };
 
                 if needs_restart {
-                    return Ok(true);
+                    return Ok(Some(container.name.clone()));
                 }
             }
         }
 
-        Ok(false) // All probes passed
+        Ok(None) // All probes passed
     }
 
     /// Execute a probe check
@@ -5448,6 +5605,12 @@ impl ContainerRuntime {
             output.push_str(&String::from_utf8_lossy(&line.message));
             output.push('\n');
         }
+        // Drop the trailing newline the line-join added above: this tail is used
+        // verbatim as the container's termination message (FallbackToLogsOnError),
+        // and upstream reports e.g. "DONE" — not "DONE\n".
+        while output.ends_with('\n') {
+            output.pop();
+        }
         if output.is_empty() {
             None
         } else {
@@ -5477,12 +5640,20 @@ impl ContainerRuntime {
         http_get: &HTTPGetAction,
         timeout: Duration,
     ) -> Result<bool> {
-        // Use host field if specified, otherwise resolve container IP
-        let ip = if let Some(ref host) = http_get.host {
-            host.clone()
-        } else {
-            self.get_effective_container_ip(namespace, container_name)
-                .await
+        // Use host field if specified, otherwise resolve the pod IP. Guard on
+        // *non-empty* rather than Some/None: pods created via the Kubernetes
+        // protobuf client (i.e. every e2e conformance pod) marshal an unset
+        // `host` as `Some("")`, and a bare `if let Some(host)` would use that
+        // empty string, producing a hostless probe URL (`http://:80/...`) that
+        // never connects — so the container is never marked ready. JSON-created
+        // pods send no field (`None`) and were unaffected, which is why this
+        // only bit protobuf traffic.
+        let ip = match http_get.host.as_deref().filter(|h| !h.is_empty()) {
+            Some(host) => host.to_string(),
+            None => {
+                self.get_effective_container_ip(namespace, container_name)
+                    .await
+            }
         };
 
         // Resolve named port via container.ports[].name lookup (K8s IntOrString).
@@ -5498,8 +5669,16 @@ impl ContainerRuntime {
                 }
             };
 
-        // Kubernetes sends scheme as uppercase ("HTTP", "HTTPS") — lowercase for URL
-        let scheme = http_get.scheme.as_deref().unwrap_or("HTTP").to_lowercase();
+        // Kubernetes sends scheme as uppercase ("HTTP", "HTTPS") — lowercase for URL.
+        // Same Some("") caveat as `host`: an unset scheme arrives as `Some("")` over
+        // protobuf, so filter empty before defaulting to HTTP (a bare `unwrap_or`
+        // would otherwise yield an empty scheme and a malformed `://host:port` URL).
+        let scheme = http_get
+            .scheme
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("HTTP")
+            .to_lowercase();
         let path = http_get.path.as_deref().unwrap_or("/");
         let url = format!("{}://{}:{}{}", scheme, ip, port, path);
 
@@ -6201,6 +6380,36 @@ impl ContainerRuntime {
                     container_name
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// Stop (honoring the grace period) and remove a single container by its
+    /// compound name (`"{pod}_{container}"`), whether or not it is running, so
+    /// it can be recreated in the SAME sandbox. Unlike
+    /// `remove_terminated_container` (which only removes already-exited
+    /// containers), this is used by the liveness-probe restart path, which must
+    /// kill a *running* container. It deliberately does NOT touch the pod
+    /// sandbox — recreating just the container keeps the pod `Running` and lets
+    /// restarts accumulate, instead of the full-pod teardown that wedged the
+    /// pod as `Failed` after one restart.
+    pub async fn stop_and_remove_container(
+        &self,
+        namespace: &str,
+        container_name: &str,
+        grace_period_seconds: i64,
+    ) -> Result<()> {
+        let (pod_name, name) = Self::split_compound_name(container_name);
+        if let Ok(Some(container)) = self.cri.find_container(namespace, pod_name, name).await {
+            let _ = self
+                .cri
+                .stop_container(&container.id, grace_period_seconds)
+                .await;
+            self.cri.remove_container(&container.id).await?;
+            debug!(
+                "Stopped + removed container {} for liveness restart",
+                container_name
+            );
         }
         Ok(())
     }
@@ -7306,12 +7515,27 @@ mod tests {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_parse_quantity_to_bytes() {
+        assert_eq!(super::parse_quantity_to_bytes("0"), Some(0));
+        assert_eq!(super::parse_quantity_to_bytes("1024"), Some(1024));
+        assert_eq!(super::parse_quantity_to_bytes("64Mi"), Some(64 * 1024 * 1024));
+        assert_eq!(super::parse_quantity_to_bytes("1Gi"), Some(1024 * 1024 * 1024));
+        assert_eq!(super::parse_quantity_to_bytes("1M"), Some(1_000_000));
+        assert_eq!(super::parse_quantity_to_bytes("500k"), Some(500_000));
+        // Unrecognized forms fall back to None (caller uses the kernel default).
+        assert_eq!(super::parse_quantity_to_bytes(""), None);
+        assert_eq!(super::parse_quantity_to_bytes("abc"), None);
+        assert_eq!(super::parse_quantity_to_bytes("12.5Gi"), None);
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_setup_emptydir_dir_sets_mode_0777_on_new_dir() {
         let tmp = unique_tmp_dir("new");
 
-        super::setup_emptydir_dir(tmp.to_str().unwrap()).expect("setup_emptydir_dir");
+        super::setup_emptydir_dir(tmp.to_str().unwrap(), None, None).expect("setup_emptydir_dir");
 
         let mode = mode_of(&tmp);
         assert_eq!(
@@ -7335,7 +7559,7 @@ mod tests {
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(mode_of(&tmp), 0o700, "pre-condition: mode 0o700");
 
-        super::setup_emptydir_dir(tmp.to_str().unwrap()).expect("setup_emptydir_dir");
+        super::setup_emptydir_dir(tmp.to_str().unwrap(), None, None).expect("setup_emptydir_dir");
 
         let after = mode_of(&tmp);
         assert_eq!(
@@ -7355,7 +7579,7 @@ mod tests {
         let root = unique_tmp_dir("nested");
         let target = root.join("pod-x").join("vol-y");
 
-        super::setup_emptydir_dir(target.to_str().unwrap()).expect("setup_emptydir_dir");
+        super::setup_emptydir_dir(target.to_str().unwrap(), None, None).expect("setup_emptydir_dir");
 
         assert!(target.exists(), "nested target dir must exist");
         let mode = mode_of(&target);
@@ -7376,7 +7600,7 @@ mod tests {
     fn test_setup_emptydir_dir_linux_full_bit_pattern() {
         let tmp = unique_tmp_dir("linux");
 
-        super::setup_emptydir_dir(tmp.to_str().unwrap()).expect("setup_emptydir_dir");
+        super::setup_emptydir_dir(tmp.to_str().unwrap(), None, None).expect("setup_emptydir_dir");
 
         let mode = mode_of(&tmp);
         // On Linux, chmod is honored by the kernel — verify every rwx triple.
@@ -8818,6 +9042,115 @@ mod tests {
         let result = ContainerRuntime::expand_subpath_expr("`$(POD_NAME)`", &env);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("backtick"));
+    }
+
+    /// Build a bare VolumeMount for subpath-resolution tests.
+    fn make_volume_mount(name: &str) -> rusternetes_common::resources::VolumeMount {
+        rusternetes_common::resources::VolumeMount {
+            name: name.to_string(),
+            mount_path: format!("/{name}"),
+            read_only: None,
+            sub_path: None,
+            sub_path_expr: None,
+            mount_propagation: None,
+            recursive_read_only: None,
+        }
+    }
+
+    #[test]
+    fn test_resolve_mount_sub_path_empty_subpathexpr_falls_through() {
+        use super::ContainerRuntime;
+        // Regression: protobuf decoding round-trips an unset subPathExpr as
+        // Some(""), which must be treated as "not set" (like real kubelet's
+        // `if mount.SubPathExpr != ""`). Previously this errored with
+        // "subPathExpr '' expanded to empty string", blocking pod startup.
+        let mut mount = make_volume_mount("tls-cert");
+        mount.sub_path_expr = Some(String::new());
+        let env = vec![("POD_NAME".to_string(), "web-0".to_string())];
+
+        let result = ContainerRuntime::resolve_mount_sub_path(&mount, "app", &env);
+        assert!(
+            result.is_ok(),
+            "empty subPathExpr must not error: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "empty subPathExpr should yield no subpath"
+        );
+    }
+
+    #[test]
+    fn test_resolve_mount_sub_path_empty_subpathexpr_falls_through_to_subpath() {
+        use super::ContainerRuntime;
+        // An empty subPathExpr must fall through to a non-empty subPath rather
+        // than short-circuiting on the empty expression.
+        let mut mount = make_volume_mount("data");
+        mount.sub_path_expr = Some(String::new());
+        mount.sub_path = Some("nested/dir".to_string());
+
+        let result = ContainerRuntime::resolve_mount_sub_path(&mount, "app", &[]);
+        assert_eq!(result.unwrap(), Some("nested/dir".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_mount_sub_path_no_subpath() {
+        use super::ContainerRuntime;
+        let mount = make_volume_mount("plain");
+        let result = ContainerRuntime::resolve_mount_sub_path(&mount, "app", &[]);
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn test_resolve_mount_sub_path_valid_subpathexpr_expands() {
+        use super::ContainerRuntime;
+        let mut mount = make_volume_mount("data");
+        mount.sub_path_expr = Some("$(POD_NAME)/logs".to_string());
+        let env = vec![("POD_NAME".to_string(), "web-0".to_string())];
+
+        let result = ContainerRuntime::resolve_mount_sub_path(&mount, "app", &env);
+        assert_eq!(result.unwrap(), Some("web-0/logs".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_mount_sub_path_nonempty_expr_expanding_to_empty_still_errors() {
+        use super::ContainerRuntime;
+        // A genuinely set subPathExpr that resolves to empty is still a real
+        // user error and must be rejected (behavior preserved by the fix).
+        let mut mount = make_volume_mount("data");
+        mount.sub_path_expr = Some("$(EMPTY)".to_string());
+        let env = vec![("EMPTY".to_string(), String::new())];
+
+        let result = ContainerRuntime::resolve_mount_sub_path(&mount, "app", &env);
+        assert!(
+            result.is_err(),
+            "non-empty expr expanding to empty must error"
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("expanded to empty string"));
+    }
+
+    #[test]
+    fn test_resolve_mount_sub_path_rejects_absolute_subpath() {
+        use super::ContainerRuntime;
+        let mut mount = make_volume_mount("data");
+        mount.sub_path = Some("/etc/passwd".to_string());
+        let result = ContainerRuntime::resolve_mount_sub_path(&mount, "app", &[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("absolute path"));
+    }
+
+    #[test]
+    fn test_resolve_mount_sub_path_empty_subpath_no_error() {
+        use super::ContainerRuntime;
+        // Empty subPath already behaved correctly (fall through to None); confirm.
+        let mut mount = make_volume_mount("data");
+        mount.sub_path = Some(String::new());
+        let result = ContainerRuntime::resolve_mount_sub_path(&mount, "app", &[]);
+        assert_eq!(result.unwrap(), None);
     }
 
     /// Test that ConfigMap volume with items only creates the specified files

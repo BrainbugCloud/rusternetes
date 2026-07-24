@@ -156,10 +156,16 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                         .as_ref()
                         .and_then(|s| s.node_name.as_deref())
                         .is_some_and(|n| !n.is_empty());
+                    // Defense-in-depth: also treat Some(Unknown) as
+                    // schedulable. The api-server defaults an empty/Unknown
+                    // phase to Pending on create, so this should be
+                    // unreachable in practice, but a pod stored with
+                    // phase=Unknown (e.g. from a client that sent phase:"")
+                    // must never be silently dropped from scheduling.
                     let needs_scheduling = !has_node
                         && matches!(
                             pod.status.as_ref().and_then(|s| s.phase.as_ref()),
-                            None | Some(Phase::Pending)
+                            None | Some(Phase::Pending) | Some(Phase::Unknown)
                         );
                     if needs_scheduling {
                         let ns = pod.metadata.namespace.as_deref().unwrap_or("");
@@ -198,10 +204,17 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         if has_node {
             return Ok(()); // already scheduled
         }
+        // Some(Unknown) is treated as schedulable too — see the note in
+        // enqueue_all(). The api-server normalizes an empty/Unknown phase to
+        // Pending on create, so this is defensive hardening only.
         let is_pending = pod
             .status
             .as_ref()
-            .map(|s| s.phase.is_none() || s.phase == Some(Phase::Pending))
+            .map(|s| {
+                s.phase.is_none()
+                    || s.phase == Some(Phase::Pending)
+                    || s.phase == Some(Phase::Unknown)
+            })
             .unwrap_or(true);
         if !is_pending {
             return Ok(()); // not pending
@@ -288,7 +301,11 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 let is_pending = !has_node
                     && p.status
                         .as_ref()
-                        .map(|s| s.phase.is_none() || s.phase == Some(Phase::Pending))
+                        .map(|s| {
+                            s.phase.is_none()
+                                || s.phase == Some(Phase::Pending)
+                                || s.phase == Some(Phase::Unknown)
+                        })
                         .unwrap_or(true);
 
                 if !is_pending {
@@ -1700,10 +1717,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            scheduled
-                .spec
-                .as_ref()
-                .and_then(|s| s.node_name.as_deref()),
+            scheduled.spec.as_ref().and_then(|s| s.node_name.as_deref()),
             Some("node-1"),
             "pod with empty schedulerName must be scheduled (empty == default-scheduler)"
         );

@@ -349,10 +349,14 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             namespace, name, desired_replicas, current_replicas
         );
 
+        // OrderedReady is the default; treat both absent and empty (the protobuf
+        // Some("") wire form) as the default so the controller doesn't fall back
+        // to Parallel scaling for a StatefulSet that never set the policy.
         let is_ordered_ready = statefulset
             .spec
             .pod_management_policy
-            .as_ref()
+            .as_deref()
+            .filter(|p| !p.is_empty())
             .map(|p| p == "OrderedReady")
             .unwrap_or(true);
 

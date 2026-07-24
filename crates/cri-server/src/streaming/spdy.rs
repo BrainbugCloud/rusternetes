@@ -148,9 +148,7 @@ fn u24(bytes: &[u8]) -> usize {
     ((bytes[0] as usize) << 16) | ((bytes[1] as usize) << 8) | bytes[2] as usize
 }
 
-pub async fn read_frame<R: AsyncRead + Unpin>(
-    read: &mut R,
-) -> std::io::Result<Option<Frame>> {
+pub async fn read_frame<R: AsyncRead + Unpin>(read: &mut R) -> std::io::Result<Option<Frame>> {
     let mut head = [0u8; 8];
     match read.read_exact(&mut head).await {
         Ok(_) => {}
@@ -297,12 +295,7 @@ impl<W: AsyncWrite + Unpin> SpdyWriter<W> {
         self.write_control(TYPE_SYN_STREAM, 0, &payload).await
     }
 
-    pub async fn data(
-        &mut self,
-        stream_id: u32,
-        fin: bool,
-        payload: &[u8],
-    ) -> std::io::Result<()> {
+    pub async fn data(&mut self, stream_id: u32, fin: bool, payload: &[u8]) -> std::io::Result<()> {
         let len = payload.len();
         let mut head = [0u8; 8];
         head[0..4].copy_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());

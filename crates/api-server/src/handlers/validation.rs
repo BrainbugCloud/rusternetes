@@ -328,15 +328,24 @@ pub fn find_duplicate_json_key_public(json_str: &str) -> Option<String> {
 }
 
 /// True for values a known optional field legitimately drops from the canonical
-/// (re-serialized) form via `skip_serializing_if`: JSON null (→ `None`), and
-/// empty string / array / object (→ empty containers). Such a field present in
-/// the request but absent from the canonical form is not an unknown field.
+/// (re-serialized) form via `skip_serializing_if`: JSON null (→ `None`), empty
+/// string / array / object (→ empty containers), and boolean `false`. Such a
+/// field present in the request but absent from the canonical form is not an
+/// unknown field.
+///
+/// `false` is included because several standard CRD `JSONSchemaProps` booleans
+/// (`exclusiveMaximum`, `exclusiveMinimum`, `uniqueItems`, `nullable`) serialize
+/// with `skip_false_or_none`, which drops `Some(false)` — matching upstream
+/// omitempty. Without this, a client sending `exclusiveMaximum: false` (as the
+/// conformance CRD fixtures do) would have it spuriously flagged as an unknown
+/// field and the CRD rejected with a strict-decoding error.
 fn is_droppable_empty(v: &serde_json::Value) -> bool {
     match v {
         serde_json::Value::Null => true,
         serde_json::Value::String(s) => s.is_empty(),
         serde_json::Value::Array(a) => a.is_empty(),
         serde_json::Value::Object(o) => o.is_empty(),
+        serde_json::Value::Bool(b) => !b,
         _ => false,
     }
 }

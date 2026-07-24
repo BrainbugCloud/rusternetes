@@ -623,3 +623,222 @@ Notes for the manual harness:
   `--volume-dir /opt/rusternetes/data/volumes`) or container start fails with
   `failed to fulfil mount request: open .../data/volumes/...: no such file`.
 
+## Results (2026-07-23) — full `certified-conformance` run via `scripts/lima-conformance.sh`
+
+Run started ~08:24 UTC on lima `default`, binary built from HEAD `8ebe7cca` (post
+k8s-proto schema-registry refactor). Pod `sonobuoy-e2e-job-faa5c97693ad4588` in ns
+`sonobuoy`, 441 specs selected (`Will run 441 of 7348 specs`).
+
+**Throughput is pathological:** only 34 of 441 specs concluded in the first ~10h
+(26 failed, ~8 passed) — this rate projects multi-day completion for a full run.
+Two StatefulSet specs alone burned ~610s each hitting real wait-timeouts before
+failing; several `sig-api-machinery` webhook/aggregator specs also ran to their
+full ~2min timeout. The slow throughput is very likely *explained by* the failure
+clusters below (real bugs causing tests to wait out their timeouts) rather than
+being an independent infra problem — worth re-measuring once those are fixed.
+
+**Failure clusters found in the first 26 failures**, in decreasing confidence:
+
+1. **Protobuf schema gaps — ROOT-CAUSED AND FIXED (2026-07-23, uncommitted).**
+   `cargo build --workspace` succeeds, `cargo test -p k8s-proto` (17 tests, 7
+   new) and `cargo test -p rusternetes-api-server` pass, `cargo clippy -p
+   k8s-proto --all-targets --all-features -- -D warnings` clean. Vendored
+   `crates/k8s-proto/proto/k8s.io/api/autoscaling/v1/generated.proto` (for
+   `Scale`) and `.../storage/v1beta1/generated.proto` (for
+   `VolumeAttributesClass` — it lives in v1beta1 at this proto pin, not v1)
+   verbatim from upstream `kubernetes/api` v0.32.0; added `FieldType::Quantity`/
+   `QuantityMap` + `decode_quantity_submessage`/`decode_quantity_map_entry` in
+   `crates/k8s-proto/src/lib.rs`, wired systematically through `build.rs` so
+   every vendored `resource.Quantity`/`map<string,Quantity>` field across all
+   groups gets it (20 QuantityMap fields: ResourceQuota hard/used, pod
+   resources.limits/requests, node capacity/allocatable, PVC capacity,
+   Overhead, etc.) — this is fix #4 below, folded in here since it landed in
+   the same agent/commit-to-be. Added a `msg_type == "MicroTime"` decode case
+   (mirroring `"Time"`, with microsecond-precision formatting) covering both
+   `Event.eventTime` and `LeaseSpec.acquireTime`/`renewTime` (fixes cluster 5's
+   Lease failure too, via the same central path). No protobuf *encode* path
+   exists in this crate (decode-only), so there was no Time/MicroTime
+   asymmetry to fix on that side. Original analysis, `crates/k8s-proto/src/lib.rs`:
+   - No `Scale`/`autoscaling` proto group vendored at all → `PUT .../scale`
+     (`crates/api-server/src/handlers/scale.rs`) fails for any protobuf client.
+     Broke: `[sig-apps] ReplicationController should get and update a
+     ReplicationController scale`.
+   - `decode_field_value` (~line 3206) special-cases `msg_type == "Time"` to
+     produce an RFC3339 string via `decode_timestamp`, but has no equivalent
+     case for `"MicroTime"` (used by `Event.eventTime`), so it falls through to
+     generic `decode_message` and produces a `{seconds,nanos}` map instead of a
+     string, which `crates/common/src/resources/event.rs`'s string-typed field
+     rejects. Broke: `[sig-instrumentation] Events should delete a collection
+     of events`.
+   - `VolumeAttributesClass` has **no protobuf `MessageSchema` at all** (only
+     field *references* to `volumeAttributesClassName` inside PVC/PV specs),
+     despite full REST handlers existing
+     (`crates/api-server/src/handlers/volumeattributesclass.rs`). Broke:
+     `[sig-storage] VolumeAttributesClass should run through the lifecycle of a
+     VolumeAttributesClass`.
+
+2. **Webhook/aggregator/StatefulSet pods stuck at 0/1 Ready — ROOT-CAUSED AND
+   FIXED (2026-07-23, uncommitted).** `crates/kubelet/src/runtime.rs`: extracted
+   the inline subpath-resolution block into a new `resolve_mount_sub_path`
+   helper with the guard fixed to
+   `mount.sub_path_expr.as_deref().filter(|e| !e.is_empty())` (mirrors
+   upstream `if mount.SubPathExpr != ""`); added 7 unit tests. All 183
+   kubelet lib tests pass; clippy clean (7 pre-existing warnings unrelated to
+   this change, confirmed via `git stash` diff); nothing committed, lima VM
+   untouched. Original analysis:
+   Kubelet rejects an empty `subPathExpr` instead of treating it as absent.
+   `crates/kubelet/src/runtime.rs` (~line 3752): the `subPathExpr` branch of
+   volume-mount construction is missing the empty-string guard that the
+   sibling `subPath` branch has, so a protobuf-serialized `VolumeMount` with
+   `subPathExpr: Some("")` (which the e2e Go typed/protobuf client sends for
+   its TLS-cert secret mount, even though it never sets the field) makes every
+   container-create attempt fail with `CreateContainerConfigError: subPathExpr
+   '' expanded to empty string`. VM log
+   (`/tmp/lima/rk-run/rusternetes.log`) showed 40k+ repeats per pod for
+   `sample-webhook`, `sample-crd-conversion-webhook`, `sample-apiserver`, and
+   the StatefulSet pods — same bug behind all of #2's failures. Regular pods
+   are unaffected because their only mount (the projected SA token) is
+   injected server-side as JSON and never carries `subPathExpr` at all. Fix:
+   gate the branch on non-empty, e.g.
+   `if let Some(expr) = mount.sub_path_expr.as_deref().filter(|e| !e.is_empty())`,
+   mirroring the existing `if !sub_path.is_empty()` guard on `subPath`.
+
+3. **ResourceQuota — ROOT-CAUSED AND FIXED** (same agent/fix as cluster 1's
+   Quantity work above — `FieldType::QuantityMap` now covers
+   `ResourceQuotaSpec.hard`/`ResourceQuotaStatus.hard`/`.used`). Both specs
+   fail synchronously at the `Create`
+   call itself (~12ms after POST) with a client-side `resource.ParseQuantity`
+   error (`quantities must match the regular expression ...`) — the
+   quota-reconciliation timing hypothesis was a red herring; the controller
+   (`crates/controller-manager/src/controllers/resource_quota.rs`) does watch
+   ReplicaSets (`needs_replicasets`) and does reconcile promptly on quota
+   CREATE. The real bug: `crates/k8s-proto/build.rs` maps a `map<string,
+   Quantity>` field (e.g. `ResourceQuotaSpec.hard`) to `FieldType::StringMap`,
+   and a scalar `Quantity` field to `FieldType::String` — but a `Quantity` is a
+   protobuf **submessage** (`{string field 1}`), not a bare string on the wire.
+   `decode_map_entry`/`decode_field_value` (`crates/k8s-proto/src/lib.rs`
+   ~3506/~3200) read the submessage's raw bytes as UTF-8 instead of unwrapping
+   field 1, so e.g. wire bytes `0a 01 35` (Quantity{string:"5"}) decode to
+   `"\n\u{1}5"` instead of `"5"`. This corrupts every quantity sent over
+   protobuf; it rarely bites elsewhere (pod resource requests/limits, PVC
+   storage) because most e2e pods are best-effort, but ResourceQuota always
+   carries hard quantities so it fails every time. Fix: add
+   `FieldType::Quantity`/`FieldType::QuantityMap` variants that decode the
+   inner submessage and extract field 1, replacing `String`/`StringMap` for
+   Quantity-typed fields in `build.rs`.
+
+4. **Storage/volume failures — ROOT-CAUSED, and NOT a volume-mounting bug at
+   all.** Splits into three causes:
+   - **Group 1 (dominant, highest impact — likely the main driver of the
+     overall pathological throughput too): the scheduler stalls for hours.**
+     VM log shows "Successfully bound" counts of **0/hr from 14:00–16:00**,
+     recovering to only 7-15/hr by 17:00-18:00, with the last pre-stall bind at
+     13:55:03. Pods created during the stall get `Pod created successfully`
+     from the api-server but no scheduler bind and no kubelet `Starting pod`
+     line — ever — so they sit at `phase: Unknown` until their test's 300s
+     wait expires. This explains: Secrets multiple-volumes, ConfigMap
+     consumable, Projected secret ×2, Subpath downward-pod, Variable
+     Expansion backticks — and very likely a large share of the overall
+     34/441-in-10h throughput problem.
+     **Reframed by cluster 5's cross-check below: this is a deterministic
+     phase-filter bug (a pod stored `Some(Phase::Unknown)` is permanently
+     invisible to the scheduler, not delayed), not a hang/deadlock/watch
+     issue** — see cluster 5. Caveat: the specific 14:00-16:00 timing window
+     may also partly be an artifact of the Mac host sleeping (pausing the
+     lima VM's clock); don't over-weight the exact hourly bucketing as a
+     separate mystery — the filter bug itself is confirmed independently via
+     a directly reproduced, currently-stuck pod, unrelated to timing.
+   - **Group 2: the `Quantity` protobuf bug (same class as the ResourceQuota
+     bug above) also corrupts pod `resources.requests`/`.limits`.**
+     `crates/k8s-proto/src/lib.rs` types `limits`/`requests` as
+     `FieldType::StringMap` (~lines 1695-1696; also `VolumeResourceRequirements`
+     ~2794-2795, `Overhead` ~2579) instead of a Quantity-aware map, so e.g.
+     `250m` decodes with its protobuf framing intact (`"\n\x04250m"`), and the
+     Go client rejects the echoed-back pod with `quantities must match the
+     regular expression ...`. Explains: Downward API volume *cpu request* +
+     *update annotations on modification*. Same fix as the ResourceQuota bug,
+     just needs to cover these additional fields too.
+   - **Group 3 — the actual root fix, FIXED (2026-07-23, uncommitted).** Empty
+     `status.phase` was defaulting to `Unknown` instead of `Pending`.
+     `Phase::Unknown` carries `#[serde(alias = "")]`
+     (`crates/common/src/types.rs:199-213`), so a client-sent `status.phase: ""`
+     deserialized to `Some(Unknown)`, skipping the create-time Pending default
+     guard. Fix: `crates/api-server/src/handlers/pod.rs` — extracted
+     `default_pod_phase_to_pending(&mut Pod)`, which now treats both `None`
+     and `Some(Phase::Unknown)` as unset and forces `Pending`; 5 regression
+     tests added. `crates/scheduler/src/scheduler.rs` — added
+     `Some(Phase::Unknown)` to the schedulable-phase filter at all three call
+     sites (`enqueue_all`, `try_schedule_pod`, `schedule_pending_pods`) as
+     defense-in-depth. 286 api-server tests + 19 scheduler tests pass; changed
+     lines clippy-clean (pre-existing unrelated clippy errors exist in
+     `controller-manager` and `scheduler.rs:1189` — `rand::gen`/`gen_range`
+     deprecations, a redundant closure, a collapsible else-if — flagged as a
+     separate follow-up, not touched here). Confirmed via live VM log: zero
+     panics in the 1.2M-line log, and other controllers (endpointslice,
+     kube-proxy) log continuously through the "stall" windows while only the
+     scheduler produces nothing — fully consistent with the deterministic
+     filter bug, not a hang. Explains: Variable Expansion "failing subpath ...
+     lifecycle" (asserted `Pending`, got `Unknown` at t=0.001s).
+   - Cross-validates the kubelet `subPathExpr` empty-string bug from cluster 2
+     above (seen independently on `sample-apiserver`'s mount).
+
+5. **Misc scattered failures — ROOT-CAUSED, and three of five turned out to be
+   the SAME empty-phase→scheduler-skip bug as Group 1 above, seen from a
+   different angle:**
+   - **Liveness-probe false-restart, Service ClusterIP→ExternalName, and
+     SchedulerPredicates NodeSelector** are all the empty-phase bug, not probe
+     logic / ExternalName handling / NodeSelector predicate logic
+     respectively. In each case a directly-created verification/setup pod gets
+     stuck at `phase: Unknown` and never scheduled, so the test times out
+     before its actual assertion is ever exercised. **This cross-investigation
+     confirms the exact mechanism**: the scheduler's own pod-selection filter
+     (`crates/scheduler/src/scheduler.rs:161` and `:204`) only enqueues pods
+     whose phase is `None | Some(Pending)` — a pod stored as `Some(Unknown)`
+     is *permanently* invisible to the scheduler, not just delayed. This
+     explains the "0 binds/hour" windows from Group 1 as a **deterministic**
+     bug (whichever test's pods are created via a raw/protobuf client sending
+     `phase:""` during that window never get scheduled) rather than a
+     scheduler hang/deadlock — the fix is the same one already identified in
+     Group 1/cluster-2 (default phase to `Pending` at create time regardless
+     of whether the client sent `None` or `Some(Unknown)`,
+     `crates/api-server/src/handlers/pod.rs:567`).
+   - **Lease API** (`spec.acquireTime: invalid type: map, expected a string`)
+     is the same `MicroTime` decode gap as the Events fix above — no separate
+     work needed, covered by the same `crates/k8s-proto/src/lib.rs` fix.
+   - **Pod InPlace Resize** (lower confidence) — client-side quantity-format
+     rejection at pod create, likely a non-canonical/empty quantity
+     round-tripping through `crates/common/src/types.rs:305`
+     (`n.to_string()` stringification). In-place resize itself also looks
+     effectively unimplemented in the kubelet (`crates/kubelet/src/runtime.rs`
+     has no resize-actuation logic; api-server only sets
+     `status.resize="Proposed"` without acting on it). Treated as a known gap,
+     not fixed in this pass — it's a feature gap (K8s 1.33+ in-place resize),
+     not a quick bug fix.
+
+6. **Not a bug:** `[sig-architecture] Conformance Tests should have at least
+   two untainted nodes` fails only because this is a single-node lima test
+   cluster; a real 2+-node cluster would pass this trivially.
+
+Full findings + how to re-check the live run: memory
+`lima-conformance-2026-07-23-findings.md`.
+
+## Re-run (2026-07-23 night) with all three fixes applied
+
+`bash scripts/lima-conformance.sh` rebuilt from the fixed tree and relaunched
+`certified-conformance`. Along the way, found and fixed a **pre-existing bug
+in the script itself**: `RK` defaulted to a deferred `\$HOME/rk` string meant
+to be resolved inside the VM, but step 5 execs the binary from inside `sudo
+bash -c '...'`, and `sudo` resets `$HOME` to `/root`'s home there — so the
+deferred `$HOME` silently resolved to the wrong path
+(`/root/rk/target/release/rusternetes`, doesn't exist) even though every
+other use of `$RK` (outside the nested sudo) worked fine. Fixed by resolving
+`$RK` to a real absolute path up front via `limactl shell "$VM" -- printenv
+HOME`, instead of deferring the expansion.
+
+After the fix, the relaunch came up clean: CoreDNS, sonobuoy, e2e job, and
+systemd-logs daemonset all reached `Running` within ~30s (previously this
+took much longer / never happened for directly-created pods) — an early
+positive signal that the empty-phase→unschedulable fix is working. Full
+pass/fail comparison pending the new run's completion (441 specs, same as
+before).
+

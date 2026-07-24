@@ -2381,6 +2381,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "k8s-proto"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "prost 0.13.5",
+ "prost-types 0.13.5",
+ "rusternetes-common",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3813,6 +3827,7 @@ dependencies = [
  "hyper 1.9.0",
  "hyper-util",
  "indexmap 2.14.0",
+ "k8s-proto",
  "openapiv3",
  "prometheus-http-query",
  "prost 0.13.5",

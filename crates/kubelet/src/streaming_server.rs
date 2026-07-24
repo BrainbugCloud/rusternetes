@@ -111,7 +111,11 @@ async fn handle_connection(
 
     // 2. Find the container via CRI labels.
     let container = cri
-        .find_container(&client_req.namespace, &client_req.pod, &client_req.container)
+        .find_container(
+            &client_req.namespace,
+            &client_req.pod,
+            &client_req.container,
+        )
         .await?
         .with_context(|| {
             format!(
@@ -160,9 +164,7 @@ async fn handle_connection(
     // 4. Connect to the CRI streaming server and do the SPDY handshake.
     let url = url::Url::parse(&streaming_url)
         .with_context(|| format!("invalid streaming URL: {streaming_url}"))?;
-    let host = url
-        .host_str()
-        .context("streaming URL has no host")?;
+    let host = url.host_str().context("streaming URL has no host")?;
     let port = url.port().unwrap_or(80);
     let addr = format!("{host}:{port}");
 
@@ -278,7 +280,9 @@ fn parse_client_request(head: Vec<u8>) -> Result<ClientRequest> {
     // Path: /{method}/{namespace}/{pod}/{container}
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
     if segments.len() < 4 {
-        anyhow::bail!("malformed streaming path (expected /<method>/<ns>/<pod>/<container>): {path}");
+        anyhow::bail!(
+            "malformed streaming path (expected /<method>/<ns>/<pod>/<container>): {path}"
+        );
     }
 
     let method = match segments[0] {
@@ -322,9 +326,7 @@ fn build_backend_request(client_head: &[u8], backend_url: &url::Url) -> Vec<u8> 
 
     let mut out = Vec::with_capacity(2048);
     // Build new request line with the CRI streaming token path
-    out.extend_from_slice(
-        format!("{method} {backend_path} HTTP/1.1\r\n").as_bytes(),
-    );
+    out.extend_from_slice(format!("{method} {backend_path} HTTP/1.1\r\n").as_bytes());
     // New Host header
     out.extend_from_slice(format!("Host: {backend_host}:{backend_port}\r\n").as_bytes());
 

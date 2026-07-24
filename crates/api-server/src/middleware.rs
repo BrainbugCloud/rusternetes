@@ -541,17 +541,15 @@ fn extract_json_from_k8s_protobuf(data: &[u8]) -> Option<Vec<u8>> {
         }
     }
 
-    // Fallback: scan for the first valid JSON object in the data
-    for i in 0..data.len() {
-        if data[i] == b'{' {
-            if let Some(candidate) = scan_balanced_braces(&data[i..]) {
-                // Only return if this is actually valid JSON, not binary garbage
-                if serde_json::from_slice::<serde_json::Value>(&candidate).is_ok() {
-                    return Some(candidate);
-                }
-            }
-        }
-    }
+    // No JSON in the `raw` field: this is a NATIVE protobuf resource. Return
+    // None so the caller runs the structured decoders in order (schema registry,
+    // then the CRD-specific decoder). Do NOT scan the whole body for embedded
+    // JSON here: a native-protobuf CustomResourceDefinition embeds JSON in its
+    // `openAPIV3Schema` fields, and returning that inner fragment as "the
+    // resource" short-circuited the real decoder and made CRD creates fail with
+    // `missing field \`plural\`` (aggregated_discovery conformance tests). A
+    // validated brace-scan still runs downstream (try_brace_scan_or_type_meta)
+    // as a genuine last resort AFTER the structured decoders.
     None
 }
 

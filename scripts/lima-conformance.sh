@@ -40,12 +40,21 @@ VM="${LIMA_INSTANCE:-default}"
 MODE="${1:-certified-conformance}"
 K8S_VER="${K8S_VER:-v1.35.0}"
 HOST_REPO="${HOST_REPO:-/Users/e28b0/git/rusternetes}"
-RK="${RK:-\$HOME/rk}"                       # writable build dir inside the VM
-RUN_DIR="${RUN_DIR:-/tmp/lima/rk-run}"      # data-dir/volume-dir/logs
+RUN_DIR="${RUN_DIR:-/tmp/lima/rk-run}"      # data-dir/logs (may live on the FUSE host mount)
+# Volumes MUST live on a VM-local real filesystem (ext4), not the FUSE/virtiofs
+# host mount under /tmp/lima: virtiofs reports FUSE to statfs and silently drops
+# file mode bits, which fails the [LinuxOnly] EmptyDir 0644/0666/0777 mode tests.
+VOL_DIR="${VOL_DIR:-/var/lib/rusternetes/volumes}"
 PKI=/etc/kubernetes/pki
 SAN="localhost,127.0.0.1,192.168.5.15,node-1,10.96.0.1,kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster.local"
 
 lsh() { limactl shell "$VM" -- bash -c "$1"; }
+
+# Resolve to a real absolute path up front (not a deferred '$HOME/rk' string):
+# step 5 execs the binary from inside `sudo bash -c '...'`, and sudo resets
+# $HOME to /root's home, so a deferred $HOME reference silently resolves to
+# the wrong (root) path there even though it works fine everywhere else.
+RK="${RK:-$(limactl shell "$VM" -- printenv HOME)/rk}"
 
 echo "==> 1/7 sync repo into the VM (preserve target/ for incremental builds)"
 lsh "git config --global --add safe.directory $HOST_REPO 2>/dev/null || true
@@ -97,8 +106,12 @@ EOF
 echo "==> 4/7 stop any old server, clean sandboxes, wipe the (bloat-prone) DB"
 lsh "sudo pkill -x rusternetes 2>/dev/null || true; sleep 2
      sudo crictl rmp -fa 2>/dev/null || true
-     sudo rm -f $RUN_DIR/rusternetes.db*
-     sudo rm -rf $RUN_DIR/volumes; sudo mkdir -p $RUN_DIR/volumes"
+     sudo rm -f $RUN_DIR/rusternetes.db*"
+# Detach any medium:Memory tmpfs a prior run left mounted under the volume dir,
+# else the rm -rf below hits EBUSY on the mountpoint. Deepest paths first.
+lsh "findmnt -rno TARGET 2>/dev/null | grep -E '^$VOL_DIR(/|\$)' | sort -r \
+     | xargs -r -I{} sudo umount -l {} 2>/dev/null || true
+     sudo rm -rf $VOL_DIR; sudo mkdir -p $VOL_DIR"
 
 echo "==> 5/7 start rusternetes with the persistent cert"
 lsh "sudo bash -c 'setsid env \
@@ -106,7 +119,7 @@ lsh "sudo bash -c 'setsid env \
        IMAGE_SERVICE_ENDPOINT=unix:///run/containerd/containerd.sock \
        $RK/target/release/rusternetes \
        --storage-backend sqlite --data-dir $RUN_DIR/rusternetes.db \
-       --volume-dir $RUN_DIR/volumes --bind-address 0.0.0.0:6443 --node-name node-1 \
+       --volume-dir $VOL_DIR --bind-address 0.0.0.0:6443 --node-name node-1 \
        --tls --tls-cert-file $PKI/apiserver.crt --tls-key-file $PKI/apiserver.key \
        --tls-san $SAN --kubernetes-service-host 10.96.0.1 --log-level info \
        > $RUN_DIR/rusternetes.log 2>&1 < /dev/null &'

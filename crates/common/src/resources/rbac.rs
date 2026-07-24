@@ -264,8 +264,12 @@ impl Subject {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RoleRef {
-    /// APIGroup is the group for the resource being referenced
-    #[serde(alias = "apiGroup")]
+    /// APIGroup is the group for the resource being referenced.
+    /// `#[serde(default)]`: K8s clients may send an empty apiGroup on the
+    /// protobuf wire (gogo marshals the empty scalar); our decoder omits empty
+    /// scalars to match JSON omitempty, so this required field must tolerate
+    /// being absent (→ "") rather than failing decode with "missing field".
+    #[serde(default, alias = "apiGroup")]
     pub api_group: String,
 
     /// Kind is the type of resource being referenced

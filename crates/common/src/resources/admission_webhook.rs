@@ -41,6 +41,7 @@ pub struct ValidatingWebhook {
     pub client_config: WebhookClientConfig,
 
     /// Rules describes what operations on what resources the webhook cares about
+    #[serde(default)]
     pub rules: Vec<RuleWithOperations>,
 
     /// FailurePolicy defines how unrecognized errors are handled
@@ -115,6 +116,7 @@ pub struct MutatingWebhook {
     pub client_config: WebhookClientConfig,
 
     /// Rules describes what operations on what resources the webhook cares about
+    #[serde(default)]
     pub rules: Vec<RuleWithOperations>,
 
     /// FailurePolicy defines how unrecognized errors are handled
