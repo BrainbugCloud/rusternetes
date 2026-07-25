@@ -750,6 +750,16 @@ impl ContainerRuntime {
         pod_ip: Option<&str>,
     ) -> Result<()> {
         let (sandbox_id, sandbox_config) = self.ensure_sandbox(pod).await?;
+        // Reconcile/restart call sites pass hosts_file_path=None; without a managed
+        // /etc/hosts a re-created container reverts to the runtime's sandbox default
+        // and the KubeletManagedEtcHosts test fails. Mint the managed hosts file
+        // here when the caller didn't supply one (returns None for hostNetwork pods).
+        let owned_hosts = if hosts_file_path.is_none() {
+            self.create_pod_hosts_file(pod, pod_ip).unwrap_or(None)
+        } else {
+            None
+        };
+        let hosts_file_path = hosts_file_path.or(owned_hosts.as_deref());
         self.start_container(
             pod,
             container,
@@ -4121,6 +4131,28 @@ impl ContainerRuntime {
                     .and_then(|s| s.security_context.as_ref())
                     .and_then(|sc| sc.run_as_group)
             });
+        // Supplemental groups for the container process: the pod's explicit
+        // securityContext.supplementalGroups PLUS fsGroup. fsGroup MUST be a
+        // supplementary group of the process, otherwise a non-root container
+        // cannot read the group-owned (e.g. 0440) volume files that fsGroup
+        // chowns to it — the failure behind the [LinuxOnly] Secrets/Projected
+        // "non-root with defaultMode and fsGroup" conformance tests.
+        let supplemental_groups: Vec<i64> = {
+            let pod_sc = pod
+                .spec
+                .as_ref()
+                .and_then(|s| s.security_context.as_ref());
+            let mut groups: Vec<i64> = pod_sc
+                .and_then(|sc| sc.supplemental_groups.clone())
+                .unwrap_or_default();
+            if let Some(fs_group) = pod_sc.and_then(|sc| sc.fs_group) {
+                if !groups.contains(&fs_group) {
+                    groups.push(fs_group);
+                }
+            }
+            groups
+        };
+
         // Hostname is sandbox-owned under CRI (PodSandboxConfig.hostname);
         // containers inherit it via the shared UTS namespace.
 
@@ -4304,6 +4336,7 @@ impl ContainerRuntime {
                         .unwrap_or(false),
                     run_as_user: run_as_user_id.map(|value| v1::Int64Value { value }),
                     run_as_group: run_as_group_id.map(|value| v1::Int64Value { value }),
+                    supplemental_groups,
                     readonly_rootfs: container
                         .security_context
                         .as_ref()
@@ -6971,9 +7004,13 @@ impl ContainerRuntime {
                 }
             }
 
-            // If the pod has no running containers, remove the last dead one too
-            // and clean up the orphaned sandbox
-            if !pods_with_running.contains(&pod_key) {
+            // If the pod is GONE from etcd and has no running containers, remove
+            // the last dead one too and clean up the orphaned sandbox/volumes.
+            // A pod still in etcd (a completed restartPolicy=Never pod, or one
+            // between container restarts) MUST keep its last container, sandbox
+            // and volumes — otherwise `kubectl logs` 404→500s, terminated-state
+            // and termination messages are lost, and restarts churn sandboxes.
+            if !pods_with_running.contains(&pod_key) && !existing_pods.contains(&pod_key) {
                 for (container_id, _) in exited.iter().take(keep_count) {
                     if self.cri.remove_container(container_id).await.is_ok() {
                         removed += 1;

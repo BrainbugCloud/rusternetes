@@ -1836,454 +1836,6 @@ impl ProtoRegistry {
             },
         );
 
-        // ========== apiextensions types (CRDs) ==========
-
-        schemas.insert(
-            "CustomResourceDefinition".into(),
-            MessageSchema {
-                fields: HashMap::from([
-                    (
-                        1,
-                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
-                    ),
-                    (
-                        2,
-                        (
-                            "spec".into(),
-                            FieldType::Message("CustomResourceDefinitionSpec".into()),
-                        ),
-                    ),
-                    (
-                        3,
-                        (
-                            "status".into(),
-                            FieldType::Message("CustomResourceDefinitionStatus".into()),
-                        ),
-                    ),
-                ]),
-            },
-        );
-        schemas.insert(
-            "CustomResourceDefinitionSpec".into(),
-            MessageSchema {
-                fields: HashMap::from([
-                    (1, ("group".into(), FieldType::String)),
-                    (
-                        3,
-                        (
-                            "names".into(),
-                            FieldType::Message("CustomResourceDefinitionNames".into()),
-                        ),
-                    ),
-                    (4, ("scope".into(), FieldType::String)),
-                    (
-                        7,
-                        (
-                            "versions".into(),
-                            FieldType::Repeated(Box::new(FieldType::Message(
-                                "CustomResourceDefinitionVersion".into(),
-                            ))),
-                        ),
-                    ),
-                    (
-                        9,
-                        (
-                            "conversion".into(),
-                            FieldType::Message("CustomResourceConversion".into()),
-                        ),
-                    ),
-                    (10, ("preserveUnknownFields".into(), FieldType::Bool)),
-                ]),
-            },
-        );
-        schemas.insert(
-            "CustomResourceDefinitionNames".into(),
-            MessageSchema {
-                fields: HashMap::from([
-                    (1, ("plural".into(), FieldType::String)),
-                    (2, ("singular".into(), FieldType::String)),
-                    (
-                        3,
-                        (
-                            "shortNames".into(),
-                            FieldType::Repeated(Box::new(FieldType::String)),
-                        ),
-                    ),
-                    (4, ("kind".into(), FieldType::String)),
-                    (5, ("listKind".into(), FieldType::String)),
-                    (
-                        6,
-                        (
-                            "categories".into(),
-                            FieldType::Repeated(Box::new(FieldType::String)),
-                        ),
-                    ),
-                ]),
-            },
-        );
-        schemas.insert(
-            "CustomResourceDefinitionVersion".into(),
-            MessageSchema {
-                fields: HashMap::from([
-                    (1, ("name".into(), FieldType::String)),
-                    (2, ("served".into(), FieldType::Bool)),
-                    (3, ("storage".into(), FieldType::Bool)),
-                    (
-                        4,
-                        (
-                            "schema".into(),
-                            FieldType::Message("CustomResourceValidation".into()),
-                        ),
-                    ),
-                    (
-                        5,
-                        (
-                            "subresources".into(),
-                            FieldType::Message("CustomResourceSubresources".into()),
-                        ),
-                    ),
-                    (
-                        6,
-                        (
-                            "additionalPrinterColumns".into(),
-                            FieldType::Repeated(Box::new(FieldType::Message(
-                                "CustomResourceColumnDefinition".into(),
-                            ))),
-                        ),
-                    ),
-                    (7, ("deprecated".into(), FieldType::Bool)),
-                    (8, ("deprecationWarning".into(), FieldType::String)),
-                    (
-                        9,
-                        (
-                            "selectableFields".into(),
-                            FieldType::Repeated(Box::new(FieldType::Message(
-                                "SelectableField".into(),
-                            ))),
-                        ),
-                    ),
-                ]),
-            },
-        );
-        schemas.insert(
-            "CustomResourceValidation".into(),
-            MessageSchema {
-                fields: HashMap::from([(
-                    1,
-                    (
-                        "openAPIV3Schema".into(),
-                        FieldType::Message("JSONSchemaProps".into()),
-                    ),
-                )]),
-            },
-        );
-        schemas.insert(
-            "JSONSchemaProps".into(),
-            MessageSchema {
-                fields: HashMap::from([
-                    (1, ("id".into(), FieldType::String)),
-                    (2, ("$schema".into(), FieldType::String)),
-                    (3, ("$ref".into(), FieldType::String)),
-                    (4, ("description".into(), FieldType::String)),
-                    (5, ("type".into(), FieldType::String)),
-                    (6, ("format".into(), FieldType::String)),
-                    (7, ("title".into(), FieldType::String)),
-                    (8, ("default".into(), FieldType::JsonRaw)),
-                    (9, ("maximum".into(), FieldType::Int)),
-                    (10, ("exclusiveMaximum".into(), FieldType::Bool)),
-                    (11, ("minimum".into(), FieldType::Int)),
-                    (12, ("exclusiveMinimum".into(), FieldType::Bool)),
-                    (13, ("maxLength".into(), FieldType::Int)),
-                    (14, ("minLength".into(), FieldType::Int)),
-                    (15, ("pattern".into(), FieldType::String)),
-                    (16, ("maxItems".into(), FieldType::Int)),
-                    (17, ("minItems".into(), FieldType::Int)),
-                    (18, ("uniqueItems".into(), FieldType::Bool)),
-                    (19, ("multipleOf".into(), FieldType::Int)), // double, but Int works for decode
-                    (
-                        20,
-                        (
-                            "enum".into(),
-                            FieldType::Repeated(Box::new(FieldType::JsonRaw)),
-                        ),
-                    ),
-                    (21, ("maxProperties".into(), FieldType::Int)),
-                    (22, ("minProperties".into(), FieldType::Int)),
-                    (
-                        23,
-                        (
-                            "required".into(),
-                            FieldType::Repeated(Box::new(FieldType::String)),
-                        ),
-                    ),
-                    (
-                        24,
-                        (
-                            "items".into(),
-                            FieldType::Message("JSONSchemaPropsOrArray".into()),
-                        ),
-                    ),
-                    (
-                        25,
-                        (
-                            "allOf".into(),
-                            FieldType::Repeated(Box::new(FieldType::Message(
-                                "JSONSchemaProps".into(),
-                            ))),
-                        ),
-                    ),
-                    (
-                        26,
-                        (
-                            "oneOf".into(),
-                            FieldType::Repeated(Box::new(FieldType::Message(
-                                "JSONSchemaProps".into(),
-                            ))),
-                        ),
-                    ),
-                    (
-                        27,
-                        (
-                            "anyOf".into(),
-                            FieldType::Repeated(Box::new(FieldType::Message(
-                                "JSONSchemaProps".into(),
-                            ))),
-                        ),
-                    ),
-                    (
-                        28,
-                        ("not".into(), FieldType::Message("JSONSchemaProps".into())),
-                    ),
-                    // field 29: properties — map<string, JSONSchemaProps>
-                    // Protobuf maps are encoded as repeated MapEntry messages.
-                    // We handle this as a special StringMap-like type but with Message values.
-                    // For now, decode properties entries manually.
-                    (
-                        29,
-                        (
-                            "properties".into(),
-                            FieldType::MessageMap("JSONSchemaProps".into()),
-                        ),
-                    ),
-                    (
-                        30,
-                        (
-                            "additionalProperties".into(),
-                            FieldType::Message("JSONSchemaPropsOrBool".into()),
-                        ),
-                    ),
-                    (37, ("nullable".into(), FieldType::Bool)),
-                    (
-                        38,
-                        (
-                            "x-kubernetes-preserve-unknown-fields".into(),
-                            FieldType::Bool,
-                        ),
-                    ),
-                    (
-                        39,
-                        ("x-kubernetes-embedded-resource".into(), FieldType::Bool),
-                    ),
-                    (40, ("x-kubernetes-int-or-string".into(), FieldType::Bool)),
-                    (
-                        41,
-                        (
-                            "x-kubernetes-list-map-keys".into(),
-                            FieldType::Repeated(Box::new(FieldType::String)),
-                        ),
-                    ),
-                    (42, ("x-kubernetes-list-type".into(), FieldType::String)),
-                    (43, ("x-kubernetes-map-type".into(), FieldType::String)),
-                    (
-                        44,
-                        (
-                            "x-kubernetes-validations".into(),
-                            FieldType::Repeated(Box::new(FieldType::Message(
-                                "ValidationRule".into(),
-                            ))),
-                        ),
-                    ),
-                ]),
-            },
-        );
-        // JSONSchemaPropsOrArray: field 1 = schema (JSONSchemaProps), field 2 = jsonSchemas (repeated JSONSchemaProps)
-        schemas.insert(
-            "JSONSchemaPropsOrArray".into(),
-            MessageSchema {
-                fields: HashMap::from([
-                    (
-                        1,
-                        (
-                            "schema".into(),
-                            FieldType::Message("JSONSchemaProps".into()),
-                        ),
-                    ),
-                    (
-                        2,
-                        (
-                            "jsonSchemas".into(),
-                            FieldType::Repeated(Box::new(FieldType::Message(
-                                "JSONSchemaProps".into(),
-                            ))),
-                        ),
-                    ),
-                ]),
-            },
-        );
-        schemas.insert(
-            "JSONSchemaPropsOrBool".into(),
-            MessageSchema {
-                fields: HashMap::from([
-                    (1, ("allows".into(), FieldType::Bool)),
-                    (
-                        2,
-                        (
-                            "schema".into(),
-                            FieldType::Message("JSONSchemaProps".into()),
-                        ),
-                    ),
-                ]),
-            },
-        );
-        schemas.insert(
-            "CustomResourceSubresources".into(),
-            MessageSchema {
-                fields: HashMap::from([
-                    (
-                        1,
-                        (
-                            "status".into(),
-                            FieldType::Message("CustomResourceSubresourceStatus".into()),
-                        ),
-                    ),
-                    (
-                        2,
-                        (
-                            "scale".into(),
-                            FieldType::Message("CustomResourceSubresourceScale".into()),
-                        ),
-                    ),
-                ]),
-            },
-        );
-        schemas.insert(
-            "CustomResourceSubresourceStatus".into(),
-            MessageSchema {
-                fields: HashMap::new(),
-            },
-        );
-        schemas.insert(
-            "CustomResourceSubresourceScale".into(),
-            MessageSchema {
-                fields: HashMap::from([
-                    (1, ("specReplicasPath".into(), FieldType::String)),
-                    (2, ("statusReplicasPath".into(), FieldType::String)),
-                    (3, ("labelSelectorPath".into(), FieldType::String)),
-                ]),
-            },
-        );
-        schemas.insert(
-            "CustomResourceConversion".into(),
-            MessageSchema {
-                fields: HashMap::from([
-                    (1, ("strategy".into(), FieldType::String)),
-                    (
-                        2,
-                        (
-                            "webhook".into(),
-                            FieldType::Message("WebhookConversion".into()),
-                        ),
-                    ),
-                ]),
-            },
-        );
-        schemas.insert(
-            "WebhookConversion".into(),
-            MessageSchema {
-                fields: HashMap::new(),
-            },
-        );
-        schemas.insert(
-            "CustomResourceDefinitionStatus".into(),
-            MessageSchema {
-                fields: HashMap::from([
-                    (
-                        1,
-                        (
-                            "conditions".into(),
-                            FieldType::Repeated(Box::new(FieldType::Message(
-                                "CustomResourceDefinitionCondition".into(),
-                            ))),
-                        ),
-                    ),
-                    (
-                        2,
-                        (
-                            "acceptedNames".into(),
-                            FieldType::Message("CustomResourceDefinitionNames".into()),
-                        ),
-                    ),
-                    (
-                        3,
-                        (
-                            "storedVersions".into(),
-                            FieldType::Repeated(Box::new(FieldType::String)),
-                        ),
-                    ),
-                ]),
-            },
-        );
-        schemas.insert(
-            "CustomResourceDefinitionCondition".into(),
-            MessageSchema {
-                fields: HashMap::from([
-                    (1, ("type".into(), FieldType::String)),
-                    (2, ("status".into(), FieldType::String)),
-                    (
-                        3,
-                        (
-                            "lastTransitionTime".into(),
-                            FieldType::Message("Time".into()),
-                        ),
-                    ),
-                    (4, ("reason".into(), FieldType::String)),
-                    (5, ("message".into(), FieldType::String)),
-                ]),
-            },
-        );
-        schemas.insert(
-            "CustomResourceColumnDefinition".into(),
-            MessageSchema {
-                fields: HashMap::from([
-                    (1, ("name".into(), FieldType::String)),
-                    (2, ("type".into(), FieldType::String)),
-                    (3, ("format".into(), FieldType::String)),
-                    (4, ("description".into(), FieldType::String)),
-                    (5, ("priority".into(), FieldType::Int)),
-                    (6, ("jsonPath".into(), FieldType::String)),
-                ]),
-            },
-        );
-        schemas.insert(
-            "SelectableField".into(),
-            MessageSchema {
-                fields: HashMap::from([(1, ("jsonPath".into(), FieldType::String))]),
-            },
-        );
-        schemas.insert(
-            "ValidationRule".into(),
-            MessageSchema {
-                fields: HashMap::from([
-                    (1, ("rule".into(), FieldType::String)),
-                    (2, ("message".into(), FieldType::String)),
-                    (4, ("messageExpression".into(), FieldType::String)),
-                    (5, ("reason".into(), FieldType::String)),
-                    (6, ("fieldPath".into(), FieldType::String)),
-                    (7, ("optionalOldSelf".into(), FieldType::Bool)),
-                ]),
-            },
-        );
-
         // events.k8s.io/v1 Event. This is a DIFFERENT message from core/v1
         // Event (kind "Event" in both groups) with different wire field
         // numbers, so it needs its own schema keyed distinctly; decode_k8s_resource
@@ -3315,6 +2867,23 @@ impl ProtoRegistry {
                     // string").
                     return decode_timestamp(data, true);
                 }
+                // apiextensions JSONSchemaProps union types custom-marshal in Go:
+                // the proto wrapper message is flattened to the inner value, not a
+                // {schema:...}/{allows:...} object. Without this, strict CRD
+                // validation rejects `...items.schema` / `additionalProperties.allows`
+                // as unknown fields.
+                if msg_type == "JSONSchemaPropsOrArray" {
+                    // {schema=1, jSONSchemas=2} -> schema object, else array
+                    return self.decode_schema_union(data, 1, 2, false);
+                }
+                if msg_type == "JSONSchemaPropsOrStringArray" {
+                    // {schema=1, property=2(strings)} -> schema object, else []string
+                    return self.decode_schema_union(data, 1, 2, true);
+                }
+                if msg_type == "JSONSchemaPropsOrBool" {
+                    // {allows=1(bool), schema=2} -> schema object, else bool allows
+                    return self.decode_schema_or_bool(data);
+                }
                 match self.decode_message(msg_type, data) {
                     Some(v) => v,
                     None => {
@@ -3422,6 +2991,114 @@ impl ProtoRegistry {
         }
     }
 
+    /// Decode a JSONSchemaPropsOrArray / JSONSchemaPropsOrStringArray wrapper.
+    /// If the `schema` field (`schema_field`) is present, return that inner
+    /// JSONSchemaProps object; otherwise return the repeated field
+    /// (`list_field`) as an array — of decoded JSONSchemaProps objects, or of
+    /// strings when `list_is_string`.
+    fn decode_schema_union(
+        &self,
+        data: &[u8],
+        schema_field: u32,
+        list_field: u32,
+        list_is_string: bool,
+    ) -> Value {
+        let mut schema: Option<Value> = None;
+        let mut list: Vec<Value> = Vec::new();
+        let mut pos = 0;
+        while pos < data.len() {
+            let (tag, np) = match read_varint(data, pos) {
+                Some(v) => v,
+                None => break,
+            };
+            pos = np;
+            let fnum = (tag >> 3) as u32;
+            let wt = (tag & 0x07) as u8;
+            if wt == WIRE_LENGTH_DELIMITED {
+                let (len, np) = match read_varint(data, pos) {
+                    Some(v) => v,
+                    None => break,
+                };
+                pos = np;
+                let len = len as usize;
+                if pos + len > data.len() {
+                    break;
+                }
+                let sub = &data[pos..pos + len];
+                pos += len;
+                if fnum == schema_field {
+                    schema = Some(
+                        self.decode_message("JSONSchemaProps", sub)
+                            .unwrap_or_else(|| Value::Object(Map::new())),
+                    );
+                } else if fnum == list_field {
+                    if list_is_string {
+                        list.push(Value::String(String::from_utf8_lossy(sub).to_string()));
+                    } else {
+                        list.push(
+                            self.decode_message("JSONSchemaProps", sub)
+                                .unwrap_or_else(|| Value::Object(Map::new())),
+                        );
+                    }
+                }
+            } else {
+                skip_wire(data, &mut pos, wt);
+            }
+        }
+        match schema {
+            Some(s) => s,
+            None => Value::Array(list),
+        }
+    }
+
+    /// Decode a JSONSchemaPropsOrBool wrapper `{allows=1(bool), schema=2}`.
+    /// A present `schema` submessage wins (return the object); otherwise return
+    /// the `allows` boolean (defaulting to true, matching K8s where an absent
+    /// wrapper means "allow").
+    fn decode_schema_or_bool(&self, data: &[u8]) -> Value {
+        let mut allows = true;
+        let mut pos = 0;
+        while pos < data.len() {
+            let (tag, np) = match read_varint(data, pos) {
+                Some(v) => v,
+                None => break,
+            };
+            pos = np;
+            let fnum = (tag >> 3) as u32;
+            let wt = (tag & 0x07) as u8;
+            if wt == WIRE_LENGTH_DELIMITED {
+                let (len, np) = match read_varint(data, pos) {
+                    Some(v) => v,
+                    None => break,
+                };
+                pos = np;
+                let len = len as usize;
+                if pos + len > data.len() {
+                    break;
+                }
+                let sub = &data[pos..pos + len];
+                pos += len;
+                if fnum == 2 {
+                    return self
+                        .decode_message("JSONSchemaProps", sub)
+                        .unwrap_or_else(|| Value::Object(Map::new()));
+                }
+            } else if wt == WIRE_VARINT {
+                let (val, np) = match read_varint(data, pos) {
+                    Some(v) => v,
+                    None => break,
+                };
+                pos = np;
+                if fnum == 1 {
+                    allows = val != 0;
+                }
+            } else {
+                skip_wire(data, &mut pos, wt);
+            }
+        }
+        Value::Bool(allows)
+    }
+
     /// Decode a protobuf map entry where value is a message type
     fn decode_message_map_entry(&self, msg_type: &str, data: &[u8]) -> (String, Value) {
         let mut key = String::new();
@@ -3450,9 +3127,17 @@ impl ProtoRegistry {
                         key = String::from_utf8_lossy(&data[pos..pos + len]).to_string();
                     }
                     2 => {
-                        val = self
-                            .decode_message(msg_type, &data[pos..pos + len])
-                            .unwrap_or(Value::Null);
+                        // Map values that are Time/MicroTime custom-marshal to an
+                        // RFC3339 string, not a {seconds,nanos} object — e.g. PDB
+                        // status.disruptedPods is map<string, Time>.
+                        val = if msg_type == "Time" {
+                            decode_timestamp(&data[pos..pos + len], false)
+                        } else if msg_type == "MicroTime" {
+                            decode_timestamp(&data[pos..pos + len], true)
+                        } else {
+                            self.decode_message(msg_type, &data[pos..pos + len])
+                                .unwrap_or(Value::Null)
+                        };
                     }
                     _ => {}
                 }
@@ -3602,6 +3287,23 @@ impl ProtoRegistry {
 // ========== Helper functions ==========
 
 /// Read a varint from data starting at pos. Returns (value, new_pos).
+/// Advance `pos` past one field body of the given wire type (tag already read).
+fn skip_wire(data: &[u8], pos: &mut usize, wire_type: u8) {
+    match wire_type {
+        WIRE_VARINT => {
+            *pos = read_varint(data, *pos).map(|(_, p)| p).unwrap_or(data.len());
+        }
+        WIRE_64BIT => *pos += 8,
+        WIRE_LENGTH_DELIMITED => {
+            *pos = read_varint(data, *pos)
+                .map(|(l, p)| p + l as usize)
+                .unwrap_or(data.len());
+        }
+        WIRE_32BIT => *pos += 4,
+        _ => *pos = data.len(),
+    }
+}
+
 fn read_varint(data: &[u8], mut pos: usize) -> Option<(u64, usize)> {
     let mut value: u64 = 0;
     let mut shift = 0;
@@ -4530,6 +4232,150 @@ mod tests {
             s.contains(".123456"),
             "MicroTime must serialize with microsecond precision, got {s:?}"
         );
+    }
+
+    #[test]
+    fn test_decode_crd_registry_preserves_plural_with_embedded_schema() {
+        // Reproduction: a native-protobuf CRD carries an openAPIV3Schema that
+        // embeds JSON (JSONSchemaProps.default / .example are `JSON` messages
+        // whose field 1 is raw JSON bytes). Verify the schema-registry decoder
+        // still emits spec.names.plural (the conformance failure was
+        // `failed to decode CRD: missing field \`plural\``).
+        let registry = ProtoRegistry::new();
+
+        fn varint(mut n: u64) -> Vec<u8> {
+            let mut b = Vec::new();
+            loop {
+                let mut byte = (n & 0x7f) as u8;
+                n >>= 7;
+                if n != 0 {
+                    byte |= 0x80;
+                }
+                b.push(byte);
+                if n == 0 {
+                    break;
+                }
+            }
+            b
+        }
+        // length-delimited (wire type 2) field
+        fn ld(field: u64, payload: &[u8]) -> Vec<u8> {
+            let mut b = varint((field << 3) | 2);
+            b.extend(varint(payload.len() as u64));
+            b.extend_from_slice(payload);
+            b
+        }
+        fn s(field: u64, val: &str) -> Vec<u8> {
+            ld(field, val.as_bytes())
+        }
+        fn v(field: u64, val: u64) -> Vec<u8> {
+            let mut b = varint(field << 3);
+            b.extend(varint(val));
+            b
+        }
+
+        // JSON message { raw = `{"replicas":1}` } for a property default.
+        let default_json = ld(1, br#"{"replicas":1}"#);
+        // inner JSONSchemaProps for property "spec": type=object, default=<json>
+        let mut spec_props = Vec::new();
+        spec_props.extend(s(5, "object"));
+        spec_props.extend(ld(8, &default_json));
+        // properties map entry: key="spec", value=<spec_props>
+        let mut prop_entry = Vec::new();
+        prop_entry.extend(s(1, "spec"));
+        prop_entry.extend(ld(2, &spec_props));
+        // root openAPIV3Schema: type=object, properties[spec]=<...>
+        let mut root_schema = Vec::new();
+        root_schema.extend(s(5, "object"));
+        root_schema.extend(ld(29, &prop_entry));
+        // CustomResourceValidation { openAPIV3Schema(1) }
+        let validation = ld(1, &root_schema);
+        // version: name=v1, served, storage, schema
+        let mut version = Vec::new();
+        version.extend(s(1, "v1"));
+        version.extend(v(2, 1));
+        version.extend(v(3, 1));
+        version.extend(ld(4, &validation));
+        // names: plural=foos, singular=foo, kind=Foo
+        let mut names = Vec::new();
+        names.extend(s(1, "foos"));
+        names.extend(s(2, "foo"));
+        names.extend(s(4, "Foo"));
+        // conversion.webhook.clientConfig — the field the empty hand-written
+        // WebhookConversion schema used to drop (`missing field clientConfig`).
+        let mut service = Vec::new();
+        service.extend(s(1, "ns1")); // namespace
+        service.extend(s(2, "svc1")); // name
+        let mut client_config = Vec::new();
+        client_config.extend(ld(1, &service)); // service (field 1)
+        client_config.extend(ld(2, b"CABUNDLE")); // caBundle (field 2, bytes)
+        let mut webhook = Vec::new();
+        webhook.extend(ld(2, &client_config)); // clientConfig (field 2)
+        webhook.extend(s(3, "v1")); // conversionReviewVersions (field 3)
+        let mut conversion = Vec::new();
+        conversion.extend(s(1, "Webhook")); // strategy (field 1)
+        conversion.extend(ld(2, &webhook)); // webhook (field 2)
+
+        // spec: group, names(3), scope(4), versions(7), conversion(9)
+        let mut spec = Vec::new();
+        spec.extend(s(1, "example.com"));
+        spec.extend(ld(3, &names));
+        spec.extend(s(4, "Namespaced"));
+        spec.extend(ld(7, &version));
+        spec.extend(ld(9, &conversion));
+        // CRD: metadata(1){name}, spec(2)
+        let metadata = s(1, "foos.example.com");
+        let mut crd = Vec::new();
+        crd.extend(ld(1, &metadata));
+        crd.extend(ld(2, &spec));
+
+        let val = registry
+            .decode_message("CustomResourceDefinition", &crd)
+            .expect("CRD should decode");
+        eprintln!(
+            "decode_message CRD = {}",
+            serde_json::to_string_pretty(&val).unwrap()
+        );
+        assert_eq!(
+            val.pointer("/spec/names/plural"),
+            Some(&Value::String("foos".into())),
+            "plural dropped from decoded CRD: {val:?}"
+        );
+        assert_eq!(
+            val.pointer("/spec/conversion/strategy"),
+            Some(&Value::String("Webhook".into()))
+        );
+        assert_eq!(
+            val.pointer("/spec/conversion/webhook/clientConfig/service/name"),
+            Some(&Value::String("svc1".into())),
+            "conversion.webhook.clientConfig dropped: {val:?}"
+        );
+
+        // Now exercise the FULL envelope path the middleware actually calls:
+        // k8s\0 + Unknown{ TypeMeta(1), raw(2) }.
+        let mut type_meta = Vec::new();
+        type_meta.extend(s(1, "apiextensions.k8s.io/v1"));
+        type_meta.extend(s(2, "CustomResourceDefinition"));
+        let mut envelope = Vec::new();
+        envelope.extend_from_slice(b"k8s\0");
+        envelope.extend(ld(1, &type_meta));
+        envelope.extend(ld(2, &crd));
+
+        let json_bytes = registry
+            .decode_k8s_resource(&envelope)
+            .expect("decode_k8s_resource must return Some for a CRD envelope");
+        let val2: Value = serde_json::from_slice(&json_bytes).unwrap();
+        eprintln!(
+            "decode_k8s_resource CRD = {}",
+            serde_json::to_string_pretty(&val2).unwrap()
+        );
+        assert_eq!(
+            val2.pointer("/spec/names/plural"),
+            Some(&Value::String("foos".into())),
+            "plural dropped from full-envelope decode: {val2:?}"
+        );
+        assert_eq!(val2["apiVersion"], "apiextensions.k8s.io/v1");
+        assert_eq!(val2["kind"], "CustomResourceDefinition");
     }
 
     #[test]

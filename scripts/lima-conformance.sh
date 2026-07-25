@@ -40,7 +40,11 @@ VM="${LIMA_INSTANCE:-default}"
 MODE="${1:-certified-conformance}"
 K8S_VER="${K8S_VER:-v1.35.0}"
 HOST_REPO="${HOST_REPO:-/Users/e28b0/git/rusternetes}"
-RUN_DIR="${RUN_DIR:-/tmp/lima/rk-run}"      # data-dir/logs (may live on the FUSE host mount)
+RUN_DIR="${RUN_DIR:-/tmp/lima/rk-run}"      # logs (may live on the FUSE host mount)
+# The SQLite DB MUST NOT live on the virtiofs host mount: WAL/mmap/checkpoints are
+# slow over FUSE and stall the scheduler under load. Put it on tmpfs (/dev/shm) —
+# it's a throwaway conformance DB so durability doesn't matter.
+DB_DIR="${DB_DIR:-/dev/shm/rk-db}"
 # Volumes MUST live on a VM-local real filesystem (ext4), not the FUSE/virtiofs
 # host mount under /tmp/lima: virtiofs reports FUSE to statfs and silently drops
 # file mode bits, which fails the [LinuxOnly] EmptyDir 0644/0666/0777 mode tests.
@@ -106,7 +110,7 @@ EOF
 echo "==> 4/7 stop any old server, clean sandboxes, wipe the (bloat-prone) DB"
 lsh "sudo pkill -x rusternetes 2>/dev/null || true; sleep 2
      sudo crictl rmp -fa 2>/dev/null || true
-     sudo rm -f $RUN_DIR/rusternetes.db*"
+     sudo mkdir -p $DB_DIR; sudo rm -f $DB_DIR/rusternetes.db* $RUN_DIR/rusternetes.db*"
 # Detach any medium:Memory tmpfs a prior run left mounted under the volume dir,
 # else the rm -rf below hits EBUSY on the mountpoint. Deepest paths first.
 lsh "findmnt -rno TARGET 2>/dev/null | grep -E '^$VOL_DIR(/|\$)' | sort -r \
@@ -118,7 +122,7 @@ lsh "sudo bash -c 'setsid env \
        CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock \
        IMAGE_SERVICE_ENDPOINT=unix:///run/containerd/containerd.sock \
        $RK/target/release/rusternetes \
-       --storage-backend sqlite --data-dir $RUN_DIR/rusternetes.db \
+       --storage-backend sqlite --data-dir $DB_DIR/rusternetes.db \
        --volume-dir $VOL_DIR --bind-address 0.0.0.0:6443 --node-name node-1 \
        --tls --tls-cert-file $PKI/apiserver.crt --tls-key-file $PKI/apiserver.key \
        --tls-san $SAN --kubernetes-service-host 10.96.0.1 --log-level info \

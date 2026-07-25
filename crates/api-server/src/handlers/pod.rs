@@ -793,9 +793,13 @@ pub async fn update(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     body: Bytes,
 ) -> Result<Json<Pod>> {
+    // The resize subresource shares this handler; on that path resource changes
+    // to spec.containers[*].resources are permitted (rejected everywhere else).
+    let is_resize = uri.path().ends_with("/resize");
     // Parse the body manually for better error handling — axum's Json extractor
     // returns 422 Unprocessable Entity on failure, but Kubernetes expects a proper
     // Status object. Manual parsing also tolerates unknown fields gracefully.
@@ -867,6 +871,11 @@ pub async fn update(
         for (i, c) in munged.containers.iter_mut().enumerate() {
             if i < old_spec.containers.len() {
                 c.image = old_spec.containers[i].image.clone();
+                // On the resize subresource, mask resources so the change is
+                // allowed (the real write still carries the new values).
+                if is_resize {
+                    c.resources = old_spec.containers[i].resources.clone();
+                }
             }
         }
         if let (Some(old_init), Some(new_init)) =
@@ -875,6 +884,9 @@ pub async fn update(
             for (i, c) in new_init.iter_mut().enumerate() {
                 if i < old_init.len() {
                     c.image = old_init[i].image.clone();
+                    if is_resize {
+                        c.resources = old_init[i].resources.clone();
+                    }
                 }
             }
         }

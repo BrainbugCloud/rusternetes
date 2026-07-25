@@ -238,6 +238,20 @@ fn json_name_override(msg_short: &str, number: i32) -> Option<&'static str> {
         // admissionregistration webhook configuration lists
         ("MutatingWebhookConfiguration", 2) => Some("webhooks"),
         ("ValidatingWebhookConfiguration", 2) => Some("webhooks"),
+        // apiextensions JSONSchemaProps: the Go json tags use `$`-prefixed and
+        // dashed `x-kubernetes-*` keys that protoc's json_name (derived from the
+        // camelCase proto field name) does not reproduce. Without these, a CRD's
+        // openAPIV3Schema decodes these fields under the wrong key and the typed
+        // struct silently drops them (breaking openAPIV3Schema fidelity).
+        ("JSONSchemaProps", 2) => Some("$schema"),
+        ("JSONSchemaProps", 3) => Some("$ref"),
+        ("JSONSchemaProps", 38) => Some("x-kubernetes-preserve-unknown-fields"),
+        ("JSONSchemaProps", 39) => Some("x-kubernetes-embedded-resource"),
+        ("JSONSchemaProps", 40) => Some("x-kubernetes-int-or-string"),
+        ("JSONSchemaProps", 41) => Some("x-kubernetes-list-map-keys"),
+        ("JSONSchemaProps", 42) => Some("x-kubernetes-list-type"),
+        ("JSONSchemaProps", 43) => Some("x-kubernetes-map-type"),
+        ("JSONSchemaProps", 44) => Some("x-kubernetes-validations"),
         _ => None,
     }
 }
@@ -263,6 +277,11 @@ fn short_of(type_name: &str) -> &str {
 fn registry_key(fqn: &str) -> String {
     match fqn {
         ".k8s.io.api.flowcontrol.v1.Subject" => "flowcontrol.Subject".to_string(),
+        // core/v1 EndpointPort {name=1, port=2, protocol=3} and discovery/v1
+        // EndpointPort {name=1, protocol=2, port=3} have SWAPPED field numbers.
+        // Without distinct keys they collide and an EndpointSlice's ports decode
+        // with protocol/port transposed (protocol becomes an int) → POST 400.
+        ".k8s.io.api.discovery.v1.EndpointPort" => "discovery.EndpointPort".to_string(),
         _ => short_of(fqn).to_string(),
     }
 }
@@ -347,6 +366,13 @@ fn scalar_or_message_expr(
                 ".k8s.io.apimachinery.pkg.runtime.RawExtension" => {
                     return "FieldType::JsonRaw".to_string()
                 }
+                // apiextensions `JSON` is a message { optional bytes raw = 1; }
+                // whose raw bytes ARE the JSON value (custom Go marshaling). It
+                // backs JSONSchemaProps.default / .example / .enum. Decode it as a
+                // JSON value, not a {raw: base64} object, mirroring RawExtension.
+                ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.JSON" => {
+                    return "FieldType::JsonRaw".to_string()
+                }
                 ".k8s.io.apimachinery.pkg.api.resource.Quantity" => {
                     // Quantity is a submessage { optional string string = 1; }
                     // on the wire, though K8s JSON marshals it as a bare string.
@@ -372,6 +398,11 @@ fn scalar_or_message_expr(
                     | "localObjectReference"
                     | "handler"
                     | "rule"
+                    // EphemeralContainer embeds EphemeralContainerCommon via Go
+                    // `,inline`; without flattening, `name`/`image` land nested
+                    // and the pods/ephemeralcontainers subresource 422s with
+                    // "missing field `name`".
+                    | "ephemeralContainerCommon"
             ) {
                 return format!("FieldType::Inlined({short:?}.to_string())");
             }
