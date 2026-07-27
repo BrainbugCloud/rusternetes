@@ -158,27 +158,29 @@ services:
     # command: ["--node-name", "node-1", "--etcd-servers", "http://etcd:2379", "--config", "/etc/kubernetes/kubelet-config.yaml"]
 
   # Kubelet 2 - second node agent for multi-node conformance tests
-  kubelet2:
-    build:
-      context: .
-      dockerfile: Dockerfile.kubelet
-    container_name: rusternetes-kubelet2
-    privileged: true
-    depends_on:
-      - etcd
-      - api-server
-    networks:
-      - rusternetes-net
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:rw
-      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw
-      - ./.rusternetes/certs:/root/.rusternetes/certs:ro
-    environment:
-      - RUST_LOG=info
-      - DOCKER_HOST=unix:///var/run/docker.sock
-      - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
-      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
-    command: ["--node-name", "node-2", "--etcd-servers", "http://etcd:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10251", "--sync-interval", "3"]
+  # DISABLED in CI to reduce resource pressure on 2-vCPU GHA runners.
+  # Uncomment for local multi-node testing.
+  # kubelet2:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.kubelet
+  #   container_name: rusternetes-kubelet2
+  #   privileged: true
+  #   depends_on:
+  #     - etcd
+  #     - api-server
+  #   networks:
+  #     - rusternetes-net
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock:rw
+  #     - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw
+  #     - ./.rusternetes/certs:/root/.rusternetes/certs:ro
+  #   environment:
+  #     - RUST_LOG=info
+  #     - DOCKER_HOST=unix:///var/run/docker.sock
+  #     - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
+  #     - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
+  #   command: ["--node-name", "node-2", "--etcd-servers", "http://etcd:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10251", "--sync-interval", "3"]
 
   # Kube-proxy - network proxy
   # IMPORTANT: Uses host network mode to modify iptables on the host/VM
