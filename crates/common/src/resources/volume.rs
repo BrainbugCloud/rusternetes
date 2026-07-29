@@ -213,7 +213,12 @@ pub struct PersistentVolumeStatus {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub enum PersistentVolumePhase {
+    // `alias = ""` mirrors the shared `Phase` enum: client-go sends
+    // `status: { phase: "" }` on CREATE, and without this the empty inner
+    // string fails to deserialize (`unknown variant ``) before the handler's
+    // phase-defaulting logic ever runs.
     #[default]
+    #[serde(alias = "")]
     Pending,
     Available,
     Bound,
@@ -386,7 +391,10 @@ pub struct ModifyVolumeStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum PersistentVolumeClaimPhase {
+    // See PersistentVolumePhase: `alias = ""` tolerates the empty inner string
+    // that client-go sends on CREATE.
     #[default]
+    #[serde(alias = "")]
     Pending,
     Bound,
     Lost,

@@ -99,6 +99,12 @@ pub struct CustomResourceDefinitionSpec {
 #[serde(rename_all = "camelCase")]
 pub struct CustomResourceDefinitionNames {
     /// Plural is the plural name of the resource (used in URLs: /apis/<group>/<version>/<plural>)
+    ///
+    /// `#[serde(default)]`: this same struct is reused for `status.acceptedNames`,
+    /// which a create request sends empty (`{}`) — mirroring Go's zero-value
+    /// deserialization. `spec.names.plural` non-emptiness is enforced separately
+    /// in `validate_crd`, so this does not weaken create-time validation.
+    #[serde(default)]
     pub plural: String,
 
     /// Singular is the singular name of the resource (used as an alias on CLI)
@@ -106,6 +112,7 @@ pub struct CustomResourceDefinitionNames {
     pub singular: Option<String>,
 
     /// Kind is the serialized kind of the resource (PascalCase)
+    #[serde(default)]
     pub kind: String,
 
     /// ShortNames are short names for the resource (used as aliases on CLI)

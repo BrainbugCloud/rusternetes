@@ -1,11 +1,16 @@
 /// Concurrency control module for optimistic locking with resourceVersion
 use rusternetes_common::Error;
 
-/// Extract resourceVersion from metadata
+/// Extract resourceVersion from metadata.
+///
+/// An empty resourceVersion is treated as absent: Kubernetes semantics say an
+/// update with an empty `metadata.resourceVersion` carries no optimistic-
+/// concurrency precondition and should overwrite unconditionally.
 pub fn extract_resource_version(metadata: &serde_json::Value) -> Option<String> {
     metadata
         .get("resourceVersion")
         .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
 }
 
@@ -63,6 +68,10 @@ mod tests {
 
         let no_rv = json!({"name": "test"});
         assert_eq!(extract_resource_version(&no_rv), None);
+
+        // An empty resourceVersion is treated as absent (unconditional update).
+        let empty_rv = json!({"name": "test", "resourceVersion": ""});
+        assert_eq!(extract_resource_version(&empty_rv), None);
     }
 
     #[test]

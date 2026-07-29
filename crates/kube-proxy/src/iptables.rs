@@ -296,57 +296,17 @@ impl IptablesManager {
             warn!("No bridge CIDR detected, skipping hairpin MASQUERADE rule");
         }
 
-        // Add MASQUERADE for NodePort traffic from local sources.
-        // When a process on the node itself connects to a NodePort, the source IP
-        // is local. Without MASQUERADE the backend pod replies directly, bypassing
-        // conntrack, and the connection breaks (asymmetric routing).
-        let nodeport_masq_check = Command::new(&self.iptables_cmd)
-            .args([
-                "-t",
-                "nat",
-                "-C",
-                "POSTROUTING",
-                "-m",
-                "comment",
-                "--comment",
-                "rusternetes nodeport masquerade",
-                "-m",
-                "addrtype",
-                "--src-type",
-                "LOCAL",
-                "-j",
-                "MASQUERADE",
-            ])
-            .output();
-        if nodeport_masq_check.map_or(true, |o| !o.status.success()) {
-            let output = Command::new(&self.iptables_cmd)
-                .args([
-                    "-t",
-                    "nat",
-                    "-A",
-                    "POSTROUTING",
-                    "-m",
-                    "comment",
-                    "--comment",
-                    "rusternetes nodeport masquerade",
-                    "-m",
-                    "addrtype",
-                    "--src-type",
-                    "LOCAL",
-                    "-j",
-                    "MASQUERADE",
-                ])
-                .output()
-                .context("Failed to add NodePort MASQUERADE rule")?;
-            if output.status.success() {
-                info!("Added MASQUERADE rule for NodePort traffic (local source)");
-            } else {
-                warn!(
-                    "Failed to add NodePort MASQUERADE: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-        }
+        // NOTE: we deliberately do NOT add a blanket
+        //   -A POSTROUTING -m addrtype --src-type LOCAL -j MASQUERADE
+        // rule here. `--src-type LOCAL` matches *every* packet the node
+        // originates — including loopback DNS to 127.0.0.53 (MASQUERADE on `lo`
+        // drops the packet) and all node egress — which blackholes node
+        // networking (DNS + image pulls fail). The node→NodePort case it was
+        // meant to cover is already handled by the `ctstate DNAT` MASQUERADE
+        // below: a local process hitting a NodePort is DNATed to the backend,
+        // so the connection is `ctstate DNAT` and gets masqueraded there.
+        // K8s ref: upstream scopes NodePort SNAT via the KUBE-MARK-MASQ fwmark,
+        // never by src-type LOCAL.
 
         // Add general MASQUERADE for all DNAT'd traffic.
         // This covers both ClusterIP and NodePort: when traffic is DNATed to a pod

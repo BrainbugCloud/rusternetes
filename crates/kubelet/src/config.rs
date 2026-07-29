@@ -43,6 +43,14 @@ pub struct KubeletConfiguration {
     /// The first IP in this range is used for the kubernetes service
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cluster_service_cidr: Option<String>,
+
+    /// CRI runtime service endpoint (e.g. "unix:///run/containerd/containerd.sock")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_runtime_endpoint: Option<String>,
+
+    /// CRI image service endpoint (defaults to containerRuntimeEndpoint)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_service_endpoint: Option<String>,
 }
 
 fn default_api_version() -> String {
@@ -65,6 +73,8 @@ impl Default for KubeletConfiguration {
             metrics_bind_port: None,
             log_level: None,
             cluster_service_cidr: None,
+            container_runtime_endpoint: None,
+            image_service_endpoint: None,
         }
     }
 }
@@ -197,7 +207,16 @@ pub struct RuntimeConfig {
 
     /// Kubernetes service ClusterIP (first IP in service CIDR)
     pub kubernetes_service_host: String,
+
+    /// CRI runtime service endpoint
+    pub container_runtime_endpoint: String,
+
+    /// CRI image service endpoint (same as runtime endpoint unless overridden)
+    pub image_service_endpoint: String,
 }
+
+/// Default CRI runtime endpoint (standard containerd socket path).
+pub const DEFAULT_CONTAINER_RUNTIME_ENDPOINT: &str = "unix:///run/containerd/containerd.sock";
 
 /// Extract the first usable IP address from a CIDR range
 /// For example, "10.96.0.0/12" -> "10.96.0.1"
@@ -245,6 +264,8 @@ impl RuntimeConfig {
         config_file: Option<KubeletConfiguration>,
         node_name: String,
         etcd_endpoints: Vec<String>,
+        cli_container_runtime_endpoint: Option<String>,
+        cli_image_service_endpoint: Option<String>,
     ) -> Result<Self> {
         // Determine root directory
         // Precedence: CLI > Config > Env > Default
@@ -310,6 +331,26 @@ impl RuntimeConfig {
                     .unwrap_or_else(|_| "10.96.0.1".to_string())
             });
 
+        // Determine CRI endpoints
+        // Precedence: CLI > Config > Env > Default (containerd socket)
+        let container_runtime_endpoint = cli_container_runtime_endpoint
+            .or_else(|| {
+                config_file
+                    .as_ref()
+                    .and_then(|c| c.container_runtime_endpoint.clone())
+            })
+            .or_else(|| std::env::var("CONTAINER_RUNTIME_ENDPOINT").ok())
+            .unwrap_or_else(|| DEFAULT_CONTAINER_RUNTIME_ENDPOINT.to_string());
+
+        let image_service_endpoint = cli_image_service_endpoint
+            .or_else(|| {
+                config_file
+                    .as_ref()
+                    .and_then(|c| c.image_service_endpoint.clone())
+            })
+            .or_else(|| std::env::var("IMAGE_SERVICE_ENDPOINT").ok())
+            .unwrap_or_else(|| container_runtime_endpoint.clone());
+
         let config = Self {
             root_dir: PathBuf::from(root_dir),
             volume_dir: PathBuf::from(volume_dir),
@@ -320,6 +361,8 @@ impl RuntimeConfig {
             node_name,
             etcd_endpoints,
             kubernetes_service_host,
+            container_runtime_endpoint,
+            image_service_endpoint,
         };
 
         config.validate()?;
@@ -378,7 +421,9 @@ impl RuntimeConfig {
   Sync Frequency: {}s
   Metrics Port: {}
   Log Level: {}
-  Etcd Endpoints: {}"#,
+  Etcd Endpoints: {}
+  Container Runtime Endpoint: {}
+  Image Service Endpoint: {}"#,
             self.node_name,
             self.root_dir.display(),
             self.volume_dir.display(),
@@ -386,7 +431,9 @@ impl RuntimeConfig {
             self.sync_frequency,
             self.metrics_bind_port,
             self.log_level,
-            self.etcd_endpoints.join(", ")
+            self.etcd_endpoints.join(", "),
+            self.container_runtime_endpoint,
+            self.image_service_endpoint
         )
     }
 }
@@ -453,6 +500,8 @@ mod tests {
             metrics_bind_port: Some(10250),
             log_level: Some("info".to_string()),
             cluster_service_cidr: Some("10.96.0.0/12".to_string()),
+            container_runtime_endpoint: Some("unix:///run/containerd/containerd.sock".to_string()),
+            image_service_endpoint: None,
         };
 
         // Write to temp file
@@ -499,6 +548,8 @@ mod tests {
             }),
             "test-node".to_string(),
             vec!["http://localhost:2379".to_string()],
+            None,
+            None,
         )
         .unwrap();
 
@@ -521,6 +572,8 @@ mod tests {
             None,
             "test-node".to_string(),
             vec!["http://localhost:2379".to_string()],
+            None,
+            None,
         )
         .unwrap();
 
@@ -543,6 +596,8 @@ mod tests {
             None,
             "".to_string(),
             vec!["http://localhost:2379".to_string()],
+            None,
+            None,
         );
         assert!(result.is_err());
 
@@ -557,6 +612,8 @@ mod tests {
             None,
             "test-node".to_string(),
             vec![],
+            None,
+            None,
         );
         assert!(result.is_err());
     }

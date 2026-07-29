@@ -657,11 +657,21 @@ impl<S: Storage + 'static> NamespaceController<S> {
                 if let Some(name) = metadata.get("name").and_then(|n| n.as_str()) {
                     let key = build_key(resource_type, Some(namespace), name);
 
-                    // For pods: terminal pods (Succeeded/Failed) should be hard-deleted
-                    // from storage regardless of finalizers. They are already done
-                    // executing and will never process their finalizers. Leaving them
-                    // in storage blocks namespace deletion indefinitely.
-                    if resource_type == "pods" {
+                    // A resource with finalizers must NOT be hard-deleted — it has
+                    // to go through graceful deletion (deletionTimestamp set, counts
+                    // as had_finalizers) so ordered namespace deletion keeps the
+                    // namespace Terminating until the finalizer is cleared. Only
+                    // finalizer-free terminal pods get the hard-delete shortcut.
+                    let res_has_finalizers = metadata
+                        .get("finalizers")
+                        .and_then(|f| f.as_array())
+                        .map(|f| !f.is_empty())
+                        .unwrap_or(false);
+
+                    // For pods: terminal pods (Succeeded/Failed) with no finalizers
+                    // should be hard-deleted from storage — they are done executing
+                    // and leaving them in storage blocks namespace deletion.
+                    if resource_type == "pods" && !res_has_finalizers {
                         let phase = resource.pointer("/status/phase").and_then(|p| p.as_str());
                         if matches!(phase, Some("Succeeded") | Some("Failed")) {
                             match self.storage.delete(&key).await {

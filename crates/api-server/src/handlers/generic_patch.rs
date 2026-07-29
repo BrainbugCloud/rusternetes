@@ -524,7 +524,7 @@ where
         .map_err(|e| rusternetes_common::Error::InvalidResource(format!("Invalid patch: {}", e)))?;
 
     // Apply patch (clone patch_type for potential retry on rv conflict)
-    let _patch_type_for_retry = patch_type.clone();
+    let patch_type_for_retry = patch_type.clone();
     let mut patched_json = apply_patch(&current_json, &patch_json, patch_type)
         .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
 
@@ -570,10 +570,25 @@ where
         return Ok(Json(patched_resource));
     }
 
-    // Update in storage
-    let updated = state.storage.update(&key, &patched_resource).await?;
-
-    Ok(Json(updated))
+    // Update in storage with retry on conflict (mirrors the namespaced path).
+    // A non-apply PATCH is idempotent — on rv conflict (e.g. a controller bumped
+    // the PV between our read and write), re-read, re-apply, and retry once.
+    match state.storage.update(&key, &patched_resource).await {
+        Ok(updated) => Ok(Json(updated)),
+        Err(rusternetes_common::Error::Conflict(_)) => {
+            let fresh: T = state.storage.get(&key).await?;
+            let fresh_json = serde_json::to_value(&fresh)
+                .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
+            let re_patched = apply_patch(&fresh_json, &patch_json, patch_type_for_retry)
+                .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
+            let re_patched_resource: T = serde_json::from_value(re_patched).map_err(|e| {
+                rusternetes_common::Error::InvalidResource(format!("Invalid result: {}", e))
+            })?;
+            let updated = state.storage.update(&key, &re_patched_resource).await?;
+            Ok(Json(updated))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Macro to create a PATCH handler for a namespaced resource

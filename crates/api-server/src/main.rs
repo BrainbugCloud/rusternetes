@@ -8,18 +8,16 @@ mod flow_control;
 mod gnostic;
 mod handlers;
 mod ip_allocator;
+mod kubelet_proxy;
 mod middleware;
 mod openapi;
 mod patch;
 mod prometheus_client;
-pub mod protobuf;
 #[allow(dead_code)]
 mod response;
 mod router;
 #[allow(dead_code)]
 mod spdy;
-#[allow(dead_code)]
-mod spdy_handlers;
 mod state;
 #[allow(dead_code)]
 mod streaming;

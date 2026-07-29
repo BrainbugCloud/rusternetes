@@ -92,8 +92,11 @@ else
 fi
 
 # Determine kubectl flags
+# Fall back to an explicit --server when KUBECONFIG is unset, /dev/null, or
+# points at a file that doesn't exist. Without this, kubectl silently defaults
+# to the legacy http://localhost:8080 and fails with a connection-refused error.
 KUBECTL_FLAGS="--insecure-skip-tls-verify"
-if [ -z "$KUBECONFIG" ] || [ "$KUBECONFIG" = "/dev/null" ]; then
+if [ -z "$KUBECONFIG" ] || [ "$KUBECONFIG" = "/dev/null" ] || [ ! -f "$KUBECONFIG" ]; then
     KUBECTL_FLAGS="$KUBECTL_FLAGS --server https://localhost:6443"
 fi
 

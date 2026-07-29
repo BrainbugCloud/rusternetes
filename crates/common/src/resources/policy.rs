@@ -362,7 +362,10 @@ pub struct PodDisruptionBudgetStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PodDisruptionBudgetCondition {
-    /// Type of PDB condition
+    /// Type of PDB condition. Serialized as `type` to match metav1.Condition —
+    /// `rename_all = "camelCase"` alone would emit `conditionType`, which
+    /// clients (and protobuf-decoded bodies) never send.
+    #[serde(rename = "type")]
     pub condition_type: String,
 
     /// Status of the condition (True, False, Unknown)

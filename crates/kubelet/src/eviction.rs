@@ -583,60 +583,55 @@ fn get_pid_stats() -> (u64, u64) {
     (pid_available, pid_max)
 }
 
-/// Get pod resource usage statistics
-/// Queries the container runtime for actual resource usage
-pub async fn get_pod_stats(pods: &[Pod]) -> HashMap<String, PodStats> {
-    get_pod_stats_async(pods).await
-}
-
-/// Async implementation of pod stats gathering
-async fn get_pod_stats_async(pods: &[Pod]) -> HashMap<String, PodStats> {
-    use bollard::Docker;
+/// Get pod resource usage statistics.
+///
+/// Queries the container runtime over CRI (`ListContainerStats`) and
+/// aggregates per-pod working-set memory and writable-layer disk usage,
+/// grouped by the CRI pod-namespace/pod-name labels.
+pub async fn get_pod_stats(
+    runtime: &crate::runtime::ContainerRuntime,
+    pods: &[Pod],
+) -> HashMap<String, PodStats> {
+    use crate::cri::labels;
 
     let mut stats_map = HashMap::new();
 
-    // Connect to Docker/Podman
-    let docker = match Docker::connect_with_local_defaults() {
-        Ok(d) => d,
-        Err(e) => {
-            warn!("Failed to connect to container runtime: {}", e);
-            return stats_map;
+    // Aggregate raw CRI stats by "{namespace}/{pod}" key.
+    let mut usage: HashMap<String, (u64, u64)> = HashMap::new();
+    for stat in runtime.all_container_stats().await {
+        let Some(attrs) = stat.attributes.as_ref() else {
+            continue;
+        };
+        let (Some(ns), Some(pod)) = (
+            attrs.labels.get(labels::POD_NAMESPACE),
+            attrs.labels.get(labels::POD_NAME),
+        ) else {
+            continue;
+        };
+        let key = format!("{}/{}", ns, pod);
+        let entry = usage.entry(key).or_insert((0, 0));
+        if let Some(mem) = stat
+            .memory
+            .as_ref()
+            .and_then(|m| m.working_set_bytes.as_ref())
+        {
+            entry.0 += mem.value;
         }
-    };
+        if let Some(disk) = stat
+            .writable_layer
+            .as_ref()
+            .and_then(|w| w.used_bytes.as_ref())
+        {
+            entry.1 += disk.value;
+        }
+    }
 
     for pod in pods {
         let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
         let pod_name = &pod.metadata.name;
         let key = format!("{}/{}", namespace, pod_name);
 
-        // Get QoS class for this pod
-        let qos_class = get_qos_class(pod);
-
-        // Aggregate resource usage across all containers in the pod
-        let mut total_memory_bytes = 0u64;
-        let mut total_disk_bytes = 0u64;
-
-        if let Some(spec) = &pod.spec {
-            for container in &spec.containers {
-                // Container name in runtime format: k8s_<container>_<pod>_<namespace>_<uid>_<attempt>
-                // For simplicity, we'll try to find containers by pod name prefix
-                let container_name = format!("k8s_{}_{}_", container.name, pod_name);
-
-                // Try to get container stats
-                match get_container_stats(&docker, &container_name).await {
-                    Ok((memory, disk)) => {
-                        total_memory_bytes += memory;
-                        total_disk_bytes += disk;
-                    }
-                    Err(e) => {
-                        debug!(
-                            "Failed to get stats for container {}: {}",
-                            container_name, e
-                        );
-                    }
-                }
-            }
-        }
+        let (total_memory_bytes, total_disk_bytes) = usage.get(&key).copied().unwrap_or((0, 0));
 
         // Only add to map if we got some stats
         if total_memory_bytes > 0 || total_disk_bytes > 0 {
@@ -647,71 +642,13 @@ async fn get_pod_stats_async(pods: &[Pod]) -> HashMap<String, PodStats> {
                     namespace: namespace.to_string(),
                     memory_usage_bytes: total_memory_bytes,
                     disk_usage_bytes: total_disk_bytes,
-                    qos_class,
+                    qos_class: get_qos_class(pod),
                 },
             );
         }
     }
 
     stats_map
-}
-
-/// Get resource stats for a single container
-async fn get_container_stats(
-    docker: &bollard::Docker,
-    container_name_prefix: &str,
-) -> Result<(u64, u64)> {
-    use bollard::container::ListContainersOptions;
-    use std::collections::HashMap as BollardHashMap;
-
-    // List all containers and find one matching our prefix
-    let mut filters = BollardHashMap::new();
-    filters.insert("name".to_string(), vec![container_name_prefix.to_string()]);
-
-    let options = Some(ListContainersOptions {
-        filters,
-        ..Default::default()
-    });
-
-    let containers = docker.list_containers(options).await?;
-
-    if containers.is_empty() {
-        return Ok((0, 0));
-    }
-
-    // Get the first matching container
-    let container_id = &containers[0]
-        .id
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Container has no ID"))?;
-
-    // Get container stats (one-shot, not streaming)
-    let stats_options = bollard::container::StatsOptions {
-        stream: false,
-        one_shot: true,
-    };
-
-    use futures::stream::StreamExt;
-    let mut stats_stream = docker.stats(container_id, Some(stats_options));
-
-    if let Some(stats_result) = stats_stream.next().await {
-        let stats = stats_result?;
-
-        // Extract memory usage
-        let memory_bytes = stats.memory_stats.usage.unwrap_or(0);
-
-        // Extract disk usage (from blkio stats)
-        let mut disk_bytes = 0u64;
-        if let Some(io_service_bytes_recursive) = &stats.blkio_stats.io_service_bytes_recursive {
-            for entry in io_service_bytes_recursive {
-                disk_bytes += entry.value;
-            }
-        }
-
-        Ok((memory_bytes, disk_bytes))
-    } else {
-        Ok((0, 0))
-    }
 }
 
 #[cfg(test)]

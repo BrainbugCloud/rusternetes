@@ -1,10 +1,13 @@
 #[allow(dead_code)]
 pub mod cni;
 pub mod config;
+pub mod cri;
 #[allow(dead_code)]
 pub mod eviction;
 pub mod kubelet;
 pub mod runtime;
+pub mod server;
+pub mod streaming_server;
 
 pub use kubelet::PodWorkerState;
 
@@ -22,7 +25,13 @@ pub struct KubeletConfig {
     pub network: String,
     pub sync_interval: u64,
     pub metrics_port: u16,
+    /// Port for the exec/attach/portForward SPDY streaming server. Advertised
+    /// in the node's `DaemonEndpoints`; also serves as the front door that
+    /// proxies plain HTTP requests (e.g. `/containerLogs`) to `metrics_port`.
+    pub streaming_port: u16,
     pub kubernetes_service_host: String,
+    pub container_runtime_endpoint: String,
+    pub image_service_endpoint: String,
 }
 
 impl Default for KubeletConfig {
@@ -35,7 +44,10 @@ impl Default for KubeletConfig {
             network: "rusternetes-network".to_string(),
             sync_interval: 3,
             metrics_port: 10250,
+            streaming_port: 10251,
             kubernetes_service_host: "127.0.0.1".to_string(),
+            container_runtime_endpoint: config::DEFAULT_CONTAINER_RUNTIME_ENDPOINT.to_string(),
+            image_service_endpoint: config::DEFAULT_CONTAINER_RUNTIME_ENDPOINT.to_string(),
         }
     }
 }
@@ -84,6 +96,8 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
         metrics_bind_port: Some(config.metrics_port),
         log_level: Some("info".to_string()),
         cluster_service_cidr: None,
+        container_runtime_endpoint: Some(config.container_runtime_endpoint.clone()),
+        image_service_endpoint: Some(config.image_service_endpoint.clone()),
     };
     let kubelet_config = Arc::new(kubelet_config);
     let kubelet_config_clone = kubelet_config.clone();
@@ -94,6 +108,24 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
         metrics_addr
     );
 
+    let cri_client = cri::CriClient::new(
+        &config.container_runtime_endpoint,
+        &config.image_service_endpoint,
+    );
+
+    // Streaming server (exec/attach/portForward SPDY) on its own port; it also
+    // proxies plain HTTP (e.g. /containerLogs) to the HTTP API on metrics_port.
+    let streaming_cri = cri_client.clone();
+    let streaming_port = config.streaming_port;
+    let http_forward_port = config.metrics_port;
+    tokio::spawn(async move {
+        if let Err(e) =
+            streaming_server::start(streaming_cri, streaming_port, http_forward_port).await
+        {
+            tracing::error!("streaming server failed: {:#}", e);
+        }
+    });
+
     tokio::spawn(async move {
         use axum::{routing::get, Json, Router};
         let app = Router::new()
@@ -101,7 +133,8 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
             .route(
                 "/configz",
                 get(|| async move { Json(kubelet_config_clone.as_ref().clone()) }),
-            );
+            )
+            .merge(server::router(cri_client));
         let listener = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
         axum::serve(listener, app).await.unwrap();
     });
@@ -116,6 +149,9 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
             config.cluster_domain,
             config.network,
             config.kubernetes_service_host,
+            config.container_runtime_endpoint,
+            config.streaming_port,
+            config.image_service_endpoint,
         )
         .await?,
     );

@@ -327,6 +327,29 @@ pub fn find_duplicate_json_key_public(json_str: &str) -> Option<String> {
     find_duplicate_json_key(json_str)
 }
 
+/// True for values a known optional field legitimately drops from the canonical
+/// (re-serialized) form via `skip_serializing_if`: JSON null (→ `None`), empty
+/// string / array / object (→ empty containers), and boolean `false`. Such a
+/// field present in the request but absent from the canonical form is not an
+/// unknown field.
+///
+/// `false` is included because several standard CRD `JSONSchemaProps` booleans
+/// (`exclusiveMaximum`, `exclusiveMinimum`, `uniqueItems`, `nullable`) serialize
+/// with `skip_false_or_none`, which drops `Some(false)` — matching upstream
+/// omitempty. Without this, a client sending `exclusiveMaximum: false` (as the
+/// conformance CRD fixtures do) would have it spuriously flagged as an unknown
+/// field and the CRD rejected with a strict-decoding error.
+fn is_droppable_empty(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(s) => s.is_empty(),
+        serde_json::Value::Array(a) => a.is_empty(),
+        serde_json::Value::Object(o) => o.is_empty(),
+        serde_json::Value::Bool(b) => !b,
+        _ => false,
+    }
+}
+
 /// Recursively find fields in `original` that are not present in `canonical`.
 /// Returns a list of dotted field paths for unknown fields.
 fn find_unknown_fields_recursive(
@@ -346,7 +369,18 @@ fn find_unknown_fields_recursive(
                 if let Some(canon_val) = canon_map.get(key) {
                     // Recurse into nested objects
                     find_unknown_fields_recursive(orig_val, canon_val, &field_path, unknown);
-                } else {
+                } else if !is_droppable_empty(orig_val) {
+                    // A field present in the request but absent after canonical
+                    // re-serialization is normally "unknown". But a *known*
+                    // optional field whose value is empty (`null`, `""`, `[]`,
+                    // `{}`) deserializes to None / an empty container and is then
+                    // dropped by `skip_serializing_if`, so it legitimately
+                    // vanishes from the canonical form. Common real traffic:
+                    // `metadata.creationTimestamp: null` and `metadata.uid: ""`,
+                    // which client-go (kubectl, sonobuoy, controllers) emits —
+                    // flagging them would reject essentially all requests.
+                    // Genuine unknown fields in the conformance strict-decode
+                    // tests always carry a non-empty value, so this stays sound.
                     unknown.push(field_path);
                 }
             }
@@ -758,6 +792,43 @@ mod tests {
             "default rejection should match strict decoder format: {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn test_strict_validation_allows_null_optional_fields() {
+        // Regression: client-go always serializes `metadata.creationTimestamp`
+        // as JSON `null`. Such a field deserializes to `None` and is dropped by
+        // `skip_serializing_if`, so it is absent from the canonical re-serialized
+        // form. The strict validator must NOT flag a null-valued original field
+        // as unknown, otherwise every client-go write (kubectl, sonobuoy, the
+        // controllers) is rejected with a 400.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Meta {
+            name: String,
+            #[serde(rename = "creationTimestamp", skip_serializing_if = "Option::is_none")]
+            creation_timestamp: Option<String>,
+        }
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Obj {
+            metadata: Meta,
+        }
+
+        let body = br#"{"metadata": {"name": "x", "creationTimestamp": null}}"#;
+        let parsed = Obj {
+            metadata: Meta {
+                name: "x".to_string(),
+                creation_timestamp: None,
+            },
+        };
+        let params = HashMap::new(); // default: Strict
+
+        let result = validate_strict_fields(&params, body, &parsed);
+        assert!(
+            result.is_ok(),
+            "null-valued known optional field must not be rejected: {:?}",
+            result.err()
+        );
+        assert!(result.unwrap().is_empty(), "no warnings expected either");
     }
 
     #[test]

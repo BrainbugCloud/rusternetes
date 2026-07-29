@@ -194,7 +194,18 @@ pub fn apply_deployment_defaults(deploy: &mut rusternetes_common::resources::Dep
 /// Apply StatefulSet-specific defaults.
 /// Matches SetDefaults_StatefulSet from pkg/apis/apps/v1/defaults.go
 pub fn apply_statefulset_defaults(ss: &mut rusternetes_common::resources::StatefulSet) {
-    if ss.spec.pod_management_policy.is_none() {
+    // Default when empty-or-absent: the Kubernetes protobuf client marshals an
+    // unset podManagementPolicy as "" (not omitted), so `is_none()` alone would
+    // leave it as Some("") — which the controller reads as "not OrderedReady" and
+    // silently switches to Parallel scaling (creating all replicas at once
+    // instead of gating each on the previous pod's readiness).
+    if ss
+        .spec
+        .pod_management_policy
+        .as_deref()
+        .unwrap_or("")
+        .is_empty()
+    {
         ss.spec.pod_management_policy = Some("OrderedReady".to_string());
     }
     if ss.spec.update_strategy.is_none() {
@@ -206,7 +217,8 @@ pub fn apply_statefulset_defaults(ss: &mut rusternetes_common::resources::Statef
             }),
         });
     } else if let Some(ref mut strategy) = ss.spec.update_strategy {
-        if strategy.strategy_type.is_none() {
+        // Same Some("") caveat as podManagementPolicy: default an empty type too.
+        if strategy.strategy_type.as_deref().unwrap_or("").is_empty() {
             strategy.strategy_type = Some("RollingUpdate".to_string());
         }
         if strategy.strategy_type.as_deref() == Some("RollingUpdate") {

@@ -126,6 +126,15 @@ pub async fn proxy_node(
     let suffix = extract_proxy_suffix(original_uri.path(), "nodes");
     info!("Proxying request to node: {}, path: /{}", node_name, suffix);
 
+    // K8s allows `nodes/{name}:{port}/proxy` — split off an explicit port.
+    let (node_name, port_override) = match node_name.rsplit_once(':') {
+        Some((name, port)) => match port.parse::<i32>() {
+            Ok(p) => (name.to_string(), Some(p)),
+            Err(_) => (node_name, None),
+        },
+        None => (node_name, None),
+    };
+
     // Check authorization - requires permission to proxy to nodes.
     // Verb derives from the HTTP method (matches K8s RBAC semantics).
     let verb = http_method_to_verb(&method);
@@ -160,10 +169,21 @@ pub async fn proxy_node(
             rusternetes_common::Error::NotFound(format!("No address found for node {}", node_name))
         })?;
 
-    // Build target URL (kubelet typically runs on port 10250).
+    // Build target URL. Port: explicit `{name}:{port}` reference wins, then
+    // the node's published kubelet daemon endpoint, then 10250. The kubelet
+    // serves plain HTTP.
+    let kubelet_port = port_override
+        .or_else(|| {
+            node.status
+                .as_ref()
+                .and_then(|s| s.daemon_endpoints.as_ref())
+                .and_then(|d| d.kubelet_endpoint.as_ref())
+                .map(|k| k.port)
+                .filter(|p| *p > 0)
+        })
+        .unwrap_or(10250);
     // Preserve the original suffix verbatim, including any trailing slash.
-    let kubelet_port = 10250;
-    let target_url = format!("https://{}:{}/{}", node_address, kubelet_port, suffix);
+    let target_url = format!("http://{}:{}/{}", node_address, kubelet_port, suffix);
 
     // Forward the request to the kubelet, including the original query string.
     proxy_request(target_url, &original_uri, method, headers, body).await

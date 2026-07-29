@@ -127,8 +127,11 @@ pub async fn create_crd(
     crd.metadata.ensure_uid();
     crd.metadata.ensure_creation_timestamp();
 
-    // Initialize status with Established and NamesAccepted conditions
-    if crd.status.is_none() {
+    // Status is server-managed: always (re)initialize it on create with the
+    // Established/NamesAccepted conditions, overwriting any client-sent status
+    // (protobuf clients send an empty `status.acceptedNames{}`, which must not
+    // be persisted verbatim).
+    {
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         crd.status = Some(
             rusternetes_common::resources::CustomResourceDefinitionStatus {
@@ -1415,5 +1418,143 @@ mod tests {
             .filter_map(|v| v.as_str())
             .collect();
         assert_eq!(stored, vec!["v1"], "storedVersions must not duplicate");
+    }
+
+    // Protobuf encoding helpers for the round-trip test below.
+    fn pb_varint(mut n: u64) -> Vec<u8> {
+        let mut b = Vec::new();
+        loop {
+            let mut byte = (n & 0x7f) as u8;
+            n >>= 7;
+            if n != 0 {
+                byte |= 0x80;
+            }
+            b.push(byte);
+            if n == 0 {
+                break;
+            }
+        }
+        b
+    }
+    fn pb_ld(field: u64, payload: &[u8]) -> Vec<u8> {
+        let mut b = pb_varint((field << 3) | 2);
+        b.extend(pb_varint(payload.len() as u64));
+        b.extend_from_slice(payload);
+        b
+    }
+    fn pb_s(field: u64, v: &str) -> Vec<u8> {
+        pb_ld(field, v.as_bytes())
+    }
+    fn pb_v(field: u64, v: u64) -> Vec<u8> {
+        let mut b = pb_varint(field << 3);
+        b.extend(pb_varint(v));
+        b
+    }
+
+    #[test]
+    fn test_protobuf_crd_message_shaped_schema_deserializes() {
+        // Reproduction for `missing field plural` on protobuf CRD creates that
+        // carry a real openAPIV3Schema. The registry emits JSONSchemaProps'
+        // custom-marshaled fields (items = JSONSchemaPropsOrArray{schema},
+        // additionalProperties = JSONSchemaPropsOrBool{allows}) in their raw
+        // MESSAGE shape, whereas the Rust structs expect real k8s JSON. Verify
+        // the decoded CRD still deserializes into the typed struct.
+        use rusternetes_common::resources::CustomResourceDefinition;
+
+        // inner property schema: type=string
+        let str_schema = pb_s(5, "string");
+        // items = JSONSchemaPropsOrArray { schema(1) = <str_schema> }
+        let items = pb_ld(1, &str_schema);
+        // additionalProperties = JSONSchemaPropsOrBool { allows(1) = false }
+        let addprops = pb_v(1, 0);
+        // property "arr": type=array(5), items(24)
+        let mut arr_prop = Vec::new();
+        arr_prop.extend(pb_s(5, "array"));
+        arr_prop.extend(pb_ld(24, &items));
+        // property "m": type=object(5), additionalProperties(30)
+        let mut m_prop = Vec::new();
+        m_prop.extend(pb_s(5, "object"));
+        m_prop.extend(pb_ld(30, &addprops));
+        // properties map entries (field 29): key(1)/value(2)
+        let mut e_arr = Vec::new();
+        e_arr.extend(pb_s(1, "arr"));
+        e_arr.extend(pb_ld(2, &arr_prop));
+        let mut e_m = Vec::new();
+        e_m.extend(pb_s(1, "m"));
+        e_m.extend(pb_ld(2, &m_prop));
+        // root openAPIV3Schema: exclusiveMaximum(10)=false, exclusiveMinimum(12)=false,
+        // nullable(37)=false, xKubernetesEmbeddedResource(39)=true,
+        // xKubernetesPreserveUnknownFields(38)=true, type(5)=object, properties(29) x2
+        let mut root = Vec::new();
+        root.extend(pb_v(10, 0));
+        root.extend(pb_v(12, 0));
+        root.extend(pb_v(37, 0));
+        root.extend(pb_v(38, 1));
+        root.extend(pb_v(39, 1));
+        root.extend(pb_s(5, "object"));
+        root.extend(pb_ld(29, &e_arr));
+        root.extend(pb_ld(29, &e_m));
+        // CustomResourceValidation { openAPIV3Schema(1) }
+        let validation = pb_ld(1, &root);
+        // version: name(1), served(2), storage(3), schema(4)
+        let mut version = Vec::new();
+        version.extend(pb_s(1, "v1"));
+        version.extend(pb_v(2, 1));
+        version.extend(pb_v(3, 1));
+        version.extend(pb_ld(4, &validation));
+        // names: plural(1), singular(2), kind(4), listKind(5)
+        let mut names = Vec::new();
+        names.extend(pb_s(1, "foos"));
+        names.extend(pb_s(2, "foo"));
+        names.extend(pb_s(4, "Foo"));
+        names.extend(pb_s(5, "FooList"));
+        // spec: group(1), names(3), scope(4), versions(7)
+        let mut spec = Vec::new();
+        spec.extend(pb_s(1, "example.com"));
+        spec.extend(pb_ld(3, &names));
+        spec.extend(pb_s(4, "Namespaced"));
+        spec.extend(pb_ld(7, &version));
+        // status(3) with an EMPTY acceptedNames(2) — the exact conformance
+        // failure: gogo marshals status.acceptedNames.plural as "" (omitted on
+        // decode), yielding acceptedNames:{} which must still deserialize.
+        let accepted_names = pb_s(1, ""); // plural="" → omitted → {}
+        let status = pb_ld(2, &accepted_names);
+        // CRD object: metadata(1){name}, spec(2), status(3)
+        let metadata = pb_s(1, "foos.example.com");
+        let mut crd = Vec::new();
+        crd.extend(pb_ld(1, &metadata));
+        crd.extend(pb_ld(2, &spec));
+        crd.extend(pb_ld(3, &status));
+        // k8s\0 envelope: TypeMeta(1){apiVersion,kind}, raw(2)
+        let mut type_meta = Vec::new();
+        type_meta.extend(pb_s(1, "apiextensions.k8s.io/v1"));
+        type_meta.extend(pb_s(2, "CustomResourceDefinition"));
+        let mut env = Vec::new();
+        env.extend_from_slice(b"k8s\0");
+        env.extend(pb_ld(1, &type_meta));
+        env.extend(pb_ld(2, &crd));
+
+        let registry = k8s_proto::ProtoRegistry::new();
+        let json = registry
+            .decode_k8s_resource(&env)
+            .expect("registry should decode CRD");
+        let json_str = String::from_utf8_lossy(&json);
+        let r: std::result::Result<CustomResourceDefinition, _> = serde_json::from_slice(&json);
+        assert!(
+            r.is_ok(),
+            "CRD deserialize failed: {}\ndecoded JSON = {}",
+            r.err().unwrap(),
+            json_str
+        );
+        // Fidelity: the x-kubernetes-* fields must decode under their dashed JSON
+        // keys (not protoc's camelCase), or the typed struct silently drops them.
+        assert!(
+            json_str.contains("x-kubernetes-embedded-resource"),
+            "x-kubernetes-embedded-resource key missing (json_name override not applied): {json_str}"
+        );
+        assert!(
+            !json_str.contains("xKubernetesEmbeddedResource"),
+            "camelCase xKubernetesEmbeddedResource leaked into decoded JSON: {json_str}"
+        );
     }
 }

@@ -1,0 +1,30 @@
+[package]
+name = "k8s-proto"
+version = "0.1.0"
+edition = "2021"
+authors = ["Rusternetes Contributors"]
+license = "Apache-2.0"
+description = "Generic Kubernetes API protobuf (application/vnd.kubernetes.protobuf) to JSON decoder, with a schema registry generated from the upstream k8s.io/api .proto descriptors."
+repository = "https://github.com/rusternetes/rusternetes"
+keywords = ["kubernetes", "protobuf", "decoder", "api"]
+categories = ["api-bindings", "encoding"]
+
+# NOTE: this crate must not depend on any rusternetes-* crate — it is a leaf
+# decoder shared by the api-server. Keep it dependency-light.
+
+[dependencies]
+serde_json = { workspace = true }
+tracing = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+
+[build-dependencies]
+prost = { workspace = true }
+prost-types = { workspace = true }
+
+[dev-dependencies]
+serde = { workspace = true }
+# Test-only: the e2e-pod test deserializes decoded JSON into the real Pod
+# struct. Dev-dep, so it creates no dependency cycle (common does not depend
+# on k8s-proto).
+rusternetes-common = { path = "../common" }

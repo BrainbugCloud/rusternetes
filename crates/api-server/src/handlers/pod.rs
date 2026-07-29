@@ -20,6 +20,32 @@ use rusternetes_storage::{build_key, build_prefix, Storage};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+/// Normalize a pod's `status.phase` on CREATE so it is always `Pending`
+/// unless the pod is already in a concrete phase.
+///
+/// Treats both "no phase" and an explicit `Unknown` phase as "unset". Some
+/// clients (notably the e2e protobuf-based pod client) send
+/// `status: { phase: "" }` on CREATE; the empty string deserializes to
+/// `Some(Phase::Unknown)` via the `#[serde(alias = "")]` on `Phase::Unknown`.
+/// If left as `Unknown`, the pod is stored with `phase=Unknown`, and the
+/// scheduler's pod-selection filter (which considers `None | Pending`) never
+/// schedules it — leaving the pod permanently unscheduled. Defaulting
+/// `Unknown -> Pending` mirrors upstream Kubernetes, which always assigns the
+/// phase server-side on create.
+fn default_pod_phase_to_pending(pod: &mut Pod) {
+    let phase_needs_default = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.phase.as_ref())
+        .map(|p| *p == rusternetes_common::types::Phase::Unknown)
+        .unwrap_or(true);
+    if phase_needs_default {
+        let mut status = pod.status.take().unwrap_or_default();
+        status.phase = Some(rusternetes_common::types::Phase::Pending);
+        pod.status = Some(status);
+    }
+}
+
 pub async fn create(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -43,9 +69,6 @@ pub async fn create(
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("duplicate field") {
-                // Re-parse via Value (lenient — takes last duplicate) so the
-                // strict-decode error path can synthesize a parity-shaped
-                // message that names every duplicate.
                 let value: serde_json::Value = serde_json::from_slice(&body).map_err(|e2| {
                     rusternetes_common::Error::BadRequest(format!("failed to decode: {}", e2))
                 })?;
@@ -566,12 +589,8 @@ pub async fn create(
         }
     }
 
-    // Set initial status to Pending (Kubernetes always sets this on creation)
-    if pod.status.is_none() || pod.status.as_ref().and_then(|s| s.phase.as_ref()).is_none() {
-        let mut status = pod.status.take().unwrap_or_default();
-        status.phase = Some(rusternetes_common::types::Phase::Pending);
-        pod.status = Some(status);
-    }
+    // Set initial status to Pending (Kubernetes always sets this on creation).
+    default_pod_phase_to_pending(&mut pod);
 
     // Compute and set QoS class
     {
@@ -681,13 +700,106 @@ pub async fn get(
     Ok(Json(pod))
 }
 
+/// Recursively remove "empty" values (null, "", [], {}) from a JSON value:
+/// object keys whose value is empty are dropped; arrays keep their elements but
+/// each is normalized. Pruning runs bottom-up, so an object that becomes empty
+/// after its own children are pruned is itself dropped by its parent.
+///
+/// Used to make the pod-update immutability compare tolerant of the
+/// absent-vs-`Some("")` asymmetry between a stored spec (unset optionals omitted)
+/// and a protobuf-decoded update body (unset optional strings arrive as ""). Only
+/// equates empty-with-absent — a non-empty value on either side is preserved, so
+/// a genuine immutable-field change is still detected.
+fn drop_empty_values(v: &mut serde_json::Value) {
+    use serde_json::Value;
+    fn is_empty(v: &Value) -> bool {
+        match v {
+            Value::Null => true,
+            Value::String(s) => s.is_empty(),
+            Value::Array(a) => a.is_empty(),
+            Value::Object(o) => o.is_empty(),
+            _ => false,
+        }
+    }
+    match v {
+        Value::Object(map) => {
+            for val in map.values_mut() {
+                drop_empty_values(val);
+            }
+            map.retain(|_, val| !is_empty(val));
+        }
+        Value::Array(arr) => {
+            for elem in arr.iter_mut() {
+                drop_empty_values(elem);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Diagnostic: collect dotted paths where two JSON values differ, with a compact
+/// rendering of the old/new value at each leaf. Used to explain a pod-update
+/// immutability rejection (genuine change vs. round-trip/defaulting asymmetry).
+/// Bounded by `budget` to keep the log line small.
+fn collect_json_diffs(
+    old: &serde_json::Value,
+    new: &serde_json::Value,
+    path: &str,
+    out: &mut Vec<String>,
+    budget: usize,
+) {
+    use serde_json::Value;
+    if out.len() >= budget {
+        return;
+    }
+    match (old, new) {
+        (Value::Object(o), Value::Object(n)) => {
+            let mut keys: std::collections::BTreeSet<&String> = o.keys().collect();
+            keys.extend(n.keys());
+            for k in keys {
+                let child = format!("{path}.{k}");
+                match (o.get(k), n.get(k)) {
+                    (Some(a), Some(b)) => collect_json_diffs(a, b, &child, out, budget),
+                    (Some(a), None) => out.push(format!("{child} removed (was {a})")),
+                    (None, Some(b)) => out.push(format!("{child} added ({b})")),
+                    (None, None) => {}
+                }
+                if out.len() >= budget {
+                    return;
+                }
+            }
+        }
+        (Value::Array(a), Value::Array(b)) => {
+            if a.len() != b.len() {
+                out.push(format!("{path} array len {} -> {}", a.len(), b.len()));
+                return;
+            }
+            for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                collect_json_diffs(x, y, &format!("{path}[{i}]"), out, budget);
+                if out.len() >= budget {
+                    return;
+                }
+            }
+        }
+        _ => {
+            if old != new {
+                out.push(format!("{path}: {old} -> {new}"));
+            }
+        }
+    }
+}
+
 pub async fn update(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((namespace, name)): Path<(String, String)>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     body: Bytes,
 ) -> Result<Json<Pod>> {
+    // The resize subresource shares this handler; on that path resource changes
+    // to spec.containers[*].resources are permitted (rejected everywhere else).
+    let is_resize = uri.path().ends_with("/resize");
     // Parse the body manually for better error handling — axum's Json extractor
     // returns 422 Unprocessable Entity on failure, but Kubernetes expects a proper
     // Status object. Manual parsing also tolerates unknown fields gracefully.
@@ -759,6 +871,11 @@ pub async fn update(
         for (i, c) in munged.containers.iter_mut().enumerate() {
             if i < old_spec.containers.len() {
                 c.image = old_spec.containers[i].image.clone();
+                // On the resize subresource, mask resources so the change is
+                // allowed (the real write still carries the new values).
+                if is_resize {
+                    c.resources = old_spec.containers[i].resources.clone();
+                }
             }
         }
         if let (Some(old_init), Some(new_init)) =
@@ -767,6 +884,9 @@ pub async fn update(
             for (i, c) in new_init.iter_mut().enumerate() {
                 if i < old_init.len() {
                     c.image = old_init[i].image.clone();
+                    if is_resize {
+                        c.resources = old_init[i].resources.clone();
+                    }
                 }
             }
         }
@@ -776,10 +896,34 @@ pub async fn update(
         munged.tolerations = old_spec.tolerations.clone();
         munged.scheduling_gates = old_spec.scheduling_gates.clone();
 
-        // Compare: if munged spec != old spec, immutable fields were changed
-        let munged_json = serde_json::to_value(&munged).unwrap_or_default();
-        let old_json = serde_json::to_value(old_spec).unwrap_or_default();
+        // Compare: if munged spec != old spec, immutable fields were changed.
+        //
+        // Normalize away empty values (null / "" / [] / {}) on both sides first.
+        // The stored old_spec was serialized with `skip_serializing_if`, so its
+        // unset optionals are absent; but an update body decoded from the
+        // Kubernetes protobuf client carries unset optional strings as Some("")
+        // (e.g. volumeMounts[].subPath/subPathExpr, serviceAccountToken.audience),
+        // which would otherwise show up as spuriously "added" fields and reject a
+        // valid update. Stripping empties equates absent-with-empty (semantically
+        // identical) while still catching genuine changes: any non-empty value
+        // difference survives normalization and is still rejected.
+        let mut munged_json = serde_json::to_value(&munged).unwrap_or_default();
+        let mut old_json = serde_json::to_value(old_spec).unwrap_or_default();
+        drop_empty_values(&mut munged_json);
+        drop_empty_values(&mut old_json);
         if munged_json != old_json {
+            // DIAGNOSTIC: log the exact differing spec paths (old vs new) so we can
+            // tell a genuine immutable-field change from a round-trip/defaulting
+            // asymmetry that spuriously trips this exact-equality compare.
+            let mut diffs = Vec::new();
+            collect_json_diffs(&old_json, &munged_json, "spec", &mut diffs, 20);
+            warn!(
+                "pod update immutability rejection for {}/{}: {} differing spec path(s): {}",
+                namespace,
+                name,
+                diffs.len(),
+                diffs.join("; ")
+            );
             return Err(rusternetes_common::Error::InvalidResource(
                 "pod updates may not change fields other than `spec.containers[*].image`, `spec.initContainers[*].image`, `spec.activeDeadlineSeconds`, `spec.terminationGracePeriodSeconds`, `spec.tolerations`, `spec.schedulingGates`".to_string(),
             ));
@@ -1607,6 +1751,39 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    #[test]
+    fn test_drop_empty_values_equates_absent_and_empty() {
+        // A protobuf-decoded update carries unset optional strings as "" while the
+        // stored spec omits them; after normalization the two must be equal.
+        let mut from_protobuf = serde_json::json!({
+            "containers": [{
+                "name": "c",
+                "volumeMounts": [{"name": "v", "mountPath": "/x", "subPath": "", "subPathExpr": ""}]
+            }],
+            "volumes": [{"projected": {"sources": [{"serviceAccountToken": {"audience": ""}}]}}]
+        });
+        let mut stored = serde_json::json!({
+            "containers": [{
+                "name": "c",
+                "volumeMounts": [{"name": "v", "mountPath": "/x"}]
+            }],
+            "volumes": [{"projected": {"sources": [{"serviceAccountToken": {}}]}}]
+        });
+        drop_empty_values(&mut from_protobuf);
+        drop_empty_values(&mut stored);
+        assert_eq!(from_protobuf, stored, "absent and empty-string must normalize equal");
+    }
+
+    #[test]
+    fn test_drop_empty_values_keeps_genuine_change() {
+        // A real immutable-field change (non-empty value) must survive normalization.
+        let mut a = serde_json::json!({"containers": [{"name": "c", "subPath": "old"}]});
+        let mut b = serde_json::json!({"containers": [{"name": "c", "subPath": "new"}]});
+        drop_empty_values(&mut a);
+        drop_empty_values(&mut b);
+        assert_ne!(a, b, "a genuine value change must remain a difference");
+    }
+
     fn make_container_with_resources(
         name: &str,
         cpu_limit: Option<&str>,
@@ -1658,6 +1835,78 @@ mod tests {
         });
 
         serde_json::from_value(json).unwrap()
+    }
+
+    use rusternetes_common::types::Phase;
+
+    #[test]
+    fn test_empty_status_phase_deserializes_to_unknown() {
+        // Documents the wire behavior that motivates the defaulting fix:
+        // a client sending `status: { phase: "" }` (e.g. the e2e protobuf pod
+        // client) deserializes to Some(Phase::Unknown), not None.
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "p", "namespace": "default" },
+            "spec": { "containers": [{ "name": "c", "image": "nginx" }] },
+            "status": { "phase": "" },
+        }))
+        .unwrap();
+        assert_eq!(
+            pod.status.and_then(|s| s.phase),
+            Some(Phase::Unknown),
+            "empty phase string should deserialize to Unknown via serde alias"
+        );
+    }
+
+    #[test]
+    fn test_default_phase_empty_string_becomes_pending() {
+        // The actual regression: a pod created with status.phase == "" must be
+        // normalized to Pending so the scheduler's phase filter can see it.
+        let mut pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "p", "namespace": "default" },
+            "spec": { "containers": [{ "name": "c", "image": "nginx" }] },
+            "status": { "phase": "" },
+        }))
+        .unwrap();
+        default_pod_phase_to_pending(&mut pod);
+        assert_eq!(pod.status.and_then(|s| s.phase), Some(Phase::Pending));
+    }
+
+    #[test]
+    fn test_default_phase_no_status_becomes_pending() {
+        let mut pod =
+            make_pod_with_containers("p", vec![make_container_with_resources("c", None, None)]);
+        pod.status = None;
+        default_pod_phase_to_pending(&mut pod);
+        assert_eq!(pod.status.and_then(|s| s.phase), Some(Phase::Pending));
+    }
+
+    #[test]
+    fn test_default_phase_explicit_unknown_becomes_pending() {
+        let mut pod =
+            make_pod_with_containers("p", vec![make_container_with_resources("c", None, None)]);
+        pod.status = Some(rusternetes_common::resources::PodStatus {
+            phase: Some(Phase::Unknown),
+            ..Default::default()
+        });
+        default_pod_phase_to_pending(&mut pod);
+        assert_eq!(pod.status.and_then(|s| s.phase), Some(Phase::Pending));
+    }
+
+    #[test]
+    fn test_default_phase_preserves_concrete_phase() {
+        // A pod already in a real phase (e.g. Running) must not be reset.
+        let mut pod =
+            make_pod_with_containers("p", vec![make_container_with_resources("c", None, None)]);
+        pod.status = Some(rusternetes_common::resources::PodStatus {
+            phase: Some(Phase::Running),
+            ..Default::default()
+        });
+        default_pod_phase_to_pending(&mut pod);
+        assert_eq!(pod.status.and_then(|s| s.phase), Some(Phase::Running));
     }
 
     #[test]

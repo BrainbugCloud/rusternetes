@@ -45,6 +45,7 @@ pub struct Kubelet {
     storage: Arc<StorageBackend>,
     runtime: Arc<ContainerRuntime>,
     sync_interval: Duration,
+    streaming_port: u16,
     eviction_manager: Mutex<EvictionManager>,
     /// Per-pod worker state. K8s uses a goroutine per pod; we track state
     /// per-UID and dispatch in the sync loop.
@@ -89,6 +90,9 @@ impl Kubelet {
         cluster_domain: String,
         network: String,
         kubernetes_service_host: String,
+        container_runtime_endpoint: String,
+        streaming_port: u16,
+        image_service_endpoint: String,
     ) -> Result<Self> {
         let runtime = ContainerRuntime::new(
             volume_dir,
@@ -96,6 +100,8 @@ impl Kubelet {
             cluster_domain,
             network,
             kubernetes_service_host,
+            container_runtime_endpoint,
+            image_service_endpoint,
         )
         .await?
         .with_storage(storage.clone());
@@ -105,6 +111,7 @@ impl Kubelet {
             storage,
             runtime: Arc::new(runtime),
             sync_interval: Duration::from_secs(sync_interval_secs),
+            streaming_port,
             eviction_manager: Mutex::new(EvictionManager::new()),
             pod_states: Mutex::new(HashMap::new()),
             pod_sync_locks: Mutex::new(HashSet::new()),
@@ -180,17 +187,23 @@ impl Kubelet {
                                         let assigned_node =
                                             pod.pointer("/spec/nodeName").and_then(|v| v.as_str());
                                         if assigned_node == Some(&node_name) {
-                                            // Cache the pod spec so orphan cleanup can run preStop hooks
+                                            // Cache the pod spec so orphan cleanup can run preStop hooks.
+                                            // Key by `{namespace}/{name}` — pod names are only
+                                            // unique within a namespace.
                                             if let Some(pod_name) = pod
                                                 .pointer("/metadata/name")
                                                 .and_then(|v| v.as_str())
                                             {
+                                                let pod_ns = pod
+                                                    .pointer("/metadata/namespace")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("default");
                                                 let cached_pod =
                                                     serde_json::from_value::<Pod>(pod.clone()).ok();
-                                                recently_deleted_clone
-                                                    .lock()
-                                                    .unwrap()
-                                                    .insert(pod_name.to_string(), cached_pod);
+                                                recently_deleted_clone.lock().unwrap().insert(
+                                                    format!("{}/{}", pod_ns, pod_name),
+                                                    cached_pod,
+                                                );
                                             }
                                             let _ = watch_tx_clone.try_send(key);
                                         }
@@ -320,16 +333,21 @@ impl Kubelet {
             tokio::select! {
                 // Watch-triggered: a specific pod changed, signal its per-pod worker
                 Some(key) = watch_rx.recv() => {
-                    // Extract pod name and namespace from key
-                    // Key format: /registry/pods/{namespace}/{name}
+                    // Extract namespace and pod name from key.
+                    // Key format: /registry/pods/{namespace}/{name}. The last two
+                    // segments identify the pod; the name alone is not unique across
+                    // namespaces, so workers are keyed by `{namespace}/{name}`.
                     let parts: Vec<&str> = key.split('/').collect();
-                    let pod_name = parts.last().unwrap_or(&"").to_string();
-                    if pod_name.is_empty() { continue; }
+                    let (namespace, pod_name) = match parts.as_slice() {
+                        [.., ns, name] if !name.is_empty() => (ns.to_string(), name.to_string()),
+                        _ => continue,
+                    };
+                    let worker_key = format!("{}/{}", namespace, pod_name);
 
                     // Signal the per-pod worker if one exists
                     let has_worker = {
                         let workers = self.pod_workers.lock().unwrap();
-                        if let Some(tx) = workers.get(&pod_name) {
+                        if let Some(tx) = workers.get(&worker_key) {
                             let _ = tx.try_send(());
                             true
                         } else {
@@ -339,7 +357,7 @@ impl Kubelet {
 
                     // If no worker exists, start one
                     if !has_worker {
-                        self.ensure_pod_worker(&pod_name).await;
+                        self.ensure_pod_worker(&namespace, &pod_name).await;
                     }
                 }
                 // Periodic full sync as safety net
@@ -419,7 +437,7 @@ impl Kubelet {
             addresses: Some(vec![
                 NodeAddress {
                     address_type: "InternalIP".to_string(),
-                    address: Self::detect_internal_ip(),
+                    address: Self::node_host_ip(),
                 },
                 NodeAddress {
                     address_type: "Hostname".to_string(),
@@ -446,7 +464,7 @@ impl Kubelet {
             // See: pkg/kubelet/kubelet.go:505 — DaemonEndpoints{KubeletEndpoint{Port: kubeCfg.Port}}
             daemon_endpoints: Some(rusternetes_common::resources::NodeDaemonEndpoints {
                 kubelet_endpoint: Some(rusternetes_common::resources::DaemonEndpoint {
-                    port: 10250,
+                    port: i32::from(self.streaming_port),
                 }),
             }),
             config: None,
@@ -478,6 +496,24 @@ impl Kubelet {
     /// In Docker, resolves the container hostname to get the network IP.
     /// Falls back to 127.0.0.1 if detection fails.
     fn detect_internal_ip() -> String {
+        // Primary: ask the kernel which source IP it would use to reach an
+        // external address. A *connected* UDP socket sends no packets —
+        // connect() only records the destination and resolves the route — so
+        // this needs no actual connectivity yet yields the node's primary
+        // non-loopback IPv4 (e.g. eth0's 192.168.x.x). This mirrors how the
+        // real kubelet derives its default node IP, and works where
+        // `hostname -i` returns only a 127.0.0.0/8 address (Debian/Ubuntu,
+        // and the lima conformance VM).
+        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            if sock.connect("8.8.8.8:80").is_ok() {
+                if let Ok(local) = sock.local_addr() {
+                    let ip = local.ip();
+                    if ip.is_ipv4() && !ip.is_loopback() {
+                        return ip.to_string();
+                    }
+                }
+            }
+        }
         // Try to resolve our own hostname to get the Docker network IP
         if let Ok(hostname) = std::env::var("HOSTNAME") {
             if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(hostname.as_str(), 0u16))
@@ -491,14 +527,34 @@ impl Kubelet {
                 }
             }
         }
-        // Fallback: try to find a non-loopback IP from network interfaces
+        // Fallback: `hostname -i` may list several space-separated addresses.
+        // Parse each and take the first non-loopback one. Debian/Ubuntu map the
+        // hostname to 127.0.1.1 in /etc/hosts, so `hostname -i` returns a
+        // 127.0.0.0/8 address that is NOT the literal "127.0.0.1" — rejecting
+        // only that exact string would register a loopback as the node's
+        // InternalIP, and NodePort traffic a pod sends to the node IP would then
+        // hit the pod's own loopback instead of the node.
         if let Ok(output) = std::process::Command::new("hostname").arg("-i").output() {
-            let ip_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !ip_str.is_empty() && ip_str != "127.0.0.1" {
-                return ip_str;
+            let ip_str = String::from_utf8_lossy(&output.stdout);
+            for token in ip_str.split_whitespace() {
+                if let Ok(ip) = token.parse::<std::net::IpAddr>() {
+                    if !ip.is_loopback() {
+                        return ip.to_string();
+                    }
+                }
             }
         }
         "127.0.0.1".to_string()
+    }
+
+    /// The node's InternalIP, detected once and cached for the process
+    /// lifetime. Pod-status HostIP is set from this so it reflects the real
+    /// node address (and matches the registered Node's InternalIP) instead of
+    /// a hardcoded loopback, which broke the downward-API HOST_IP spec and
+    /// showed 127.0.0.1 in every pod status.
+    fn node_host_ip() -> String {
+        static NODE_IP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        NODE_IP.get_or_init(Self::detect_internal_ip).clone()
     }
 
     async fn update_node_status(&self) -> Result<()> {
@@ -587,7 +643,7 @@ impl Kubelet {
         if let Some(ref mut status) = node.status {
             let addresses = status.addresses.get_or_insert_with(Vec::new);
             if addresses.is_empty() {
-                let ip = Self::detect_internal_ip();
+                let ip = Self::node_host_ip();
                 if ip != "127.0.0.1" {
                     addresses.push(rusternetes_common::resources::NodeAddress {
                         address_type: "InternalIP".to_string(),
@@ -792,11 +848,13 @@ impl Kubelet {
         // K8s ref: pkg/kubelet/pod_workers.go — podWorkerLoop (long-lived)
         for pod in &node_pods {
             let pod_name = &pod.metadata.name;
+            let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
+            let worker_key = format!("{}/{}", namespace, pod_name);
 
             // Signal existing worker or create a new one
             let has_worker = {
                 let workers = self.pod_workers.lock().unwrap();
-                if let Some(tx) = workers.get(pod_name.as_str()) {
+                if let Some(tx) = workers.get(&worker_key) {
                     let _ = tx.try_send(());
                     true
                 } else {
@@ -805,18 +863,27 @@ impl Kubelet {
             };
 
             if !has_worker {
-                self.ensure_pod_worker(pod_name).await;
+                self.ensure_pod_worker(namespace, pod_name).await;
             }
         }
 
-        // Clean up workers for pods that are no longer assigned to this node
+        // Clean up workers for pods that are no longer assigned to this node.
+        // Worker keys are `{namespace}/{name}`.
         {
             let worker_names: Vec<String> =
                 self.pod_workers.lock().unwrap().keys().cloned().collect();
-            let pod_names: HashSet<&str> =
-                node_pods.iter().map(|p| p.metadata.name.as_str()).collect();
+            let pod_keys: HashSet<String> = node_pods
+                .iter()
+                .map(|p| {
+                    format!(
+                        "{}/{}",
+                        p.metadata.namespace.as_deref().unwrap_or("default"),
+                        p.metadata.name
+                    )
+                })
+                .collect();
             for name in worker_names {
-                if !pod_names.contains(name.as_str()) {
+                if !pod_keys.contains(&name) {
                     // Pod no longer exists — remove worker (it will shut down on next recv)
                     self.pod_workers.lock().unwrap().remove(&name);
                 }
@@ -876,9 +943,17 @@ impl Kubelet {
         // Error handling is in each spawned task above.
         // This matches K8s podWorkerLoop which runs independently per pod.
 
-        // Clean up orphaned containers using the pod list we already fetched
+        // Clean up orphaned containers using a FRESH pod list, not the stale
+        // snapshot from the start of the sync loop. Pods created during the
+        // sync would otherwise be killed as orphans because their sandboxes
+        // exist but the pod list doesn't include them yet.
+        let fresh_pods: Vec<Pod> = self
+            .storage
+            .list(&all_pods_prefix)
+            .await
+            .unwrap_or_default();
         if let Err(e) = self
-            .cleanup_orphaned_containers(&node_pods, &all_pods)
+            .cleanup_orphaned_containers(&node_pods, &fresh_pods)
             .await
         {
             error!("Error cleaning up orphaned containers: {}", e);
@@ -920,8 +995,17 @@ impl Kubelet {
             }
         };
 
-        let existing_pod_names: std::collections::HashSet<String> =
-            all_pods.iter().map(|p| p.metadata.name.clone()).collect();
+        // Pod identity is `{namespace}/{name}` — names are only unique per namespace.
+        let existing_pod_names: std::collections::HashSet<String> = all_pods
+            .iter()
+            .map(|p| {
+                format!(
+                    "{}/{}",
+                    p.metadata.namespace.as_deref().unwrap_or("default"),
+                    p.metadata.name
+                )
+            })
+            .collect();
 
         // Get all containers from Docker (including exited) so orphan cleanup
         // can remove stopped containers from deleted pods
@@ -934,9 +1018,9 @@ impl Kubelet {
         };
 
         // Find orphans — running in Docker but not in etcd
-        let orphans: Vec<String> = running_pods
+        let orphans: Vec<(String, String)> = running_pods
             .into_iter()
-            .filter(|name| !existing_pod_names.contains(name))
+            .filter(|(ns, name)| !existing_pod_names.contains(&format!("{}/{}", ns, name)))
             .collect();
 
         if orphans.is_empty() {
@@ -953,15 +1037,21 @@ impl Kubelet {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
         let mut handles = Vec::new();
 
-        for orphan in orphans {
+        for (orphan_ns, orphan_name) in orphans {
             let runtime = self.runtime.clone();
             let sem = semaphore.clone();
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await;
-                if let Err(e) = runtime.stop_and_remove_pod(&orphan).await {
-                    warn!("Startup cleanup: failed to remove {}: {}", orphan, e);
+                if let Err(e) = runtime.stop_and_remove_pod(&orphan_ns, &orphan_name).await {
+                    warn!(
+                        "Startup cleanup: failed to remove {}/{}: {}",
+                        orphan_ns, orphan_name, e
+                    );
                 } else {
-                    info!("Startup cleanup: removed stale container {}", orphan);
+                    info!(
+                        "Startup cleanup: removed stale container {}/{}",
+                        orphan_ns, orphan_name
+                    );
                 }
             }));
         }
@@ -985,15 +1075,23 @@ impl Kubelet {
         // (container_gc method), which runs independently every 60 seconds and removes
         // exited containers. This orphan cleanup only handles containers whose pods
         // have been fully removed from etcd.
+        // Pod identity is `{namespace}/{name}` — names are only unique per namespace.
         let existing_pod_names: std::collections::HashSet<String> = all_existing_pods
             .iter()
-            .map(|p| p.metadata.name.clone())
+            .map(|p| {
+                format!(
+                    "{}/{}",
+                    p.metadata.namespace.as_deref().unwrap_or("default"),
+                    p.metadata.name
+                )
+            })
             .collect();
 
         debug!("Found {} pods in etcd", existing_pod_names.len());
 
-        // Get all pod names from the container runtime (including exited)
-        // so orphan cleanup removes stopped containers from deleted pods
+        // Get all pods from the container runtime (including exited) as
+        // `(namespace, name)` so orphan cleanup removes stopped containers from
+        // deleted pods.
         let running_pods = self.runtime.list_all_pods().await?;
         debug!(
             "Found {} running pods in container runtime",
@@ -1007,15 +1105,20 @@ impl Kubelet {
         //
         // IMPORTANT: In a shared Docker daemon, ALL kubelets see ALL containers.
         // We must not kill containers belonging to other nodes' pods.
-        let known_pod_names: std::collections::HashSet<String> = {
-            let states = self.pod_states.lock().unwrap();
-            states.keys().cloned().collect()
+        //
+        // A pod is "still tracked by a worker" iff a per-pod worker exists for
+        // its `{namespace}/{name}` key. (pod_states is keyed by UID, which never
+        // matches a name-based identity, so it can't be used for this check.)
+        let worker_keys: std::collections::HashSet<String> = {
+            let workers = self.pod_workers.lock().unwrap();
+            workers.keys().cloned().collect()
         };
-        for running_pod_name in &running_pods {
-            if existing_pod_names.contains(running_pod_name) {
+        for (running_ns, running_name) in &running_pods {
+            let running_key = format!("{}/{}", running_ns, running_name);
+            if existing_pod_names.contains(&running_key) {
                 continue; // Pod exists in etcd — not an orphan
             }
-            if known_pod_names.contains(running_pod_name) {
+            if worker_keys.contains(&running_key) {
                 continue; // Pod worker is still tracking this pod
             }
             // Fast path: if this pod was explicitly deleted (via watch event),
@@ -1024,7 +1127,7 @@ impl Kubelet {
                 .recently_deleted
                 .lock()
                 .unwrap()
-                .get(running_pod_name)
+                .get(&running_key)
                 .cloned()
                 .flatten();
             let is_recently_deleted = cached_pod.is_some()
@@ -1032,30 +1135,27 @@ impl Kubelet {
                     .recently_deleted
                     .lock()
                     .unwrap()
-                    .contains_key(running_pod_name);
+                    .contains_key(&running_key);
             if !is_recently_deleted {
                 // Check container age — don't kill containers younger than 30s
                 let container_age = self
                     .runtime
-                    .get_container_age(running_pod_name)
+                    .get_container_age(running_ns, running_name)
                     .await
                     .unwrap_or(std::time::Duration::from_secs(0));
                 if container_age < std::time::Duration::from_secs(30) {
                     debug!(
                         "Skipping recently started orphan {} (age {:?})",
-                        running_pod_name, container_age
+                        running_key, container_age
                     );
                     continue;
                 }
             } else {
                 // Remove from tracker — we're about to clean it up
-                self.recently_deleted
-                    .lock()
-                    .unwrap()
-                    .remove(running_pod_name.as_str());
+                self.recently_deleted.lock().unwrap().remove(&running_key);
                 info!(
                     "Fast-path cleanup for explicitly deleted pod {} — skipping grace period",
-                    running_pod_name
+                    running_key
                 );
             }
             // Re-check etcd before cleanup — a new pod with the same name may have
@@ -1067,21 +1167,22 @@ impl Kubelet {
                     .list("/registry/pods/")
                     .await
                     .unwrap_or_default();
-                !fresh_pods
-                    .iter()
-                    .any(|p| p.metadata.name == *running_pod_name)
+                !fresh_pods.iter().any(|p| {
+                    p.metadata.name == *running_name
+                        && p.metadata.namespace.as_deref().unwrap_or("default") == running_ns
+                })
             };
             if !still_orphaned {
                 debug!(
                     "Pod {} was recreated in etcd — skipping cleanup",
-                    running_pod_name
+                    running_key
                 );
                 continue;
             }
 
             info!(
                 "Found orphaned pod {} - not in etcd, stopping and removing containers",
-                running_pod_name
+                running_key
             );
             // Stop orphaned containers. K8s HandlePodCleanups kills orphaned
             // runtime pods with a 1-second grace period. Container removal is
@@ -1095,16 +1196,16 @@ impl Kubelet {
                     .and_then(|s| s.termination_grace_period_seconds)
                     .unwrap_or(1); // K8s uses 1s for orphans
                 if let Err(e) = self.runtime.stop_pod_for(pod, grace).await {
-                    warn!("Failed to stop orphaned pod {}: {}", running_pod_name, e);
+                    warn!("Failed to stop orphaned pod {}: {}", running_key, e);
                 }
             } else {
                 // No cached spec — stop with 1s grace, no preStop hooks
                 if let Err(e) = self
                     .runtime
-                    .stop_pod_with_grace_period(running_pod_name, 1)
+                    .stop_pod_with_grace_period(running_ns, running_name, 1)
                     .await
                 {
-                    warn!("Failed to stop orphaned pod {}: {}", running_pod_name, e);
+                    warn!("Failed to stop orphaned pod {}: {}", running_key, e);
                 }
             }
         }
@@ -1127,13 +1228,20 @@ impl Kubelet {
     async fn container_gc(&self) {
         // Get pod names from etcd to distinguish deleted vs existing pods
         // K8s ref: evictContainers checks allSourcesReady
+        // Pod identity is `{namespace}/{name}` — names are only unique per namespace.
         let existing_pods: HashSet<String> = self
             .storage
             .list::<Pod>("/registry/pods/")
             .await
             .unwrap_or_default()
             .iter()
-            .map(|p| p.metadata.name.clone())
+            .map(|p| {
+                format!(
+                    "{}/{}",
+                    p.metadata.namespace.as_deref().unwrap_or("default"),
+                    p.metadata.name
+                )
+            })
             .collect();
 
         match self
@@ -1163,7 +1271,11 @@ impl Kubelet {
     ///
     /// The worker stays alive until the pod is deleted and cleaned up.
     /// This avoids the full sync_loop on every watch event.
-    async fn ensure_pod_worker(self: &Arc<Self>, pod_name: &str) {
+    async fn ensure_pod_worker(self: &Arc<Self>, namespace: &str, pod_name: &str) {
+        // Workers are keyed by `{namespace}/{name}` — pod names are only unique
+        // within a namespace, so a name-only key would let two same-named pods
+        // in different namespaces share (and clobber) one worker.
+        let worker_key = format!("{}/{}", namespace, pod_name);
         let (tx, mut rx) = mpsc::channel::<()>(4);
 
         // Signal immediately to sync now
@@ -1171,18 +1283,20 @@ impl Kubelet {
 
         {
             let mut workers = self.pod_workers.lock().unwrap();
-            if workers.contains_key(pod_name) {
+            if workers.contains_key(&worker_key) {
                 // Worker already exists — just signal it
-                if let Some(existing_tx) = workers.get(pod_name) {
+                if let Some(existing_tx) = workers.get(&worker_key) {
                     let _ = existing_tx.try_send(());
                 }
                 return;
             }
-            workers.insert(pod_name.to_string(), tx);
+            workers.insert(worker_key.clone(), tx);
         }
 
         let kubelet = Arc::clone(self);
         let name = pod_name.to_string();
+        let ns = namespace.to_string();
+        let worker_key = worker_key.clone();
         let pod_workers = Arc::clone(&self.pod_workers);
         let node_name = self.node_name.clone();
 
@@ -1198,21 +1312,25 @@ impl Kubelet {
 
                 // If channel closed, pod worker is being removed
                 if matches!(signaled, Ok(None)) {
-                    debug!("Pod worker for {} shutting down (channel closed)", name);
+                    debug!(
+                        "Pod worker for {} shutting down (channel closed)",
+                        worker_key
+                    );
                     break;
                 }
 
                 // Drain any additional queued signals
                 while rx.try_recv().is_ok() {}
 
-                // Read the latest pod state from storage by scanning for this pod.
-                // We need to find the namespace since it's not stored in the worker key.
-                // Search all namespaces for this pod name assigned to our node.
+                // Read the latest pod state from storage. Match BOTH namespace and
+                // name (the worker key identity) so a same-named pod in another
+                // namespace is never picked up by this worker.
                 let pod = {
                     let prefix = build_prefix("pods", None);
                     match kubelet.storage.list::<Pod>(&prefix).await {
                         Ok(pods) => pods.into_iter().find(|p| {
                             p.metadata.name == name
+                                && p.metadata.namespace.as_deref().unwrap_or("default") == ns
                                 && p.spec
                                     .as_ref()
                                     .and_then(|s| s.node_name.as_ref())
@@ -1220,7 +1338,7 @@ impl Kubelet {
                                     .unwrap_or(false)
                         }),
                         Err(e) => {
-                            debug!("Pod worker {}: storage error: {}", name, e);
+                            debug!("Pod worker {}: storage error: {}", worker_key, e);
                             continue;
                         }
                     }
@@ -1251,24 +1369,24 @@ impl Kubelet {
                                 {
                                     let _ = kubelet.update_pod_status_error(&pod, &err_str).await;
                                 }
-                                debug!("Pod worker {}: sync error: {}", name, err_str);
+                                debug!("Pod worker {}: sync error: {}", worker_key, err_str);
                             }
                             Err(_) => {
-                                warn!("Pod worker {}: sync timed out", name);
+                                warn!("Pod worker {}: sync timed out", worker_key);
                             }
                         }
                     }
                     None => {
                         // Pod no longer exists for this node — stop the worker
-                        debug!("Pod worker {}: pod not found, shutting down", name);
+                        debug!("Pod worker {}: pod not found, shutting down", worker_key);
                         break;
                     }
                 }
             }
 
             // Clean up worker entry
-            pod_workers.lock().unwrap().remove(&name);
-            debug!("Pod worker for {} removed", name);
+            pod_workers.lock().unwrap().remove(&worker_key);
+            debug!("Pod worker for {} removed", worker_key);
         });
     }
 
@@ -1551,8 +1669,16 @@ impl Kubelet {
                             }
                             let _ = self.storage.update(&key, &failed_pod).await;
                             // Stop the pod
-                            if self.runtime.is_pod_running(pod_name).await.unwrap_or(false) {
-                                let _ = self.runtime.stop_pod_with_grace_period(pod_name, 0).await;
+                            if self
+                                .runtime
+                                .is_pod_running(namespace, pod_name)
+                                .await
+                                .unwrap_or(false)
+                            {
+                                let _ = self
+                                    .runtime
+                                    .stop_pod_with_grace_period(namespace, pod_name, 0)
+                                    .await;
                             }
                             return Ok(());
                         }
@@ -1571,7 +1697,7 @@ impl Kubelet {
         );
         let is_running = match tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            self.runtime.is_pod_running(pod_name),
+            self.runtime.is_pod_running(namespace, pod_name),
         )
         .await
         {
@@ -1737,10 +1863,9 @@ impl Kubelet {
                     // For pods with init containers, use the state machine approach.
                     // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go — computeInitContainerActions
                     // Check if the pause container exists (pod sandbox created).
-                    let pause_name = format!("{}_pause", pod_name);
                     let sandbox_exists = self
                         .runtime
-                        .is_container_running(&pause_name)
+                        .is_sandbox_ready(namespace, pod_name)
                         .await
                         .unwrap_or(false);
 
@@ -1766,7 +1891,10 @@ impl Kubelet {
                                 );
                                 // Remove failed container so it can be recreated
                                 let cname = format!("{}_{}", pod_name, ic.name);
-                                let _ = self.runtime.remove_terminated_container(&cname).await;
+                                let _ = self
+                                    .runtime
+                                    .remove_terminated_container(namespace, &cname)
+                                    .await;
                                 // Update status with CrashLoopBackOff
                                 let init_statuses =
                                     self.runtime.get_init_container_statuses(pod).await;
@@ -1805,9 +1933,9 @@ impl Kubelet {
                                         vols.iter()
                                             .map(|v| {
                                                 let path = format!(
-                                                    "{}/{}/{}",
-                                                    self.runtime.volumes_base_path(),
-                                                    pod_name,
+                                                    "{}/{}",
+                                                    self.runtime
+                                                        .pod_volume_root(namespace, pod_name),
                                                     v.name
                                                 );
                                                 (v.name.clone(), path)
@@ -1818,7 +1946,7 @@ impl Kubelet {
                                 let pod_ip = pod.status.as_ref().and_then(|s| s.pod_ip.as_deref());
                                 if let Err(e) = self
                                     .runtime
-                                    .start_container(pod, ic, &volume_paths, None, None, pod_ip)
+                                    .start_container_for_pod(pod, ic, &volume_paths, None, pod_ip)
                                     .await
                                 {
                                     warn!(
@@ -1891,7 +2019,12 @@ impl Kubelet {
                             // Get container statuses and pod IP
                             let container_statuses =
                                 self.runtime.get_container_statuses(&fresh_pod).await.ok();
-                            let pod_ip = self.runtime.get_pod_ip(pod_name).await.ok().flatten();
+                            let pod_ip = self
+                                .runtime
+                                .get_pod_ip(namespace, pod_name)
+                                .await
+                                .ok()
+                                .flatten();
                             let pod_i_ps = pod_ip.as_ref().map(|ip| vec![PodIP { ip: ip.clone() }]);
 
                             // Write Running status using the fresh resourceVersion
@@ -1923,7 +2056,7 @@ impl Kubelet {
                                 phase: Some(Phase::Running),
                                 message: Some("All containers started".to_string()),
                                 reason: None,
-                                host_ip: Some("127.0.0.1".to_string()),
+                                host_ip: Some(Self::node_host_ip()),
                                 pod_ip,
                                 conditions: Some(conditions),
                                 container_statuses,
@@ -1933,7 +2066,7 @@ impl Kubelet {
                                 resource_claim_statuses: None,
                                 observed_generation: observed_gen,
                                 host_i_ps: Some(vec![rusternetes_common::resources::pod::HostIP {
-                                    ip: "127.0.0.1".to_string(),
+                                    ip: Self::node_host_ip(),
                                 }]),
                                 pod_i_ps,
                                 nominated_node_name: None,
@@ -2073,6 +2206,17 @@ impl Kubelet {
                                     _ => pod.clone(),
                                 };
                                 let mut new_pod = fresh_pod;
+                                // Preserve the existing start_time and remember the stored
+                                // status: a config error (e.g. CreateContainerConfigError)
+                                // won't clear without a spec change, so re-deriving a fresh
+                                // start_time every retry would make the status differ every
+                                // cycle, emit a MODIFIED watch event, and re-trigger this sync
+                                // in a tight loop (~183/sec observed). We gate the write on an
+                                // actual change below, mirroring the terminal-pod status gate.
+                                let prev_start_time =
+                                    new_pod.status.as_ref().and_then(|s| s.start_time);
+                                let prev_status_json =
+                                    serde_json::to_value(&new_pod.status).ok();
 
                                 // Build container statuses with the failed container
                                 let container_statuses: Option<Vec<ContainerStatus>> =
@@ -2115,7 +2259,7 @@ impl Kubelet {
                                     phase: Some(Phase::Pending),
                                     message: Some(err_msg),
                                     reason: Some(reason),
-                                    host_ip: Some("127.0.0.1".to_string()),
+                                    host_ip: Some(Self::node_host_ip()),
                                     pod_ip: None,
                                     conditions: None,
                                     container_statuses,
@@ -2126,24 +2270,34 @@ impl Kubelet {
                                     observed_generation: observed_gen,
                                     host_i_ps: Some(vec![
                                         rusternetes_common::resources::pod::HostIP {
-                                            ip: "127.0.0.1".to_string(),
+                                            ip: Self::node_host_ip(),
                                         },
                                     ]),
                                     pod_i_ps: None,
                                     nominated_node_name: None,
                                     qos_class: Some(qos),
-                                    start_time: Some(chrono::Utc::now()),
+                                    start_time: prev_start_time
+                                        .or_else(|| Some(chrono::Utc::now())),
                                 });
 
-                                if let Err(e) = self.storage.update(&key, &new_pod).await {
-                                    warn!(
+                                // Only write when the status actually changed — otherwise a
+                                // repeated identical config-error failure emits a watch event
+                                // every cycle and re-triggers this sync in a tight loop.
+                                let status_changed =
+                                    serde_json::to_value(&new_pod.status).ok() != prev_status_json;
+                                if status_changed {
+                                    if let Err(e) = self.storage.update(&key, &new_pod).await {
+                                        warn!(
                                     "Failed to update pod {}/{} status to container error: {}, retrying",
                                     namespace, pod_name, e
                                 );
-                                    // CAS retry — re-read and apply status
-                                    if let Ok(mut retry_pod) = self.storage.get::<Pod>(&key).await {
-                                        retry_pod.status = new_pod.status.clone();
-                                        let _ = self.storage.update(&key, &retry_pod).await;
+                                        // CAS retry — re-read and apply status
+                                        if let Ok(mut retry_pod) =
+                                            self.storage.get::<Pod>(&key).await
+                                        {
+                                            retry_pod.status = new_pod.status.clone();
+                                            let _ = self.storage.update(&key, &retry_pod).await;
+                                        }
                                     }
                                 }
                             } else {
@@ -2272,7 +2426,7 @@ impl Kubelet {
                                     phase: Some(phase),
                                     message: Some(status_msg),
                                     reason: Some(reason),
-                                    host_ip: Some("127.0.0.1".to_string()),
+                                    host_ip: Some(Self::node_host_ip()),
                                     pod_ip: None,
                                     conditions: Some(failed_conditions),
                                     container_statuses: app_container_statuses,
@@ -2283,7 +2437,7 @@ impl Kubelet {
                                     observed_generation: observed_gen,
                                     host_i_ps: Some(vec![
                                         rusternetes_common::resources::pod::HostIP {
-                                            ip: "127.0.0.1".to_string(),
+                                            ip: Self::node_host_ip(),
                                         },
                                     ]),
                                     pod_i_ps: None,
@@ -2352,7 +2506,12 @@ impl Kubelet {
                         self.runtime.get_container_statuses(&fresh_pod).await.ok();
 
                     // Get pod IP
-                    let pod_ip = self.runtime.get_pod_ip(pod_name).await.ok().flatten();
+                    let pod_ip = self
+                        .runtime
+                        .get_pod_ip(namespace, pod_name)
+                        .await
+                        .ok()
+                        .flatten();
                     let pod_i_ps = pod_ip.as_ref().map(|ip| vec![PodIP { ip: ip.clone() }]);
 
                     // Update status to Running
@@ -2382,7 +2541,7 @@ impl Kubelet {
                         phase: Some(Phase::Running),
                         message: Some("All containers started".to_string()),
                         reason: None,
-                        host_ip: Some("127.0.0.1".to_string()),
+                        host_ip: Some(Self::node_host_ip()),
                         pod_ip,
                         conditions: Some(conditions),
                         container_statuses,
@@ -2506,6 +2665,7 @@ impl Kubelet {
                                     match self
                                         .runtime
                                         .update_container_resources(
+                                            namespace,
                                             &container_name,
                                             cpu_period,
                                             cpu_quota,
@@ -2580,7 +2740,11 @@ impl Kubelet {
                 if let Some(ref spec) = pod.spec {
                     for container in &spec.containers {
                         let container_name = format!("{}_{}", pod_name, container.name);
-                        if !self.runtime.container_exists(&container_name).await {
+                        if !self
+                            .runtime
+                            .container_exists(namespace, &container_name)
+                            .await
+                        {
                             info!(
                                 "Container {} missing for running pod {}/{}, creating",
                                 container.name, namespace, pod_name
@@ -2588,11 +2752,10 @@ impl Kubelet {
                             let empty_binds = std::collections::HashMap::new();
                             if let Err(e) = self
                                 .runtime
-                                .start_container(
+                                .start_container_for_pod(
                                     pod,
                                     container,
                                     &empty_binds,
-                                    None, // netns — pod already has networking via pause
                                     None, // hosts file
                                     pod.status.as_ref().and_then(|s| s.pod_ip.as_deref()),
                                 )
@@ -2840,9 +3003,10 @@ impl Kubelet {
                                                 vols.iter()
                                                     .map(|v| {
                                                         let path = format!(
-                                                            "{}/{}/{}",
-                                                            self.runtime.volumes_base_path(),
-                                                            pod_name,
+                                                            "{}/{}",
+                                                            self.runtime.pod_volume_root(
+                                                                namespace, pod_name
+                                                            ),
                                                             v.name
                                                         );
                                                         (v.name.clone(), path)
@@ -2855,7 +3019,7 @@ impl Kubelet {
                                         // Check if this specific container is terminated
                                         if !self
                                             .runtime
-                                            .is_container_running(&cname)
+                                            .is_container_running(namespace, &cname)
                                             .await
                                             .unwrap_or(true)
                                         {
@@ -2863,7 +3027,7 @@ impl Kubelet {
                                             if restart_policy == "OnFailure" {
                                                 let exit_code = self
                                                     .runtime
-                                                    .get_container_exit_code(&cname)
+                                                    .get_container_exit_code(namespace, &cname)
                                                     .await
                                                     .unwrap_or(1);
                                                 if exit_code == 0 {
@@ -2873,7 +3037,7 @@ impl Kubelet {
                                             }
                                             let _ = self
                                                 .runtime
-                                                .remove_terminated_container(&cname)
+                                                .remove_terminated_container(namespace, &cname)
                                                 .await;
                                             // Recreate just this container with its volumes
                                             let pod_ip = pod
@@ -2882,11 +3046,10 @@ impl Kubelet {
                                                 .and_then(|s| s.pod_ip.as_deref());
                                             if let Err(e) = self
                                                 .runtime
-                                                .start_container(
+                                                .start_container_for_pod(
                                                     pod,
                                                     c,
                                                     &volume_paths,
-                                                    None,
                                                     None,
                                                     pod_ip,
                                                 )
@@ -2949,7 +3112,11 @@ impl Kubelet {
                                 // Ephemeral containers are one-shot — never restart them.
                                 // Skip if the container already exists in any state (running,
                                 // exited, created). Only start truly new ephemeral containers.
-                                if self.runtime.container_exists(&ec_container_name).await {
+                                if self
+                                    .runtime
+                                    .container_exists(namespace, &ec_container_name)
+                                    .await
+                                {
                                     continue;
                                 }
                                 info!(
@@ -2992,11 +3159,10 @@ impl Kubelet {
                                     .unwrap_or_default();
                                 if let Err(e) = self
                                     .runtime
-                                    .start_container(
+                                    .start_container_for_pod(
                                         &ec_pod,
                                         &container,
                                         &volume_paths,
-                                        None,
                                         None,
                                         None,
                                     )
@@ -3024,10 +3190,11 @@ impl Kubelet {
 
                 // Check liveness probes
                 // check_liveness may error on transient probe failures — treat errors as "no restart needed"
-                // to ensure the status update branch always runs
-                let needs_restart = self.runtime.check_liveness(pod).await.unwrap_or(false);
+                // to ensure the status update branch always runs. It returns the
+                // name of the container that crossed its failure threshold.
+                let restart_container = self.runtime.check_liveness(pod).await.unwrap_or(None);
                 {
-                    if needs_restart {
+                    if let Some(restart_container) = restart_container {
                         let restart_policy = pod
                             .spec
                             .as_ref()
@@ -3037,121 +3204,124 @@ impl Kubelet {
                         match restart_policy {
                             "Always" | "OnFailure" => {
                                 warn!(
-                                    "Restarting pod {}/{} due to failed liveness probe",
-                                    namespace, pod_name
+                                    "Restarting container {} in pod {}/{} due to failed liveness probe",
+                                    restart_container, namespace, pod_name
                                 );
 
-                                // Capture current restart counts before stopping
-                                let current_restart_counts: HashMap<String, u32> = pod
-                                    .status
-                                    .as_ref()
-                                    .and_then(|s| s.container_statuses.as_ref())
-                                    .map(|statuses| {
-                                        statuses
-                                            .iter()
-                                            .map(|cs| (cs.name.clone(), cs.restart_count))
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-
-                                // Stop and restart the pod
+                                // Restart ONLY the failed container, in place: stop+remove it
+                                // and recreate it in the EXISTING sandbox — mirroring the
+                                // exited-container restart path. A full-pod stop_pod_for +
+                                // start_pod tears down the sandbox, which start_pod then
+                                // rejects as "still initializing", wedging the pod as Failed
+                                // after a single restart (never reaching the 5 the conformance
+                                // liveness spec expects).
                                 let grace = pod
                                     .spec
                                     .as_ref()
                                     .and_then(|s| s.termination_grace_period_seconds)
                                     .unwrap_or(30);
-                                if let Err(e) = self.runtime.stop_pod_for(pod, grace).await {
-                                    error!("Failed to stop pod for restart: {}", e);
-                                } else {
-                                    // Build container statuses with incremented restart counts
-                                    let restarting_statuses: Vec<ContainerStatus> = pod
-                                        .spec
-                                        .as_ref()
-                                        .map(|s| &s.containers)
-                                        .unwrap_or(&vec![])
-                                        .iter()
-                                        .map(|c| {
-                                            let prev_count = current_restart_counts
-                                                .get(&c.name)
-                                                .copied()
-                                                .unwrap_or(0);
-                                            ContainerStatus {
-                                                name: c.name.clone(),
-                                                ready: false,
-                                                restart_count: prev_count + 1,
-                                                state: Some(ContainerState::Waiting {
-                                                    reason: Some("CrashLoopBackOff".to_string()),
-                                                    message: Some(
-                                                        "Liveness probe failed".to_string(),
-                                                    ),
-                                                }),
-                                                last_state: None,
-                                                image: Some(c.image.clone()),
-                                                image_id: None,
-                                                container_id: None,
-                                                started: Some(false),
-                                                allocated_resources: c
-                                                    .resources
-                                                    .as_ref()
-                                                    .and_then(|r| r.requests.clone()),
-                                                allocated_resources_status: None,
-                                                resources: c.resources.clone(),
-                                                user: None,
-                                                volume_mounts: None,
-                                                stop_signal: None,
-                                            }
-                                        })
-                                        .collect();
+                                let cname = format!("{}_{}", pod_name, restart_container);
 
-                                    // Update status with incremented restart counts — re-read for fresh RV
-                                    let key = build_key("pods", Some(namespace), pod_name);
-                                    let mut new_pod: Pod = match self.storage.get(&key).await {
-                                        Ok(p) => p,
-                                        _ => pod.clone(),
-                                    };
-                                    if let Some(ref mut status) = new_pod.status {
-                                        status.phase = Some(Phase::Running);
-                                        status.message = Some("Liveness probe failed".to_string());
-                                        status.reason = Some("Restarting".to_string());
-                                        status.container_statuses = Some(restarting_statuses);
-                                    } else {
-                                        new_pod.status = Some(PodStatus {
-                                            phase: Some(Phase::Running),
-                                            message: Some("Liveness probe failed".to_string()),
-                                            reason: Some("Restarting".to_string()),
-                                            host_ip: Some("127.0.0.1".to_string()),
-                                            pod_ip: None,
-                                            conditions: None,
-                                            container_statuses: None,
-                                            init_container_statuses: None,
-                                            ephemeral_container_statuses: None,
-                                            resize: None,
-                                            resource_claim_statuses: None,
-                                            observed_generation: new_pod.metadata.generation,
-                                            host_i_ps: Some(vec![
-                                                rusternetes_common::resources::pod::HostIP {
-                                                    ip: "127.0.0.1".to_string(),
-                                                },
-                                            ]),
-                                            pod_i_ps: None,
-                                            nominated_node_name: None,
-                                            qos_class: None,
-                                            start_time: None,
-                                        });
+                                // Volume paths persist on disk from the initial start_pod.
+                                let volume_paths: HashMap<String, String> = pod
+                                    .spec
+                                    .as_ref()
+                                    .and_then(|s| s.volumes.as_ref())
+                                    .map(|vols| {
+                                        vols.iter()
+                                            .map(|v| {
+                                                let path = format!(
+                                                    "{}/{}",
+                                                    self.runtime
+                                                        .pod_volume_root(namespace, pod_name),
+                                                    v.name
+                                                );
+                                                (v.name.clone(), path)
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+
+                                // Capture the failed container's current restart count.
+                                let prev_count = pod
+                                    .status
+                                    .as_ref()
+                                    .and_then(|s| s.container_statuses.as_ref())
+                                    .and_then(|css| {
+                                        css.iter().find(|cs| cs.name == restart_container)
+                                    })
+                                    .map(|cs| cs.restart_count)
+                                    .unwrap_or(0);
+
+                                // Kill + remove the running container so it can be recreated.
+                                if let Err(e) = self
+                                    .runtime
+                                    .stop_and_remove_container(namespace, &cname, grace)
+                                    .await
+                                {
+                                    error!(
+                                        "Failed to stop container {} for liveness restart: {}",
+                                        cname, e
+                                    );
+                                }
+
+                                // Persist the incremented restart count (re-read for fresh RV)
+                                // and mark the container transiently not-ready.
+                                let key = build_key("pods", Some(namespace), pod_name);
+                                let mut new_pod: Pod = match self.storage.get(&key).await {
+                                    Ok(p) => p,
+                                    _ => pod.clone(),
+                                };
+                                if let Some(ref mut status) = new_pod.status {
+                                    status.phase = Some(Phase::Running);
+                                    if let Some(ref mut css) = status.container_statuses {
+                                        if let Some(cs) = css
+                                            .iter_mut()
+                                            .find(|cs| cs.name == restart_container)
+                                        {
+                                            cs.restart_count = prev_count + 1;
+                                            cs.ready = false;
+                                            cs.started = Some(false);
+                                            cs.state = Some(ContainerState::Waiting {
+                                                reason: Some("Restarting".to_string()),
+                                                message: Some(
+                                                    "Liveness probe failed".to_string(),
+                                                ),
+                                            });
+                                        }
                                     }
+                                }
+                                let _ = self.storage.update(&key, &new_pod).await;
 
-                                    let _ = self.storage.update(&key, &new_pod).await;
-
-                                    // Start again
-                                    if let Err(e) = self.runtime.start_pod(&new_pod).await {
-                                        error!("Failed to restart pod: {}", e);
-                                        self.update_pod_status(
+                                // Recreate just the failed container in the existing sandbox.
+                                if let Some(container) = pod.spec.as_ref().and_then(|s| {
+                                    s.containers.iter().find(|c| c.name == restart_container)
+                                }) {
+                                    let pod_ip =
+                                        pod.status.as_ref().and_then(|s| s.pod_ip.as_deref());
+                                    if let Err(e) = self
+                                        .runtime
+                                        .start_container_for_pod(
                                             pod,
-                                            Phase::Failed,
-                                            Some("FailedToRestart"),
-                                            Some(&e.to_string()),
+                                            container,
+                                            &volume_paths,
+                                            None,
+                                            pod_ip,
                                         )
-                                        .await?;
+                                        .await
+                                    {
+                                        error!(
+                                            "Failed to recreate container {} after liveness restart: {}",
+                                            cname, e
+                                        );
+                                    } else {
+                                        info!(
+                                            "Restarted container {} in pod {}/{} (liveness), restart #{}",
+                                            restart_container,
+                                            namespace,
+                                            pod_name,
+                                            prev_count + 1
+                                        );
                                     }
                                 }
                             }
@@ -3307,7 +3477,12 @@ impl Kubelet {
                             }
 
                             // Get pod IP (important for pods started by docker-compose)
-                            let pod_ip = self.runtime.get_pod_ip(pod_name).await.ok().flatten();
+                            let pod_ip = self
+                                .runtime
+                                .get_pod_ip(namespace, pod_name)
+                                .await
+                                .ok()
+                                .flatten();
 
                             // Re-read pod from storage to get latest resourceVersion
                             // to avoid CAS conflicts when other controllers have
@@ -3341,12 +3516,19 @@ impl Kubelet {
                                         pod_ip.as_ref().map(|ip| vec![PodIP { ip: ip.clone() }]);
                                     status.pod_ip = pod_ip;
                                 }
+                                let existing_conditions = status.conditions.take();
                                 if all_ready {
                                     status.message = Some("All containers ready".to_string());
-                                    status.conditions = Some(Self::running_pod_conditions());
+                                    status.conditions = Some(Self::preserve_transition_times(
+                                        Self::running_pod_conditions(),
+                                        existing_conditions.as_deref(),
+                                    ));
                                 } else {
                                     status.message = Some("Some containers not ready".to_string());
-                                    status.conditions = Some(Self::not_ready_pod_conditions());
+                                    status.conditions = Some(Self::preserve_transition_times(
+                                        Self::not_ready_pod_conditions(),
+                                        existing_conditions.as_deref(),
+                                    ));
                                 }
                             }
 
@@ -3364,30 +3546,42 @@ impl Kubelet {
                                 return Ok(());
                             }
 
-                            if let Err(e) = self.storage.update(&key, &new_pod).await {
-                                // CAS conflict — re-read and retry once
-                                debug!("Pod status update CAS conflict, retrying: {}", e);
-                                if let Ok(mut fresh_pod) = self.storage.get::<Pod>(&key).await {
-                                    if let Some(ref mut status) = fresh_pod.status {
-                                        status.container_statuses = new_pod
-                                            .status
-                                            .as_ref()
-                                            .and_then(|s| s.container_statuses.clone());
-                                        status.conditions = new_pod
-                                            .status
-                                            .as_ref()
-                                            .and_then(|s| s.conditions.clone());
-                                        status.message =
-                                            new_pod.status.as_ref().and_then(|s| s.message.clone());
-                                        if let Some(ref new_status) = new_pod.status {
-                                            if new_status.pod_ip.is_some() {
-                                                status.pod_ip = new_status.pod_ip.clone();
-                                                status.pod_i_ps = new_status.pod_i_ps.clone();
-                                            }
-                                        }
+                            // Write the status, retrying on CAS (resourceVersion)
+                            // conflict by re-fetching the latest pod and
+                            // re-applying the full desired status. Under
+                            // conformance load the pod is modified concurrently
+                            // (controllers, GC, the test itself), so a single
+                            // retry is not enough — a running pod's status must
+                            // still reach the API or every "wait for Running"
+                            // test times out. The kubelet owns pod status, so
+                            // overwriting the fresh object's status is correct.
+                            let desired_status = new_pod.status.clone();
+                            let mut result = self.storage.update(&key, &new_pod).await;
+                            let mut attempt = 0u32;
+                            while let Err(ref e) = result {
+                                if !e.to_string().contains("Conflict") || attempt >= 5 {
+                                    warn!(
+                                        "Failed to update pod status for {}/{} after {} attempt(s): {}",
+                                        namespace, pod_name, attempt + 1, e
+                                    );
+                                    break;
+                                }
+                                attempt += 1;
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    20 * attempt as u64,
+                                ))
+                                .await;
+                                match self.storage.get::<Pod>(&key).await {
+                                    Ok(mut fresh_pod) => {
+                                        fresh_pod.status = desired_status.clone();
+                                        result = self.storage.update(&key, &fresh_pod).await;
                                     }
-                                    if let Err(e2) = self.storage.update(&key, &fresh_pod).await {
-                                        warn!("Failed to update pod status after retry: {}", e2);
+                                    Err(ge) => {
+                                        warn!(
+                                            "Failed to re-fetch pod {}/{} for status retry: {}",
+                                            namespace, pod_name, ge
+                                        );
+                                        break;
                                     }
                                 }
                             }
@@ -3420,16 +3614,23 @@ impl Kubelet {
                             namespace, pod_name
                         );
 
-                        // CrashLoopBackOff: update status to show Terminated state
-                        // with the actual exit reason. Don't immediately set Waiting —
-                        // the test needs to observe the Terminated state with a reason.
+                        // CrashLoopBackOff: reflect the Terminated state (with the actual
+                        // exit reason) in status, but DO NOT change restart_count on this
+                        // per-sync path. Re-incrementing the count every sync was a
+                        // self-amplifying write storm: each +1 write produced a watch
+                        // MODIFIED event, which re-signalled the per-pod worker to sync
+                        // again immediately, which wrote +1 again (~180 writes/sec, and
+                        // the inflated count pinned backoff to 300s so the container was
+                        // never actually recreated). restart_count is now bumped exactly
+                        // once per REAL restart, below, only after the backoff has elapsed.
                         let key = build_key("pods", Some(namespace), pod_name);
                         let mut fresh_pod: Pod = match self.storage.get(&key).await {
                             Ok(p) => p,
                             _ => pod.clone(),
                         };
+                        let original = fresh_pod.clone();
 
-                        // Get current restart count from pod status
+                        // Restarts recorded so far — read only; not incremented here.
                         let prev_restart = fresh_pod
                             .status
                             .as_ref()
@@ -3443,24 +3644,28 @@ impl Kubelet {
                                     .iter()
                                     .map(|c| {
                                         let mut new_cs = c.clone();
-                                        // Preserve the Terminated state (with reason) from
-                                        // get_container_statuses. Increment restart count.
-                                        new_cs.restart_count = prev_restart + 1;
+                                        // Preserve the Terminated state (with reason);
+                                        // keep the EXISTING restart_count (no per-sync bump).
+                                        new_cs.restart_count = prev_restart;
                                         new_cs.ready = false;
                                         new_cs.started = Some(false);
-                                        // Keep state as Terminated — tests need to observe it.
-                                        // On the NEXT sync cycle, after backoff, we'll set
-                                        // Waiting/CrashLoopBackOff and restart.
                                         new_cs
                                     })
                                     .collect();
                                 status.container_statuses = Some(updated_statuses);
                             }
                         }
-                        let _ = self.storage.update(&key, &fresh_pod).await;
+                        // Only write when the status actually changed. During backoff the
+                        // computed status is identical every cycle, so this suppresses the
+                        // write and breaks the watch -> resync -> write feedback loop.
+                        if !pod_status_equal(&original, &fresh_pod) {
+                            let _ = self.storage.update(&key, &fresh_pod).await;
+                        }
 
                         // CrashLoopBackOff: compute backoff delay based on restart count
-                        // K8s uses: 10s, 20s, 40s, 80s, 160s, 300s (capped at 5m)
+                        // K8s uses: 10s, 20s, 40s, 80s, 160s, 300s (capped at 5m). With
+                        // prev_restart now stable (no per-sync inflation) this grows as
+                        // intended instead of instantly saturating at 300s.
                         let current_restart = prev_restart + 1;
                         let backoff_secs: i64 =
                             std::cmp::min(10 * (1_i64 << (current_restart as i64 - 1).min(5)), 300);
@@ -3492,6 +3697,22 @@ impl Kubelet {
                                 namespace, pod_name, current_restart, backoff_secs
                             );
                             return Ok(());
+                        }
+
+                        // Backoff elapsed — record exactly ONE real restart, then recreate.
+                        {
+                            let mut restart_pod: Pod = match self.storage.get(&key).await {
+                                Ok(p) => p,
+                                _ => fresh_pod.clone(),
+                            };
+                            if let Some(ref mut status) = restart_pod.status {
+                                if let Some(ref mut cs_list) = status.container_statuses {
+                                    for cs in cs_list.iter_mut() {
+                                        cs.restart_count = prev_restart + 1;
+                                    }
+                                }
+                            }
+                            let _ = self.storage.update(&key, &restart_pod).await;
                         }
 
                         if let Err(e) = self.runtime.start_pod(pod).await {
@@ -3645,6 +3866,30 @@ impl Kubelet {
     /// Build the standard pod conditions for a Running pod.
     /// Real Kubernetes sets Initialized, PodScheduled, ContainersReady, and Ready=True
     /// when all containers are running. The e2e conformance suite checks these conditions.
+    /// Carry `last_transition_time` forward from the existing conditions for any
+    /// condition whose (type, status) is unchanged. The condition builders stamp
+    /// `now()` unconditionally; without this, every status sync produces a
+    /// "different" status (new timestamps), defeating the no-op write gate and
+    /// causing a MODIFIED-event / resourceVersion storm (and the CAS conflicts it
+    /// spawns). K8s semantics: `lastTransitionTime` only advances on an actual
+    /// status transition.
+    fn preserve_transition_times(
+        mut new: Vec<PodCondition>,
+        existing: Option<&[PodCondition]>,
+    ) -> Vec<PodCondition> {
+        if let Some(existing) = existing {
+            for cond in &mut new {
+                if let Some(prev) = existing
+                    .iter()
+                    .find(|e| e.condition_type == cond.condition_type && e.status == cond.status)
+                {
+                    cond.last_transition_time = prev.last_transition_time;
+                }
+            }
+        }
+        new
+    }
+
     fn running_pod_conditions() -> Vec<PodCondition> {
         let now = Some(chrono::Utc::now());
         vec![
@@ -3948,25 +4193,40 @@ impl Kubelet {
             &pod.metadata.name,
         );
 
-        // Read the fresh pod from storage so we preserve container_statuses,
+        let reason_s = reason.map(|s| s.to_string());
+        let message_s = message.map(|s| s.to_string());
+
+        // Read fresh, apply, write — retrying on CAS conflict by re-fetching.
+        // Reading the fresh pod preserves container_statuses,
         // init_container_statuses, conditions, pod_ip, start_time, etc.
-        // Constructing a fresh PodStatus would WIPE those fields — destructive
-        // when called on a failure path of a previously-Running pod.
-        let mut new_pod = match self.storage.get::<Pod>(&key).await {
-            Ok(p) => p,
-            Err(_) => pod.clone(),
-        };
-        let original = new_pod.clone();
+        // (constructing a fresh PodStatus would WIPE those). A single write
+        // loses to concurrent modification under load, so loop.
+        for attempt in 0..6u32 {
+            let mut new_pod = match self.storage.get::<Pod>(&key).await {
+                Ok(p) => p,
+                Err(_) => pod.clone(),
+            };
+            let original = new_pod.clone();
 
-        let mut status = new_pod.status.take().unwrap_or_default();
-        status.phase = Some(phase);
-        status.reason = reason.map(|s| s.to_string());
-        status.message = message.map(|s| s.to_string());
-        new_pod.status = Some(status);
+            let mut status = new_pod.status.take().unwrap_or_default();
+            status.phase = Some(phase.clone());
+            status.reason = reason_s.clone();
+            status.message = message_s.clone();
+            new_pod.status = Some(status);
 
-        // Gate the write so a no-op call doesn't emit a MODIFIED watch event.
-        if !pod_status_equal(&original, &new_pod) {
-            self.storage.update(&key, &new_pod).await?;
+            // Gate the write so a no-op call doesn't emit a MODIFIED watch event.
+            if pod_status_equal(&original, &new_pod) {
+                return Ok(());
+            }
+
+            match self.storage.update(&key, &new_pod).await {
+                Ok(_) => return Ok(()),
+                Err(e) if e.to_string().contains("Conflict") && attempt < 5 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20 * (attempt as u64 + 1)))
+                        .await;
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
 
         Ok(())
@@ -4004,7 +4264,7 @@ impl Kubelet {
             .collect();
 
         // Get pod resource usage statistics
-        let pod_stats = get_pod_stats(&node_pods).await;
+        let pod_stats = get_pod_stats(&self.runtime, &node_pods).await;
 
         // For each active signal, select pods for eviction
         for signal in signals {

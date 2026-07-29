@@ -1023,8 +1023,15 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         spec: &mut rusternetes_common::resources::PodSpec,
         namespace: &str,
     ) {
-        // Get service account name, default to "default"
-        let sa_name = spec.service_account_name.as_deref().unwrap_or("default");
+        // Get service account name, default to "default". The protobuf wire form
+        // marshals an unset serviceAccountName as an empty string, so `unwrap_or`
+        // alone leaves `sa_name = ""` and builds a bogus "-token" secret name that
+        // never exists — filter the empty string out so it defaults properly.
+        let sa_name = spec
+            .service_account_name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("default");
 
         // The service account token secret name follows the pattern: {sa-name}-token
         let token_secret_name = format!("{}-token", sa_name);
