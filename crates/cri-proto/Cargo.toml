@@ -1,0 +1,33 @@
+[package]
+name = "cri-proto"
+version = "0.1.0"
+edition = "2021"
+authors = ["Rusternetes Contributors"]
+license = "Apache-2.0"
+description = "Kubernetes Container Runtime Interface (CRI) v1 gRPC bindings (release-1.36), with unix-socket helpers"
+repository = "https://github.com/rusternetes/rusternetes"
+keywords = ["kubernetes", "cri", "grpc", "container", "runtime"]
+categories = ["api-bindings", "virtualization"]
+
+# NOTE: this crate must not depend on any rusternetes-* crate (see plan/01-cri-crates.md).
+
+[features]
+default = ["client", "server"]
+# Generate the tonic client stubs (RuntimeServiceClient / ImageServiceClient) and UDS connect helper.
+client = []
+# Generate the tonic server stubs (RuntimeServiceServer / ImageServiceServer).
+server = []
+
+[dependencies]
+prost = "0.14"
+tonic = "0.14"
+tonic-prost = "0.14"
+tokio = { version = "1.40", features = ["net"] }
+tower = { version = "0.5", features = ["util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread"] }
