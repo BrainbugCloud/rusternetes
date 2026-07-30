@@ -1,0 +1,3 @@
+# SwiftPM build products. Package.resolved IS committed: it pins containerization
+# and its transitive deps, which must match the version `container` ships.
+.build/

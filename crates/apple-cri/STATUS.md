@@ -165,46 +165,68 @@ namespace):
 | containers added to a live sandbox | `vm.hotplug(rootfs, id:)`, the CRI ordering |
 | per-container rootfs / cgroup / limits | `/run/container/<id>/rootfs`, `/container/pod/<pod>/<id>` |
 | exec | same `containerID`, distinct process `id`, inheriting the container's spec |
+| guest OCI runtime | `vmexec` (`ociRuntimePath: nil`), as upstream's `LinuxPod` uses at all three call sites — it is `vmexec/RunCommand.swift` `setupNamespaces()` that does the `setns`/`unshare`. runc is opt-in and absent from Apple's init image |
 
 A member container deliberately carries **no** `hostname`: an OCI runtime can only
 set one in a UTS namespace it created, and runc errors out if `hostname` is set
 while the namespace is inherited.
 
-### The remaining gap: a VMM broker
+### The VMM broker
 
 Everything inside the guest is gRPC, so it is Rust. Four host-side operations are
 not, because macOS exposes them only through Virtualization.framework and only to
 the process owning the `VZVirtualMachine`: VM lifecycle, vsock dial/listen, block
 hotplug, and virtiofs shares. They sit behind `apple_containerization::Vmm`.
 
-**No broker is implemented, so no pod has booted on hardware yet.** Driving
-Apple's shipped `container-runtime-linux` is not sufficient: its XPC surface has
-`bootstrap` and `dial` — the agent is reachable — but no hotplug route, so
-containers could never be added to a live sandbox. A broker therefore has to own
-the VM itself. Apple's `Containerization` SPM package builds cleanly here
-(`swift build --product Containerization`, Swift 6.2), which makes a small Swift
-helper the cheapest path: it reuses upstream's tested VZ code and ext4 unpacking
-instead of reimplementing them, and needs the `com.apple.security.virtualization`
-entitlement.
+Driving Apple's shipped `container-runtime-linux` is not sufficient — its XPC
+surface has `bootstrap` and `dial`, so the agent is reachable, but no hotplug
+route, so containers could never be added to a live sandbox. The broker therefore
+owns the VM itself: [`vmm-broker/`](../../vmm-broker/README.md), a small Swift
+package linking Apple's `Containerization` (pinned to the `0.40.1` that
+`container` 1.2.0 pins) rather than reimplementing VZ setup.
 
-Also still open on the pod path:
+```bash
+bash scripts/build-vmm-broker.sh     # builds and signs; verifies the entitlement stuck
+```
 
-- `RootfsProvider` has no implementation: turning an image reference into an ext4
-  block device is host-side work (upstream's `ContainerizationEXT4` `EXT4Unpacker`
-  writes a per-container `rootfs.ext4`).
-- CRI mounts name **host** paths, so they need virtiofs shares before the guest
-  bind can resolve. `pod_runtime` emits the correct mount shape; without broker
-  virtiofs support the guest bind fails with `ENOENT`.
-- Stdio/attach/port-forward over pod vsock ports: `Pod::dial` and the stdio port
-  allocator are in place, the relay is not. Container `stdin` is therefore always
-  wired to `None` today.
-- **Pod VM sizing is a flat default** (4 cpus / 1 GiB) rather than derived from the
-  containers' requests. A VM is sized once, at `RunPodSandbox`, before any
-  container config is known — so either the kubelet's pod-level resources have to
-  be read from the sandbox config, or the VM needs resizing on `CreateContainer`.
-  Unlike a Linux runtime, getting this wrong costs real RAM per pod.
-- `pod_runtime` is not wired into `AppleBackend`; the CLI path remains the default
-  so critest stays green.
+Two unknowns are now settled:
+
+- **The entitlement is not a barrier.** `com.apple.security.virtualization` is
+  carried by an **ad-hoc signature** (`codesign -s -`) — no paid developer
+  identity. Verified on macOS 26.5.1.
+- **The wire contract is covered without a hypervisor.**
+  `apple-containerization/tests/broker_pod.rs` drives a full two-container pod over
+  the real broker protocol *and* the real `SandboxContext` gRPC, asserting that both
+  containers join the same infra ipc/uts/pid namespaces, that one VM is created and
+  each rootfs hotplugged, and that teardown signals the guest before stopping the
+  VM. If the Swift side answers those methods with those shapes, the semantics
+  above it already work.
+
+Implemented in the broker: VM create/start/stop/state, `dial` with a vsock↔unix
+relay, `hotplug`/`releaseHotplug`, `mounts`, `registerMounts`.
+
+### What still blocks a pod from booting
+
+- **image → ext4 (`provisionRootfs`).** Needs the image store plus
+  `ContainerizationEXT4`'s `EXT4Unpacker` to write a per-container `rootfs.ext4`.
+  The **initfs is the same problem**: Apple ships it as an OCI image
+  (`ghcr.io/apple/containerization/vminit`, present in the local store), not a
+  file. One unpacker unblocks both — it is now the single largest remaining piece.
+- **Network.** `VMConfiguration.interfaces` is passed empty, so the pod has no
+  address for `configure_network` to apply. Whether to drive Apple's network
+  service or run our own IPAM is undecided.
+- **Stdio relay.** `Pod::dial` and the vsock port allocator exist; the pump does
+  not, and the broker's `listen` is unimplemented. Until then: no logs, no exec
+  output, no attach, no port-forward, and container `stdin` is wired to `None`.
+- **virtiofs hotplug**, for CRI mounts naming host paths. `pod_runtime` emits the
+  right mount shape; the attach half is missing, so those binds would fail ENOENT.
+- **Wiring.** `pod_runtime` is not hooked into `AppleBackend` — no flag selects pod
+  vs CLI mode, and pod state is not checkpointed across a shim restart the way the
+  CLI path's `state.rs` does.
+- **Pod VM sizing** is a flat 4 cpu / 1 GiB default. The VM is created at
+  `RunPodSandbox`, before any container config is known, so this needs the
+  sandbox's pod-level resources or a resize on `CreateContainer`. Unlike a Linux
+  runtime, guessing wrong costs real RAM per pod.
 
 ## Not yet done
 

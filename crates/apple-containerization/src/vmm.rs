@@ -41,7 +41,8 @@ use crate::error::{Error, Result};
 use crate::oci;
 
 /// Runtime state of a VM, mirroring `VirtualMachineInstanceState`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum VmState {
     Starting,
     Running,
@@ -52,7 +53,8 @@ pub enum VmState {
 
 /// A filesystem to attach to the VM, mirroring containerization's `Mount` in its
 /// host-side (pre-attach) form.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BlockMount {
     /// Filesystem format, e.g. `ext4`.
     pub format: String,
@@ -84,7 +86,8 @@ impl BlockMount {
 /// `source` is what the *guest* sees — a block device path such as `/dev/vdb`,
 /// or a virtiofs tag — which is why the pod can only build a container's mount
 /// list after the attach has happened.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AttachedFilesystem {
     pub type_: String,
     pub source: String,
@@ -106,7 +109,8 @@ impl AttachedFilesystem {
 }
 
 /// A network interface for the pod's VM, mirroring the `Interface` protocol.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Interface {
     /// CIDR form, e.g. `192.168.64.5/24`.
     pub address: String,
@@ -117,7 +121,8 @@ pub struct Interface {
 }
 
 /// Configuration for creating a pod's VM, mirroring `VMConfiguration`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VmConfig {
     /// Identifier the broker should use for the VM; the pod passes its own id.
     pub id: String,

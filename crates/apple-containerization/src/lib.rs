@@ -16,6 +16,7 @@
 //! | [`oci`] | `Sources/ContainerizationOCI/Spec.swift` |
 //! | [`pod`] | `Sources/Containerization/LinuxPod.swift` |
 //! | [`vmm`] | `VirtualMachineManager.swift` / `VirtualMachineInstance.swift` |
+//! | [`broker`] | no upstream equivalent — see below |
 //! | [`proto`] | `Sources/Containerization/SandboxContext/SandboxContext.proto` |
 //!
 //! # What is Rust and what cannot be
@@ -34,6 +35,7 @@
 //! `apple-cri` is what joins the two.
 
 pub mod agent;
+pub mod broker;
 pub mod error;
 pub mod oci;
 pub mod pod;
@@ -55,6 +57,7 @@ pub mod proto {
 pub mod testing;
 
 pub use agent::{Agent, AGENT_VSOCK_PORT};
+pub use broker::{BrokerClient, BrokerRootfs, BrokerVmm};
 pub use error::{Error, Result};
 pub use pod::{ContainerConfig, ContainerState, NamespaceMode, Pod, PodConfig, ProcessConfig};
 pub use vmm::{AttachedFilesystem, BlockMount, Interface, VmConfig, VmInstance, VmState, Vmm};

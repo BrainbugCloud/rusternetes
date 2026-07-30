@@ -781,3 +781,214 @@ impl VmInstance for MockVm {
         Ok(())
     }
 }
+
+/// A broker that speaks the real [`crate::broker`] wire format, backed by
+/// [`MockVmm`].
+///
+/// This exists to validate the protocol without a hypervisor: a [`crate::Pod`]
+/// driven through [`crate::BrokerVmm`] against this server exercises the exact
+/// JSON both sides will exchange, then the exact `SandboxContext` gRPC the guest
+/// will serve. Anything the Swift broker gets wrong is a mismatch against a
+/// contract that is already covered here.
+#[derive(Debug, Clone)]
+pub struct FakeBroker {
+    socket: PathBuf,
+    guest: FakeGuest,
+    requests: Arc<Mutex<Vec<crate::broker::Method>>>,
+    _dir: Arc<tempfile::TempDir>,
+}
+
+impl FakeBroker {
+    /// Start the broker on a unix socket in a temp dir.
+    pub async fn start(guest: FakeGuest) -> std::io::Result<Self> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir()?;
+        let socket = dir.path().join("broker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket)?;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+
+        let vmm = MockVmm::new(guest.clone());
+        let state: Arc<tokio::sync::Mutex<HashMap<String, Arc<dyn VmInstance>>>> =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let guest_socket = guest.socket_path().to_path_buf();
+        let recorded = requests.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let vmm = vmm.clone();
+                let state = state.clone();
+                let guest_socket = guest_socket.clone();
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let response = match serde_json::from_str::<crate::broker::Request>(&line) {
+                        Ok(request) => {
+                            recorded
+                                .lock()
+                                .expect("broker request log poisoned")
+                                .push(request.method);
+                            Self::handle(&vmm, &state, &guest_socket, request).await
+                        }
+                        Err(e) => crate::broker::Response::err(format!("bad request: {e}")),
+                    };
+                    let mut out = serde_json::to_vec(&response).unwrap_or_default();
+                    out.push(b'\n');
+                    let _ = reader.get_mut().write_all(&out).await;
+                    let _ = reader.get_mut().flush().await;
+                });
+            }
+        });
+
+        Ok(Self {
+            socket,
+            guest,
+            requests,
+            _dir: Arc::new(dir),
+        })
+    }
+
+    pub fn socket_path(&self) -> &std::path::Path {
+        &self.socket
+    }
+
+    pub fn guest(&self) -> &FakeGuest {
+        &self.guest
+    }
+
+    /// Methods received, in order.
+    pub fn requests(&self) -> Vec<crate::broker::Method> {
+        self.requests
+            .lock()
+            .expect("broker request log poisoned")
+            .clone()
+    }
+
+    async fn handle(
+        vmm: &MockVmm,
+        state: &Arc<tokio::sync::Mutex<HashMap<String, Arc<dyn VmInstance>>>>,
+        guest_socket: &std::path::Path,
+        request: crate::broker::Request,
+    ) -> crate::broker::Response {
+        use crate::broker::{Method, Reply, Response};
+
+        let vm_id = request.params.vm_id.clone().unwrap_or_default();
+        let lookup = || async {
+            state
+                .lock()
+                .await
+                .get(&vm_id)
+                .cloned()
+                .ok_or_else(|| format!("no such vm: {vm_id}"))
+        };
+
+        match request.method {
+            Method::CreateVm => {
+                let Some(config) = request.params.config else {
+                    return Response::err("createVm requires config");
+                };
+                match vmm.create(config).await {
+                    Ok(vm) => {
+                        state.lock().await.insert(vm_id, vm);
+                        Response::ok(Reply::default())
+                    }
+                    Err(e) => Response::err(e),
+                }
+            }
+            Method::Start => match lookup().await {
+                Ok(vm) => match vm.start().await {
+                    Ok(()) => Response::ok(Reply::default()),
+                    Err(e) => Response::err(e),
+                },
+                Err(e) => Response::err(e),
+            },
+            Method::Stop => match lookup().await {
+                Ok(vm) => match vm.stop().await {
+                    Ok(()) => Response::ok(Reply::default()),
+                    Err(e) => Response::err(e),
+                },
+                Err(e) => Response::err(e),
+            },
+            Method::State => match lookup().await {
+                Ok(vm) => Response::ok(Reply {
+                    state: Some(vm.state().await),
+                    ..Default::default()
+                }),
+                Err(e) => Response::err(e),
+            },
+            // The relay a real broker would stand up per dial; here the guest's
+            // own socket already is one.
+            Method::Dial | Method::Listen => Response::ok(Reply {
+                socket_path: Some(guest_socket.to_path_buf()),
+                ..Default::default()
+            }),
+            Method::Hotplug => {
+                let (Some(block), Some(owner)) = (request.params.block, request.params.owner_id)
+                else {
+                    return Response::err("hotplug requires block and ownerId");
+                };
+                match lookup().await {
+                    Ok(vm) => match vm.hotplug(block, &owner).await {
+                        Ok(attached) => Response::ok(Reply {
+                            attached: Some(attached),
+                            ..Default::default()
+                        }),
+                        Err(e) => Response::err(e),
+                    },
+                    Err(e) => Response::err(e),
+                }
+            }
+            Method::ReleaseHotplug => {
+                let Some(owner) = request.params.owner_id else {
+                    return Response::err("releaseHotplug requires ownerId");
+                };
+                match lookup().await {
+                    Ok(vm) => match vm.release_hotplug(&owner).await {
+                        Ok(()) => Response::ok(Reply::default()),
+                        Err(e) => Response::err(e),
+                    },
+                    Err(e) => Response::err(e),
+                }
+            }
+            Method::Mounts => match lookup().await {
+                Ok(vm) => Response::ok(Reply {
+                    mounts: Some(vm.mounts().await),
+                    ..Default::default()
+                }),
+                Err(e) => Response::err(e),
+            },
+            Method::RegisterMounts => {
+                let (Some(owner), Some(rootfs)) = (request.params.owner_id, request.params.rootfs)
+                else {
+                    return Response::err("registerMounts requires ownerId and rootfs");
+                };
+                let additional = request.params.additional.unwrap_or_default();
+                match lookup().await {
+                    Ok(vm) => match vm.register_mounts(&owner, rootfs, additional).await {
+                        Ok(()) => Response::ok(Reply::default()),
+                        Err(e) => Response::err(e),
+                    },
+                    Err(e) => Response::err(e),
+                }
+            }
+            Method::ProvisionRootfs => {
+                let Some(owner) = request.params.owner_id else {
+                    return Response::err("provisionRootfs requires ownerId");
+                };
+                // A real broker unpacks the image into an ext4 file here.
+                Response::ok(Reply {
+                    block: Some(BlockMount::block("ext4", format!("/images/{owner}.ext4"))),
+                    ..Default::default()
+                })
+            }
+            Method::ReleaseRootfs => Response::ok(Reply::default()),
+        }
+    }
+}
