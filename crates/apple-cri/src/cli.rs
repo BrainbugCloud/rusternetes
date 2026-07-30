@@ -663,6 +663,39 @@ impl CreateSpec {
             a.push(o.clone());
         }
         for (src, dst, ro) in &self.binds {
+            // A virtiofs share is directory-only: a single-file source fails with
+            // `path '<src>' is not a directory`. That is not a corner case — the
+            // kubelet bind-mounts two *files* into every container it creates
+            // (`/dev/termination-log` and `/etc/hosts`), so without this every
+            // CreateContainer fails and no pod can ever start.
+            //
+            // `-v` does handle file binds, including `:ro` (measured on 1.2.0:
+            // the file is readable in the guest and writes to a `:ro` bind fail
+            // with EROFS). It is only used for files; directories keep the
+            // virtiofs path, which is what critest exercises.
+            //
+            // `-v` is colon-delimited, so a path containing `:` is ambiguous.
+            // Fall through to `--mount` in that case rather than emit an argument
+            // Apple would misparse — for a file that fails loudly, which beats
+            // mounting the wrong thing.
+            let is_file = std::fs::metadata(src).map(|m| m.is_file()).unwrap_or(false);
+            let colon_safe = !src.contains(':') && !dst.contains(':');
+            if is_file && colon_safe {
+                a.push("-v".into());
+                let mut m = format!("{src}:{dst}");
+                if *ro {
+                    m.push_str(":ro");
+                }
+                a.push(m);
+                continue;
+            }
+            if is_file && !colon_safe {
+                tracing::warn!(
+                    source = %src,
+                    target = %dst,
+                    "file bind mount contains ':' and cannot be expressed with -v"
+                );
+            }
             // `--mount` takes an explicit readonly flag; `-v` does not.
             a.push("--mount".into());
             let mut m = format!("type=virtiofs,source={src},target={dst}");
@@ -809,6 +842,103 @@ mod tests {
             Error::FailedPrecondition(_)
         ));
         assert!(matches!(classify("ctx", ""), Error::Internal(_)));
+    }
+
+    #[test]
+    fn a_file_bind_uses_dash_v_because_virtiofs_is_directory_only() {
+        // The kubelet bind-mounts /dev/termination-log and /etc/hosts — both
+        // *files* — into every container. A virtiofs share rejects a file source
+        // with "is not a directory", so those must go out as `-v`.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("termination-log");
+        std::fs::write(&file, b"").unwrap();
+
+        let spec = CreateSpec {
+            name: "c".into(),
+            image: "img".into(),
+            binds: vec![(
+                file.to_string_lossy().into_owned(),
+                "/dev/termination-log".into(),
+                false,
+            )],
+            ..Default::default()
+        };
+        let joined = spec.to_args().join(" ");
+        assert!(
+            joined.contains(&format!("-v {}:/dev/termination-log", file.display())),
+            "expected a -v file bind, got: {joined}"
+        );
+        assert!(
+            !joined.contains("type=virtiofs"),
+            "a file must not be sent as a virtiofs share: {joined}"
+        );
+    }
+
+    #[test]
+    fn a_readonly_file_bind_gets_the_ro_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hosts");
+        std::fs::write(&file, b"127.0.0.1 localhost\n").unwrap();
+
+        let spec = CreateSpec {
+            name: "c".into(),
+            image: "img".into(),
+            binds: vec![(
+                file.to_string_lossy().into_owned(),
+                "/etc/hosts".into(),
+                true,
+            )],
+            ..Default::default()
+        };
+        let joined = spec.to_args().join(" ");
+        assert!(
+            joined.contains(&format!("-v {}:/etc/hosts:ro", file.display())),
+            "expected :ro on the -v bind, got: {joined}"
+        );
+    }
+
+    #[test]
+    fn a_directory_bind_still_uses_virtiofs() {
+        // Directories keep the proven path; only files changed.
+        let dir = tempfile::tempdir().unwrap();
+        let spec = CreateSpec {
+            name: "c".into(),
+            image: "img".into(),
+            binds: vec![(
+                dir.path().to_string_lossy().into_owned(),
+                "/data".into(),
+                false,
+            )],
+            ..Default::default()
+        };
+        let joined = spec.to_args().join(" ");
+        assert!(
+            joined.contains(&format!(
+                "--mount type=virtiofs,source={},target=/data",
+                dir.path().display()
+            )),
+            "expected a virtiofs share for a directory, got: {joined}"
+        );
+        assert!(!joined.contains(" -v "), "got: {joined}");
+    }
+
+    #[test]
+    fn a_file_bind_with_a_colon_falls_back_to_mount_rather_than_misparsing() {
+        // `-v` is colon-delimited, so `a:b:c` is ambiguous. Emitting `--mount`
+        // instead fails loudly for a file rather than mounting the wrong path.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("odd:name");
+        std::fs::write(&file, b"").unwrap();
+
+        let spec = CreateSpec {
+            name: "c".into(),
+            image: "img".into(),
+            binds: vec![(file.to_string_lossy().into_owned(), "/dst".into(), false)],
+            ..Default::default()
+        };
+        let joined = spec.to_args().join(" ");
+        assert!(joined.contains("type=virtiofs"), "got: {joined}");
+        assert!(!joined.contains(" -v "), "got: {joined}");
     }
 
     #[test]
