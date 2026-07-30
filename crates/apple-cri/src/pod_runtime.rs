@@ -59,9 +59,21 @@ pub struct PodRuntimeConfig {
     pub default_cpus: u32,
     /// Memory for a pod's VM when the sandbox config does not say.
     pub default_memory_bytes: u64,
-    /// OCI runtime inside the guest. `None` uses vminitd's built-in `vmexec`;
-    /// `Some("/usr/bin/runc")` runs runc, which is what a multi-container pod
-    /// wants since it is the runtime that understands joining namespaces by path.
+    /// OCI runtime inside the guest.
+    ///
+    /// `None` selects vminitd's built-in `vmexec`, which is what upstream's
+    /// `LinuxPod` uses — it passes `ociRuntimePath: nil` at all three of its
+    /// `createProcess` call sites (pause, member container, exec). vmexec
+    /// implements the namespace model this pod layer depends on:
+    /// `vminitd/Sources/vmexec/RunCommand.swift:287` `setupNamespaces()` calls
+    /// `setns(fd, flag)` for a namespace carrying a path and `unshare` for one
+    /// without, which is exactly join-by-path vs. create-new.
+    ///
+    /// `Some(path)` makes the guest shell out to that binary instead
+    /// (`vminitd/Sources/VminitdCore/ManagedContainer.swift:71` builds
+    /// `Runc(command: path, root: "/run/runc")`). The path must exist *inside the
+    /// guest*; Apple's init image does not ship runc, so this is opt-in for hosts
+    /// that provide one, not a default.
     pub oci_runtime_path: Option<String>,
 }
 
@@ -71,7 +83,8 @@ impl Default for PodRuntimeConfig {
             // Matches LinuxPod.Configuration's own defaults.
             default_cpus: 4,
             default_memory_bytes: 1024 * 1024 * 1024,
-            oci_runtime_path: Some("/usr/bin/runc".to_string()),
+            // vmexec, as upstream LinuxPod does. See the field docs.
+            oci_runtime_path: None,
         }
     }
 }
@@ -885,10 +898,27 @@ mod tests {
     }
 
     #[test]
-    fn runc_is_the_default_guest_runtime_for_pods() {
-        // Pod containers join namespaces by path, which is runc's job; vmexec is
-        // the single-container default.
+    fn vmexec_is_the_default_guest_runtime_for_pods() {
+        // Upstream's LinuxPod passes ociRuntimePath: nil at every createProcess
+        // call site, and vmexec is what implements join-by-path namespaces
+        // (vmexec/RunCommand.swift setupNamespaces). Apple's init image ships no
+        // runc, so defaulting to a runc path would fail every container start.
         let out = container_config(ContainerConfig::default());
+        assert_eq!(out.oci_runtime_path, None);
+    }
+
+    #[test]
+    fn an_explicit_guest_runtime_is_passed_through() {
+        // Opt-in for a guest that does provide a runc binary.
+        let out = container_config_from_cri(
+            &ContainerConfig::default(),
+            &PodSandboxConfig::default(),
+            &PodRuntimeConfig {
+                oci_runtime_path: Some("/usr/bin/runc".to_string()),
+                ..PodRuntimeConfig::default()
+            },
+            &BlockMount::block("ext4", "/i.ext4"),
+        );
         assert_eq!(out.oci_runtime_path.as_deref(), Some("/usr/bin/runc"));
     }
 

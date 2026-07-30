@@ -121,8 +121,10 @@ pub struct ContainerConfig {
     pub readonly_rootfs: bool,
     pub pid_namespace: NamespaceMode,
     pub ipc_namespace: NamespaceMode,
-    /// OCI runtime in the guest. `None` uses vminitd's built-in `vmexec`;
-    /// `Some("/usr/bin/runc")` runs runc.
+    /// OCI runtime in the guest. `None` uses vminitd's built-in `vmexec`, which
+    /// is what upstream's `LinuxPod` passes and which implements join-by-path
+    /// namespaces (`vmexec/RunCommand.swift` `setupNamespaces`). `Some(path)`
+    /// shells out to that binary, which must exist inside the guest.
     pub oci_runtime_path: Option<String>,
 }
 
