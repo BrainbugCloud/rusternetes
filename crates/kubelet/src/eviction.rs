@@ -933,7 +933,7 @@ pub fn get_node_stats(root_dir: &Path) -> NodeStats {
     sys.refresh_all();
 
     let memory_total_bytes = sys.total_memory();
-    let memory_available_bytes = sys.available_memory();
+    let memory_available_bytes = available_memory_bytes(&sys, memory_total_bytes);
 
     let (nodefs_available_bytes, nodefs_total_bytes, nodefs_inodes_free, nodefs_inodes_total) =
         match statvfs_for_root_dir(root_dir) {
@@ -966,6 +966,36 @@ pub fn get_node_stats(root_dir: &Path) -> NodeStats {
         nodefs_inodes_total,
         pid_available,
         pid_total,
+    }
+}
+
+/// The `memory.available` signal, in bytes.
+///
+/// Upstream computes this as capacity minus working set
+/// (`pkg/kubelet/stats/helper.go:74` — "availableBytes = memory limit (if known)
+/// - workingset"), fed by cAdvisor's cgroup accounting.
+///
+/// On Linux `sysinfo`'s `available_memory()` is `/proc/meminfo` `MemAvailable`,
+/// which already accounts for reclaimable page cache, so it is used as-is.
+///
+/// On macOS `sysinfo` has no Darwin implementation of `available_memory()` and
+/// returns **0**. Left alone, `memory.available < 100Mi` is permanently true and
+/// the kubelet evicts every pod within seconds of it starting. So fall back to
+/// upstream's formula with `used_memory()` as the working set: on Darwin that is
+/// the active + wired + compressor page set, i.e. exactly the memory that cannot
+/// be reclaimed without swapping. Measured on a 36 GiB host: `available_memory()`
+/// = 0, while `total - used` = 8.97 GiB against a reclaimable
+/// free+inactive+purgeable+speculative set of 9.00 GiB.
+fn available_memory_bytes(sys: &sysinfo::System, memory_total_bytes: u64) -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        memory_total_bytes.saturating_sub(sys.used_memory())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // `memory_total_bytes` is only needed for the Darwin formula.
+        let _ = memory_total_bytes;
+        sys.available_memory()
     }
 }
 
@@ -1099,6 +1129,39 @@ async fn get_pod_stats_async(pods: &[Pod]) -> HashMap<String, PodStats> {
     }
 
     stats_map
+}
+
+#[cfg(test)]
+mod platform_memory_tests {
+    use super::*;
+
+    #[test]
+    fn available_memory_never_exceeds_total() {
+        let mut sys = sysinfo::System::new_all();
+        sys.refresh_all();
+        let total = sys.total_memory();
+        let available = available_memory_bytes(&sys, total);
+        assert!(total > 0, "total memory must be probed");
+        assert!(
+            available <= total,
+            "available ({available}) must not exceed total ({total})"
+        );
+    }
+
+    #[test]
+    fn node_stats_report_nonzero_available_memory() {
+        // The regression this guards: `sysinfo::available_memory()` returns 0 on
+        // macOS, which made `memory.available < 100Mi` permanently true and had
+        // the kubelet evict every pod within seconds of starting. Any host
+        // running the test suite has more than 100 MiB of reclaimable memory.
+        let stats = get_node_stats(std::path::Path::new("/"));
+        assert!(
+            stats.memory_available_bytes > 100 * 1024 * 1024,
+            "memory.available was {} bytes, which would trip the default \
+             memory.available<100Mi eviction threshold",
+            stats.memory_available_bytes
+        );
+    }
 }
 
 #[cfg(test)]

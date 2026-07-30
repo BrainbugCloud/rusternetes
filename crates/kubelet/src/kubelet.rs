@@ -330,12 +330,56 @@ fn terminal_phase_requires_termination(pod: &Pod) -> bool {
 /// NodeStatus the kubelet posts and the values the runtime uses to default
 /// resourceFieldRef LIMITS (downward-API `limits.cpu`/`memory` env) never drift.
 fn node_allocatable_map() -> HashMap<String, String> {
-    HashMap::from([
-        ("cpu".to_string(), "4".to_string()),
-        ("memory".to_string(), "8Gi".to_string()),
+    NODE_ALLOCATABLE.get_or_init(probe_node_allocatable).clone()
+}
+
+/// Probed once: a node's CPU count, RAM and filesystem size do not change while
+/// the kubelet runs, and this is read on every NodeStatus post.
+static NODE_ALLOCATABLE: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+
+/// Upstream fills capacity from cAdvisor's machine info — `cpu` from the core
+/// count, `memory` from `MemTotal` (reported in `Ki`), `ephemeral-storage` from
+/// the imagefs capacity (`pkg/kubelet/nodestatus/setters.go`, `MachineInfo`).
+/// There is no cAdvisor here, so the same three facts come from `sysinfo` and
+/// `statvfs`.
+///
+/// Previously these were hardcoded to 4 CPUs / 8Gi / 100Gi, which under-reports
+/// most hosts (measured: a 12-core, 36 GiB, 926 GiB machine advertised 4/8Gi) and
+/// caps what the scheduler will place. `pods` stays at 110, which is upstream's
+/// `--max-pods` default rather than a property of the machine.
+fn probe_node_allocatable() -> HashMap<String, String> {
+    let mut sys = sysinfo::System::new_all();
+    sys.refresh_all();
+
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1);
+
+    // Quantities are emitted in the same units upstream's kubelet uses, so
+    // `kubectl describe node` output is comparable.
+    let memory_ki = sys.total_memory() / 1024;
+
+    // Root filesystem stands in for the imagefs: the container runtime's store
+    // lives on it, and on macOS the image store is Apple's own directory there.
+    let ephemeral_bytes = crate::eviction::statvfs_for_root_dir(std::path::Path::new("/"))
+        .map(|(_, total, _, _, _)| total)
+        .unwrap_or(0);
+
+    let mut map = HashMap::from([
+        ("cpu".to_string(), cpus.to_string()),
+        ("memory".to_string(), format!("{memory_ki}Ki")),
         ("pods".to_string(), "110".to_string()),
-        ("ephemeral-storage".to_string(), "100Gi".to_string()),
-    ])
+    ]);
+    // Omit rather than advertise 0 if the probe failed: a 0 capacity would make
+    // the scheduler reject every pod with an ephemeral-storage request.
+    if ephemeral_bytes > 0 {
+        map.insert(
+            "ephemeral-storage".to_string(),
+            format!("{}Ki", ephemeral_bytes / 1024),
+        );
+    }
+    map
 }
 
 /// `pkg/kubelet/kuberuntime/kuberuntime_manager.go` `doBackOff` +
@@ -1281,21 +1325,14 @@ impl Kubelet {
 
         // Ensure capacity, allocatable, and nodeInfo are always set
         if let Some(ref mut status) = node.status {
+            // Same source as the NodeStatus the kubelet posts — see
+            // `node_allocatable_map`, which is documented as the single source of
+            // truth and was being contradicted by a second hardcoded copy here.
             if status.capacity.as_ref().is_none_or(|c| c.is_empty()) {
-                status.capacity = Some(HashMap::from([
-                    ("cpu".to_string(), "4".to_string()),
-                    ("memory".to_string(), "8Gi".to_string()),
-                    ("pods".to_string(), "110".to_string()),
-                    ("ephemeral-storage".to_string(), "100Gi".to_string()),
-                ]));
+                status.capacity = Some(node_allocatable_map());
             }
             if status.allocatable.as_ref().is_none_or(|a| a.is_empty()) {
-                status.allocatable = Some(HashMap::from([
-                    ("cpu".to_string(), "4".to_string()),
-                    ("memory".to_string(), "8Gi".to_string()),
-                    ("pods".to_string(), "110".to_string()),
-                    ("ephemeral-storage".to_string(), "100Gi".to_string()),
-                ]));
+                status.allocatable = Some(node_allocatable_map());
             }
             // Ensure nodeInfo is populated (may have been lost during updates)
             if status
@@ -5965,6 +6002,54 @@ mod taint_eviction_tests {
         assert!(!noexecute_eviction_due(&tols, &fresh, chrono::Utc::now()));
         let expired = no_execute_taint(Some(400));
         assert!(noexecute_eviction_due(&tols, &expired, chrono::Utc::now()));
+    }
+}
+
+#[cfg(test)]
+mod node_capacity_tests {
+    use super::node_allocatable_map;
+
+    #[test]
+    fn capacity_reflects_the_real_machine_not_a_hardcoded_guess() {
+        let map = node_allocatable_map();
+
+        let cpu: usize = map["cpu"].parse().expect("cpu is an integer");
+        let expected = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        assert_eq!(cpu, expected, "cpu capacity must be the host's core count");
+
+        // Previously hardcoded to 8Gi; must now be the host's real RAM.
+        let memory = &map["memory"];
+        let ki: u64 = memory
+            .strip_suffix("Ki")
+            .expect("memory is reported in Ki, as upstream's kubelet does")
+            .parse()
+            .expect("memory is an integer");
+        assert!(ki > 0, "memory capacity must be probed, got {memory}");
+
+        assert_eq!(map["pods"], "110", "max-pods is a setting, not a probe");
+    }
+
+    #[test]
+    fn ephemeral_storage_is_omitted_rather_than_advertised_as_zero() {
+        // A 0 capacity would make the scheduler reject every pod that requests
+        // ephemeral-storage, which is worse than not advertising it at all.
+        let map = node_allocatable_map();
+        if let Some(value) = map.get("ephemeral-storage") {
+            let ki: u64 = value
+                .strip_suffix("Ki")
+                .expect("ephemeral-storage is reported in Ki")
+                .parse()
+                .expect("ephemeral-storage is an integer");
+            assert!(ki > 0, "ephemeral-storage must never be advertised as 0");
+        }
+    }
+
+    #[test]
+    fn capacity_is_probed_once_and_stable() {
+        // NodeStatus posts call this on every sync; the values must not drift.
+        assert_eq!(node_allocatable_map(), node_allocatable_map());
     }
 }
 

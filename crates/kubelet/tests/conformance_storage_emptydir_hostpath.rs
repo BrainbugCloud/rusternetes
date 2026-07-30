@@ -52,6 +52,23 @@ fn unique_tmp_dir(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("rusternetes-conformance-storage-{tag}-{ts}"))
 }
 
+/// A temp dir short enough to hold a bindable unix socket.
+///
+/// `sockaddr_un.sun_path` is 104 bytes on macOS (108 on Linux), and the whole
+/// path counts. macOS puts `TMPDIR` under `/var/folders/<...>/T/`, ~49 bytes on
+/// its own, so [`unique_tmp_dir`]'s descriptive name plus a nanosecond timestamp
+/// overruns the limit and `bind(2)` fails with "path must be shorter than
+/// SUN_LEN" before the test under examination even runs.
+#[cfg(unix)]
+fn unique_tmp_dir_for_socket(tag: &str) -> PathBuf {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    // Keep only the low bits of the timestamp: still unique per run, far shorter.
+    std::env::temp_dir().join(format!("rk-{tag}-{:x}", ts as u32))
+}
+
 #[cfg(unix)]
 fn mode_of(path: &Path) -> u32 {
     fs::metadata(path).unwrap().permissions().mode() & 0o7777
@@ -662,9 +679,9 @@ fn hostpath_type_socket_rejects_non_socket() {
 #[test]
 fn hostpath_type_socket_accepts_real_socket() {
     use std::os::unix::net::UnixListener;
-    let dir = unique_tmp_dir("hp-socket-real");
+    let dir = unique_tmp_dir_for_socket("sock");
     fs::create_dir_all(&dir).unwrap();
-    let sock = dir.join("kubelet.sock");
+    let sock = dir.join("k.sock");
     let _listener = UnixListener::bind(&sock).expect("bind unix socket");
 
     let res = check_host_path_type(sock.to_str().unwrap(), Some("Socket"));
