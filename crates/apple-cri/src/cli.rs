@@ -468,15 +468,34 @@ impl Cli {
     }
 
     /// Idempotent image delete.
+    ///
+    /// CRI requires `RemoveImage` to succeed when the image is already gone,
+    /// *including* when a concurrent `RemoveImage` is what removed it — critest's
+    /// "should not fail on simultaneous RemoveImage calls" fires five at once.
+    /// Apple's delete is not atomic against itself: the loser of that race exits
+    /// non-zero with `failed to delete one or more images: ["<ref>"]`, which is
+    /// indistinguishable by message from a genuine failure.
+    ///
+    /// So the outcome is checked rather than the message: if the reference is gone
+    /// from the store, the delete achieved what was asked, whoever performed it.
+    /// Matching on the error text instead would either mask real failures (an
+    /// image still in use) or keep failing this spec.
     pub async fn remove_image(&self, reference: &str) -> Result<()> {
         let out = self.raw(&["image", "delete", reference]).await?;
         if out.status.success() {
             return Ok(());
         }
-        match classify("remove image", &out.stderr_str()) {
-            Error::NotFound(_) => Ok(()),
-            other => Err(other),
+        let err = classify("remove image", &out.stderr_str());
+        if matches!(err, Error::NotFound(_)) {
+            return Ok(());
         }
+        // Re-read the store: a concurrent delete may have won.
+        if let Ok(images) = self.list_images().await {
+            if !images.iter().any(|i| i.reference() == reference) {
+                return Ok(());
+            }
+        }
+        Err(err)
     }
 
     /// `container registry login --password-stdin -u <user> <server>`.

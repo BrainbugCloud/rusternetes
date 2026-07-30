@@ -81,7 +81,7 @@ which keeps stdout and stderr apart and — the part that actually matters — g
 both streams a real EOF when the container exits. Without that EOF the CRI
 streaming protocol never closes the session and `Attach` hangs forever.
 
-Three behaviours worth recording, all measured against 0.7.1 and all
+Three behaviours worth recording, all measured against 1.2.0 and all
 counterintuitive:
 
 - **Signals to the CLI are proxied into the guest — SIGTERM only.** SIGTERM to
@@ -114,32 +114,74 @@ Stats need no cAdvisor equivalent: `container stats --format json` reports the
 guest's own cgroup accounting, so the shim never reads `/proc` or cgroupfs —
 neither of which exists on macOS.
 
-## Host↔container connectivity (an environment gate, not a shim limitation)
+## Host↔container connectivity (macOS Local Network privacy)
 
 Container-to-container traffic works, and so does everything riding Apple's own
 control plane (`exec`, `logs`, `attach`, stats). Traffic **from macOS into a
-container** is a separate matter, and on some hosts it does not work at all.
-Measured here (macOS 26.5.1, `container` 0.7.1):
+container** depends on a *per-application* macOS authorization. When the
+connecting process lacks it, the failure looks exactly like a broken network but
+is not one. Measured here (macOS 26.5.1, `container` 1.2.0), all against the same
+nginx container at `192.168.64.3`:
 
 | Path | Result |
 |---|---|
-| container → container, by IP | works (HTTP 200 from nginx) |
-| host → container IP | `No route to host`, with an **incomplete ARP entry** on `bridge101` — even though the host holds `192.168.64.1/24` on that same bridge and pings its own gateway fine |
-| host → `--publish`ed port on `127.0.0.1` | the proxy **accepts** the TCP connection, then **resets** it |
+| container → container, by IP | works (HTTP 200) |
+| container → host (`192.168.64.1`) | works, 0.5 ms |
+| host → container IP, from a process **without** the grant | `No route to host` — instantly, and with **zero packets on `bridge100`** under `tcpdump` |
+| host → container IP, from a process **with** the grant | `HTTP 200`, logged by nginx as a request from `192.168.64.1` |
+| host → `--publish`ed port on `127.0.0.1` | TCP **accepted**, then **reset**; the request never reaches the container — **even with the grant** |
 
-Neither path is fixed by restarting the runtime, and neither is caused by the
-`vmenet` interface leak that accumulates across container churn (68 interfaces
-survived a `container system stop` here). The likely cause is host policy —
-macOS's Local Network privacy gate and/or the enabled application firewall —
-rather than anything this shim controls. The fix is granting the connecting
-process Local Network access and allowing `container` through the firewall; both
-are user actions in System Settings.
+The cause is **macOS's Local Network privacy gate** (TCC
+`kTCCServiceLocalNetwork`) — not routing, not ARP, not the application firewall,
+not `vmnet`, and not `container`. Four measurements pin it down:
 
-`dial_in_sandbox` therefore tries the container IP first and falls back to a
-published host port when the sandbox declares one, so port-forward works wherever
-either path is open. The three critest specs that require host→container
-connectivity are skipped by default and can be re-enabled with
-`INCLUDE_NETWORK=1`.
+- The route points at the right bridge and the ARP entry for the container is
+  **complete** (the container's own traffic populates it), yet the host's packets
+  **never reach the interface** — they are discarded on egress, above the link
+  layer. Neither a routing fault nor an ARP failure can produce that, and the
+  application firewall filters inbound sockets, not outbound sends.
+- The block follows the **application, not the address**: at the same instant the
+  shell got `No route to host`, an app holding the grant fetched `/` and nginx
+  logged a `200` from `192.168.64.1`.
+- The exemptions match the feature precisely. On one interface and one subnet,
+  the host's own address works, the **default gateway** works, and an ordinary
+  **peer** is 100% lost. The same pattern holds on the unrelated physical LAN, so
+  it is not specific to Apple's bridge.
+- Loopback is exempt, which is why `--publish` *accepts* the connection — but the
+  proxy that then dials the container is itself an unauthorized process, so it
+  fails and resets. **`--publish` is therefore not a workaround**, and neither is
+  restarting the runtime. (The `vmenet` interface leak — 68 interfaces surviving
+  a `container system stop` — is unrelated; it does not affect the datapath.)
+
+This is grantable, and granting it is a **user action** in System Settings →
+Privacy & Security → Local Network. The grant belongs to the *responsible*
+application, which for a shim started from a terminal is the terminal or host
+app, not the `apple-cri` binary — and bundles nest, so the responsible app may
+not be the one you expect (here it was `com.anthropic.claude-code`, a distinct
+bundle inside `com.anthropic.claudefordesktop`).
+
+**Confirmed by granting it.** With the grant in place and nothing else changed,
+the shell went from `No route to host` to `HTTP 200`, and two of the three
+previously-skipped critest specs pass: `runtime should support portforward` and
+`port mapping with only container port`. The third — `port mapping with host port
+and container port` — still fails, because that path runs through Apple's publish
+proxy, a launchd-started helper that cannot present an authorization prompt and
+so stays unauthorized. It is skipped unconditionally for that reason.
+
+It matters well beyond port-forward. Every host-originated connection to a pod IP
+is gated identically — including the kubelet's **HTTP and TCP liveness/readiness
+probes** and any host-side Service proxying. Moving to one VM per pod does not
+change this; only the authorization does.
+
+(Attribution is behavioural: reading the TCC database directly needs Full Disk
+Access, so the mechanism is identified from the drop pattern above rather than
+from a TCC entry.)
+
+`dial_in_sandbox` tries the container IP first and falls back to a published host
+port when the sandbox declares one, so port-forward works wherever either path is
+open — noting that the fallback only helps if the publish proxy is itself
+authorized, which on this host it is not. The two grant-dependent critest specs
+are skipped by default and re-enabled with `INCLUDE_NETWORK=1`.
 
 ## Deviations from CRI
 
@@ -186,10 +228,12 @@ does offer here, the harness skips these:
 | `runtime should support set hostname` | no `--hostname` flag exists |
 | `should return the same image identifier when pulled from different registries` | needs the same image in two registries |
 | `removing image from one registry should remove all tags from other registries` | same |
-| `runtime should support portforward` | needs host→container connectivity (see above); re-enable with `INCLUDE_NETWORK=1` |
-| `runtime should support port mapping` (both specs) | same |
+| `runtime should support portforward` | needs Local Network access for the shim's process (see above); **passes** with it — re-enable with `INCLUDE_NETWORK=1` |
+| `port mapping with only container port` | same |
+| `port mapping with host port and container port` | goes through Apple's publish proxy, which cannot be authorized; skipped unconditionally |
+| `runtime should support execSync with timeout` | `container` 1.2.0 drops signals sent to an exec'd process (upstream type mismatch in its own XPC message); see `STATUS.md` |
 
-The last three are *environment*-gated, not runtime-gated: they are expected to
-pass on a host where macOS will route into a container.
+The first two are *environment*-gated, not runtime-gated, and are verified to
+pass once the grant is in place.
 
 See `STATUS.md` for the current pass count.

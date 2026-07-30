@@ -124,17 +124,17 @@ impl AppleBackend {
         let mut groups: std::collections::BTreeMap<String, ImageGroup> =
             std::collections::BTreeMap::new();
         for entry in self.cli.list_images().await? {
-            if is_infra_image(&entry.reference) {
+            if is_infra_image(entry.reference()) {
                 continue;
             }
             groups
-                .entry(entry.descriptor.digest.clone())
+                .entry(entry.descriptor().digest.clone())
                 .or_insert_with(|| ImageGroup {
-                    id: entry.descriptor.digest.clone(),
+                    id: entry.descriptor().digest.clone(),
                     listed: Vec::new(),
                 })
                 .listed
-                .push(entry.reference);
+                .push(entry.configuration.name);
         }
         Ok(groups.into_values().collect())
     }
@@ -170,7 +170,7 @@ impl AppleBackend {
             .and_then(|c| c.config.as_ref());
         Ok(Some(ResolvedImage {
             id: group.id.clone(),
-            reference: insp.name.clone(),
+            reference: insp.name().to_string(),
             entrypoint: inner.map(|c| c.entrypoint.clone()).unwrap_or_default(),
             cmd: inner.map(|c| c.cmd.clone()).unwrap_or_default(),
         }))

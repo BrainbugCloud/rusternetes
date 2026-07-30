@@ -1,0 +1,95 @@
+{
+    "configuration": {
+        "capAdd": [],
+        "capDrop": [],
+        "creationDate": "2026-07-30T18:01:23Z",
+        "dns": {
+            "nameservers": [],
+            "options": [],
+            "searchDomains": []
+        },
+        "id": "fc51e1198130435bb3e0a682be082fe3",
+        "image": {
+            "descriptor": {
+                "digest": "sha256:c318242786b139d18676b1c09a0ad7f15fc17f8f16a5b2e625cd0dc8c9703daf",
+                "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+                "size": 3117
+            },
+            "reference": "registry.k8s.io/e2e-test-images/busybox:1.29-2"
+        },
+        "initProcess": {
+            "arguments": [
+                "-c",
+                "top"
+            ],
+            "environment": [
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            ],
+            "executable": "sh",
+            "rlimits": [],
+            "supplementalGroups": [],
+            "terminal": false,
+            "user": {
+                "id": {
+                    "gid": 0,
+                    "uid": 0
+                }
+            },
+            "workingDirectory": "/"
+        },
+        "labels": {
+            "io.kubernetes.container.name": "idempotence-container-0667196f-aff3-44e5-9754-a3e82339c613",
+            "io.kubernetes.cri.container-type": "container",
+            "io.kubernetes.cri.sandbox-id": "069c3d8776ea4f66bd7e632102421168",
+            "io.kubernetes.pod.name": "create-PodSandbox-for-container-8f5199d0-2395-4fc8-945d-560bedc6b22d",
+            "io.kubernetes.pod.namespace": "cri-test-namespace81a6a2cd-121e-4e00-9491-01de993d8d3c",
+            "io.kubernetes.pod.uid": "cri-test-uidcdbe5cda-c797-40e2-827d-1f2ca554b36a"
+        },
+        "mounts": [],
+        "networks": [
+            {
+                "network": "k8s-critest",
+                "options": {
+                    "hostname": "fc51e1198130435bb3e0a682be082fe3",
+                    "mtu": 1280
+                }
+            }
+        ],
+        "platform": {
+            "architecture": "arm64",
+            "os": "linux",
+            "variant": "v8"
+        },
+        "publishedPorts": [],
+        "publishedSockets": [],
+        "readOnly": false,
+        "resources": {
+            "cpuOverhead": 1,
+            "cpus": 4,
+            "memoryInBytes": 1073741824
+        },
+        "rosetta": false,
+        "runtimeHandler": "container-runtime-linux",
+        "ssh": false,
+        "sysctls": {},
+        "useInit": false,
+        "virtualization": false
+    },
+    "id": "fc51e1198130435bb3e0a682be082fe3",
+    "status": {
+        "networks": [
+            {
+                "hostname": "fc51e1198130435bb3e0a682be082fe3",
+                "ipv4Address": "192.168.65.3/24",
+                "ipv4Gateway": "192.168.65.1",
+                "ipv6Address": "fd84:62f6:5071:28e9:f423:86ff:fec2:e9b3/64",
+                "macAddress": "f6:23:86:c2:e9:b3",
+                "mtu": 1280,
+                "network": "k8s-critest",
+                "variant": "reserved"
+            }
+        ],
+        "startedDate": "2026-07-30T18:01:23Z",
+        "state": "running"
+    }
+}

@@ -1,22 +1,23 @@
 # apple-cri status
 
-Host: macOS 26.5.1, Apple silicon (arm64), `container` CLI **0.7.1**,
+Host: macOS 26.5.1, Apple silicon (arm64), `container` CLI **1.2.0**
+(containerization 0.40.1),
 critest/crictl **1.36.0** (native darwin/arm64 builds).
 
 ## critest — 2026-07-30
 
 ```bash
-bash scripts/apple-cri-critest.sh
+INCLUDE_NETWORK=1 bash scripts/apple-cri-critest.sh
 ```
 
 ```
-Ran 48 of 59 Specs in 199.456 seconds
-SUCCESS! -- 48 Passed | 0 Failed | 0 Pending | 11 Skipped
+Ran 49 of 59 Specs in 216.557 seconds
+SUCCESS! -- 49 Passed | 0 Failed | 0 Pending | 10 Skipped
 ```
 
-**48/48 of the supported set pass.** Of critest's 59 specs, 5 self-skip on
+**49/49 of the supported set pass.** Of critest's 59 specs, 5 self-skip on
 darwin (the Linux-only suites: hostNetwork, sysctls, seccomp/AppArmor/SELinux,
-capabilities, OOM, `NamespaceOption`, devices) and the harness skips 6 more —
+capabilities, OOM, `NamespaceOption`, devices) and the harness skips 5 more —
 each justified in `README.md`:
 
 | Skipped | Reason | Kind |
@@ -24,24 +25,85 @@ each justified in `README.md`:
 | `runtime should support set hostname` | `container create` has no `--hostname` | runtime |
 | `…image identifier when pulled from different registries` | needs one image in two registries | fixture |
 | `removing image from one registry should remove all tags from other registries` | same | fixture |
-| `runtime should support portforward` | needs host→container connectivity | **environment** |
-| `runtime should support port mapping` ×2 | same | **environment** |
+| `port mapping with host port and container port` | Apple's publish proxy cannot be authorized (below) | **environment** |
+| `runtime should support execSync with timeout` | signals never reach an exec'd process on 1.2.0 (below) | **upstream bug** |
 
-The last three are expected to pass on a host where macOS routes into a
-container; re-enable with `INCLUDE_NETWORK=1`. On this host neither the direct
-vmnet address nor `--publish`'s own proxy is reachable from macOS — see
-README "Host↔container connectivity" for the measurements.
+`INCLUDE_NETWORK=1` adds `runtime should support portforward` and `port mapping
+with only container port`, which need the shim's own process to hold **macOS
+Local Network access** — without it every host-originated packet to a container
+is dropped before egress. Plain `bash scripts/apple-cri-critest.sh` skips those
+two and reports **47/47**, so an unauthorized host still gets a green run.
+
+The gate is macOS policy, not a limitation of this shim or of Apple's runtime, and
+it is per-application. Verified both ways: before the grant a shell got `No route
+to host` with zero packets on the bridge while an authorized app fetched HTTP 200
+from the same container; after the grant the shell got HTTP 200 and both specs
+above went green with no other change. `--publish` is *not* a workaround — its
+proxy is a launchd-started helper that cannot present an authorization prompt, so
+it accepts on loopback, fails its own dial and resets. Note that host-originated
+connections to pod IPs also cover the kubelet's HTTP/TCP **liveness and readiness
+probes**, so this grant is a prerequisite for running a kubelet here, not just for
+port-forward. See README "Host↔container connectivity" for the measurements.
+
+### Upgrading the runtime 0.7.1 → 1.2.0 broke five things
+
+Worth recording, because three of them failed **silently** — the JSON parsed
+into empty values rather than erroring, so the symptom appeared far from the cause:
+
+| Change | Symptom |
+|---|---|
+| `image list`/`image inspect` moved `reference`+`descriptor` under a `configuration` object as `name`+`descriptor` | every Image Manager spec: "pulled X but it is not in the image store" (silent) |
+| container `status` became an object `{state, startedDate, networks}` instead of a bare string | every inspect: `invalid type: map, expected a string` (loud) |
+| network attachments split into `ipv4Address`/`ipv4Gateway` | pod IP resolved to `None` (silent) |
+| `networks[].options` mixes value types (`{"hostname": "…", "mtu": 1280}`) | every inspect: `invalid type: integer 1280, expected a string` (loud) |
+| `network ls` renamed `config`→`configuration`, `creationDate` float→ISO string | nothing yet — only `id` is read (silent) |
+
+`testdata/container-inspect-1.2.0.json` is now a verbatim capture of the runtime's
+own output, asserted against in `model.rs`. A hand-written fixture would have gone
+on agreeing with the old model, which is precisely how these got through.
+
+1.2.0 also *adds* `status.startedDate` and `configuration.creationDate` — real
+timestamps, which 0.7.x had none of. They are parsed but not yet used as a source
+of truth; the checkpoint store remains authoritative. Worth revisiting, since it
+was the absence of timestamps that forced that store to exist.
+
+### An upstream 1.2.0 bug: signals never reach an exec'd process
+
+`runtime should support execSync with timeout` cannot pass on 1.2.0. A timed-out
+`ExecSync` sends SIGTERM to the `container exec` child, which the CLI then fails to
+forward:
+
+```
+failed to send signal: [error: invalidArgument: "missing signal in xpc message", "signal": 15]
+```
+
+Its own XPC client and server disagree on the field's type:
+
+```swift
+// Sources/Services/ContainerAPIService/Client/ClientProcess.swift:83
+request.set(key: .signal, value: Int64(signal))   // writes Int64
+// Sources/Services/ContainerAPIService/Server/Containers/ContainersService.swift:1154
+guard let signal = self.string(key: .signal)      // reads String
+```
+
+Container-level signals go through `ContainerClient.swift:168`, which writes a
+`String` — which is why `StopContainer` and `container kill` still work and only
+the exec path is affected. Verified by hand: the guest `sleep` survives SIGTERM to
+the CLI and is still there as pid 2. This spec passed on 0.7.1 and nothing in the
+shim changed; there is no workaround available to us, because the exec'd process's
+guest pid is never exposed. Worth filing upstream.
 
 Suites fully green: Runtime info (2), PodSandbox (4), Container runtime (18,
-incl. volumes, logs, `ReopenContainerLog`, execSync + timeout, stats),
-Streaming (exec tty/non-tty, attach), Networking (DNS config), Image Manager
+incl. volumes, logs, `ReopenContainerLog`, execSync, stats),
+Streaming (exec tty/non-tty, attach, port-forward), Networking (DNS config,
+container-port mapping), Image Manager
 (11), Image Consistency (3), Image Identifier Consistency (1), Idempotence (7).
 
 ## Unit tests
 
 ```
 cargo test -p apple-cri
-test result: ok. 52 passed; 0 failed
+test result: ok. 57 passed; 0 failed
 ```
 
 `cargo clippy -p apple-cri --all-targets -- -D warnings` and
@@ -53,7 +115,7 @@ test result: ok. 52 passed; 0 failed
 |---|---|
 | every container reported EXITED right after start | container ids over ~64 chars make `start --attach` fail with `EINVAL`; the cri-dockerd-style name is ~230 chars |
 | `StartContainer` failed for critest's idempotence specs | an empty CRI `log_path` was treated as a fatal open error |
-| a timed-out `ExecSync` left its process running in the guest | SIGKILL to `container exec` orphans the guest process; only SIGTERM is proxied |
+| a timed-out `ExecSync` left its process running in the guest | SIGKILL to `container exec` orphans the guest process; only SIGTERM is proxied — and on 1.2.0 not even that, see the upstream bug above |
 | exec with `tty=true, stdin=true` failed | the CLI requires a real PTY on stdin for that combination |
 | `Attach` hung for the full suite timeout | attach output came from a second `container logs --follow` that never EOF'd; and the fan-out `Sender` held in the relay handle kept the channel open, so an explicit `Eof` was needed |
 | attach saw nothing for `echo -n hello` | the stdio pump was line-oriented and blocked on a newline that never came |
@@ -61,6 +123,8 @@ test result: ok. 52 passed; 0 failed
 | one image with 3 tags reported as 3 images | CRI reports one `Image` per id with all its tags; Apple lists one row per reference |
 | `RemoveImage` left the image resolvable | only tags were untagged, not a real `name@digest` store entry |
 | `Username` reported as `www-data:group` | the group must be split off the OCI `User` field |
+| every Image Manager spec failed after upgrading the runtime to 1.2.0 with "pulled X but it is not in the image store" | `image list`/`image inspect` moved `reference`+`descriptor` under a `configuration` object (`name`, `descriptor`); the 0.7.x shape parsed as an empty reference instead of erroring, so every lookup missed |
+| concurrent `RemoveImage` calls failed for all but one caller | Apple's `image delete` is not atomic against itself; the losers exit non-zero with `failed to delete one or more images`, which reads the same as a real failure. `remove_image` now re-reads the store and treats "the reference is gone" as success, whoever removed it |
 
 ## Not yet done
 
