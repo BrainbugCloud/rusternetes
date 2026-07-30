@@ -1,0 +1,29 @@
+[package]
+name = "apple-cri"
+version = "0.1.0"
+edition = "2021"
+authors = ["Rusternetes Contributors"]
+license = "Apache-2.0"
+description = "A CRI server for Apple's container runtime (apple/container) on macOS — one microVM per container"
+repository = "https://github.com/rusternetes/rusternetes"
+
+# NOTE: depends on cri-proto/cri-server only — never on the kubelet or other
+# rusternetes-* crates (same rule as bollard-cri, plan/03-bollard-cri.md).
+
+[dependencies]
+cri-proto = { version = "0.1.0", path = "../cri-proto" }
+cri-server = { version = "0.1.0", path = "../cri-server" }
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+async-trait = "0.1"
+clap = { version = "4.5", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+libc = "0.2"
+uuid = { version = "1.10", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
