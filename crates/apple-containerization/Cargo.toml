@@ -1,0 +1,44 @@
+[package]
+name = "apple-containerization"
+version = "0.1.0"
+edition = "2021"
+authors = ["Rusternetes Contributors"]
+license = "Apache-2.0"
+description = "Low-level client for Apple's Containerization sandbox protocol (SandboxContext v3 / vminitd) — one microVM per pod"
+repository = "https://github.com/rusternetes/rusternetes"
+keywords = ["macos", "virtualization", "container", "grpc", "vminitd"]
+categories = ["api-bindings", "virtualization"]
+
+# NOTE: this crate must not depend on any rusternetes-* crate, nor on cri-proto /
+# cri-server. It is a client for Apple's guest-agent protocol and nothing else;
+# apple-cri is what joins it to CRI. Same layering rule as cri-proto.
+
+[dependencies]
+prost = "0.14"
+prost-types = "0.14"
+tonic = "0.14"
+tonic-prost = "0.14"
+tokio = { version = "1.40", features = ["net", "sync", "io-util", "macros", "rt", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tower = { version = "0.5", features = ["util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+tracing = "0.1"
+# Only used by the `testing` module's fake guest, which needs a temp dir for its
+# unix socket.
+tempfile = { version = "3", optional = true }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[features]
+# Exposes the in-process fake guest agent and mock VMM so downstream crates
+# (apple-cri) can test pod semantics without a hypervisor.
+testing = ["dep:tempfile"]
+
+[dev-dependencies]
+tokio = { version = "1.40", features = ["full"] }
+tempfile = "3"

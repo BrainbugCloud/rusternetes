@@ -16,6 +16,11 @@ mod images;
 mod logs;
 mod model;
 mod naming;
+// The pod-shaped CRI path (one microVM per pod). Not yet the default backend —
+// it needs a VMM broker for VM lifecycle, vsock and block hotplug, so nothing
+// wires it up yet. See crates/apple-cri/STATUS.md.
+#[allow(dead_code)]
+mod pod_runtime;
 mod sandbox;
 mod state;
 mod stats;

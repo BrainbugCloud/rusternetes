@@ -102,12 +102,12 @@ container-port mapping), Image Manager
 ## Unit tests
 
 ```
-cargo test -p apple-cri
-test result: ok. 57 passed; 0 failed
+cargo test -p apple-cri --all-features
+test result: ok. 87 passed; 0 failed
 ```
 
-`cargo clippy -p apple-cri --all-targets -- -D warnings` and
-`cargo fmt --all -- --check` are clean.
+`cargo clippy -p apple-cri -p apple-containerization --all-targets --all-features
+-- -D warnings` and `cargo fmt --all -- --check` are clean.
 
 ## Bugs this shim had to solve (each found by a failing spec)
 
@@ -126,12 +126,88 @@ test result: ok. 57 passed; 0 failed
 | every Image Manager spec failed after upgrading the runtime to 1.2.0 with "pulled X but it is not in the image store" | `image list`/`image inspect` moved `reference`+`descriptor` under a `configuration` object (`name`, `descriptor`); the 0.7.x shape parsed as an empty reference instead of erroring, so every lookup missed |
 | concurrent `RemoveImage` calls failed for all but one caller | Apple's `image delete` is not atomic against itself; the losers exit non-zero with `failed to delete one or more images`, which reads the same as a real failure. `remove_image` now re-reads the store and treats "the reference is gone" as success, whoever removed it |
 
+## Real pod semantics — 2026-07-30
+
+The CLI path above gives **one microVM per container**. Real pods live below the
+CLI, in `vminitd`'s `SandboxContext` gRPC service: its process RPCs carry an
+optional `containerID`, so one VM hosts N containers, each with its own rootfs and
+OCI runtime invocation.
+
+That protocol is now implemented in Rust as
+[`apple-containerization`](../apple-containerization/README.md) — a port of Apple's
+Containerization Swift package at `ff44a5b` (v0.40.1), the version `container`
+1.2.0 pins. `pod.rs` ports `LinuxPod.swift`; `crate::pod_runtime` here translates
+CRI onto it.
+
+```
+cargo test -p apple-containerization -p apple-cri --all-features
+16 passed   (apple-containerization unit)
+36 passed   (pod semantics, over real gRPC)
+87 passed   (apple-cri, incl. 30 pod_runtime)
+```
+
+The 36 pod-semantics tests run against a **real** in-process `SandboxContext`
+server: the generated tonic client, the proto encoding and the OCI-spec JSON are
+all the ones `vminitd` would see, and a malformed spec fails the test. They assert
+the call sequence and the exact spec bytes — where pod semantics actually live.
+
+Verified pod behaviour, and how it differs from upstream `LinuxPod`, which is the
+right mechanism but the wrong policy (it gives each container a *fresh* ipc/uts
+namespace):
+
+| Behaviour | How |
+|---|---|
+| one VM per pod, N containers | `containerID` on every process RPC; rootfs hotplugged per container |
+| shared pod network + `localhost` | no `network` namespace declared → the VM's root netns is the pod network |
+| shared IPC | members join `/proc/<infra>/ns/ipc` — **divergence**, upstream gives each a fresh one |
+| one pod hostname | members join `/proc/<infra>/ns/uts`; hostname set on the infra spec only |
+| `shareProcessNamespace` | members join `/proc/<infra>/ns/pid`; private otherwise |
+| containers added to a live sandbox | `vm.hotplug(rootfs, id:)`, the CRI ordering |
+| per-container rootfs / cgroup / limits | `/run/container/<id>/rootfs`, `/container/pod/<pod>/<id>` |
+| exec | same `containerID`, distinct process `id`, inheriting the container's spec |
+
+A member container deliberately carries **no** `hostname`: an OCI runtime can only
+set one in a UTS namespace it created, and runc errors out if `hostname` is set
+while the namespace is inherited.
+
+### The remaining gap: a VMM broker
+
+Everything inside the guest is gRPC, so it is Rust. Four host-side operations are
+not, because macOS exposes them only through Virtualization.framework and only to
+the process owning the `VZVirtualMachine`: VM lifecycle, vsock dial/listen, block
+hotplug, and virtiofs shares. They sit behind `apple_containerization::Vmm`.
+
+**No broker is implemented, so no pod has booted on hardware yet.** Driving
+Apple's shipped `container-runtime-linux` is not sufficient: its XPC surface has
+`bootstrap` and `dial` — the agent is reachable — but no hotplug route, so
+containers could never be added to a live sandbox. A broker therefore has to own
+the VM itself. Apple's `Containerization` SPM package builds cleanly here
+(`swift build --product Containerization`, Swift 6.2), which makes a small Swift
+helper the cheapest path: it reuses upstream's tested VZ code and ext4 unpacking
+instead of reimplementing them, and needs the `com.apple.security.virtualization`
+entitlement.
+
+Also still open on the pod path:
+
+- `RootfsProvider` has no implementation: turning an image reference into an ext4
+  block device is host-side work (upstream's `ContainerizationEXT4` `EXT4Unpacker`
+  writes a per-container `rootfs.ext4`).
+- CRI mounts name **host** paths, so they need virtiofs shares before the guest
+  bind can resolve. `pod_runtime` emits the correct mount shape; without broker
+  virtiofs support the guest bind fails with `ENOENT`.
+- Stdio/attach/port-forward over pod vsock ports: `Pod::dial` and the stdio port
+  allocator are in place, the relay is not. Container `stdin` is therefore always
+  wired to `None` today.
+- **Pod VM sizing is a flat default** (4 cpus / 1 GiB) rather than derived from the
+  containers' requests. A VM is sized once, at `RunPodSandbox`, before any
+  container config is known — so either the kubelet's pod-level resources have to
+  be read from the sandbox config, or the VM needs resizing on `CreateContainer`.
+  Unlike a Linux runtime, getting this wrong costs real RAM per pod.
+- `pod_runtime` is not wired into `AppleBackend`; the CLI path remains the default
+  so critest stays green.
+
 ## Not yet done
 
-- The Kata-shaped pod model (one VM per *pod*, containers as namespaced
-  processes inside it) — the only way to get shared `localhost`, a single pod IP,
-  and shared IPC/PID. Needs a transport below the CLI (`Containerization` +
-  `vminitd`), which is why the CLI is isolated behind `cli.rs`.
 - End-to-end rusternetes-on-macOS bring-up: this crate is the CRI half; the
   kubelet also needs a macOS story for kube-proxy (iptables) and for
   `Memory`-medium `emptyDir` (`mount -t tmpfs`).

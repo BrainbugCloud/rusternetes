@@ -31,17 +31,26 @@ Kata Containers solves this by making the sandbox *be* the VM: `RunPodSandbox`
 boots one VM per pod, and `kata-agent` inside the guest then creates each
 container as namespaced processes *within* that VM. Apple's `vminitd` is the
 structural analogue of `kata-agent` — Swift init, first process in the guest, a
-gRPC API over vsock — but its job is mounting the rootfs and launching *the*
-process. It does not create per-container namespaces inside the VM, and the CLI
-exposes no way to share a netns (`--network` takes a *network* name, never a
-container) or to attach a second image's rootfs to a running VM.
+gRPC API over vsock.
 
-So a Kata-shaped pod is reachable on this stack only *below* the CLI, by
-extending `vminitd` or running our own agent in a pod VM via the
-`Containerization` Swift package. That is the real fix, and it is not what this
-crate does. This crate takes the achievable path — one VM per container, with the
-consequences documented below — and keeps the pod model behind
-`RuntimeBackend` so the Kata-shaped implementation can replace it later.
+The mismatch is in the **CLI**, not the protocol. `container` gives one microVM
+per container and exposes no way to share a netns (`--network` takes a *network*
+name, never a container) or to attach a second image's rootfs to a running VM.
+But `vminitd`'s `SandboxContext` service underneath it does: every process RPC
+carries an optional `containerID`, and `ociRuntimePath` selects the guest OCI
+runtime, so **one VM can host N containers** with per-container namespaces.
+Upstream's own experimental `LinuxPod` is built on exactly that.
+
+So a Kata-shaped pod is reachable on this stack *below* the CLI — and that is now
+implemented, in [`apple-containerization`](../apple-containerization/README.md)
+plus `pod_runtime.rs` here. It is not yet the default backend: it still needs a
+VMM broker for the host-side operations only Virtualization.framework can perform
+(VM lifecycle, vsock, block hotplug). See [STATUS.md](STATUS.md).
+
+This crate therefore ships **two** paths. The default one — described in the rest
+of this document, and what critest exercises — takes the achievable CLI route: one
+VM per container, with the consequences documented below. The pod path sits behind
+the same `RuntimeBackend` seam so it can take over once a broker exists.
 
 ### What this means for a sandbox
 
@@ -231,7 +240,6 @@ does offer here, the harness skips these:
 | `runtime should support portforward` | needs Local Network access for the shim's process (see above); **passes** with it — re-enable with `INCLUDE_NETWORK=1` |
 | `port mapping with only container port` | same |
 | `port mapping with host port and container port` | goes through Apple's publish proxy, which cannot be authorized; skipped unconditionally |
-| `runtime should support execSync with timeout` | `container` 1.2.0 drops signals sent to an exec'd process (upstream type mismatch in its own XPC message); see `STATUS.md` |
 
 The first two are *environment*-gated, not runtime-gated, and are verified to
 pass once the grant is in place.

@@ -24,6 +24,7 @@ members = [
     "crates/cri-proto",
     "crates/bollard-cri",
     "crates/apple-cri",
+    "crates/apple-containerization",
 ]
 # rhino is a vendored third-party submodule (its own upstream project), wired in
 # only as an optional path dependency of crates/storage. Exclude it from the
