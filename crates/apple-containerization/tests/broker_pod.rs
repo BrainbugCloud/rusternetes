@@ -1,211 +1,343 @@
 //! A multi-container pod driven over the real broker wire format.
 //!
-//! Every other pod test talks to a `Vmm` in-process. These go through
-//! [`apple_containerization::BrokerVmm`] to a broker on a unix socket, so the
-//! full stack under test is:
-//!
 //! ```text
-//! Pod  ->  BrokerVmm  -> JSON/unix -> broker -> VM
-//!      \-> SandboxContext gRPC ----------------> vminitd
+//! PodBroker  -> JSON/unix -> broker -> LinuxPod -> vminitd
 //! ```
 //!
-//! Both hops are the real encodings the Swift broker and Apple's guest agent will
-//! see. That makes this the contract the broker has to satisfy: if it answers
-//! these methods with these shapes, the pod semantics above it already work.
-
-use std::sync::Arc;
+//! The broker owns Apple's `LinuxPod`, so the *semantics* (namespaces, OCI specs)
+//! are asserted on the Swift side. What is ours, and what these tests pin, is the
+//! **call sequence and the payloads** — which is where CRI's pod model actually
+//! shows up:
+//!
+//! * one `createPod` per pod, however many containers it holds;
+//! * containers added after `create` land in a **live** sandbox (hotplug), which
+//!   is the ordering every container after the first always takes;
+//! * `waitContainer` reports a real exit code, which is what makes an **init
+//!   container** expressible at all;
+//! * a **sidecar** is the same shape without the wait — two containers running
+//!   at once in one pod.
+//!
+//! Neither init containers nor sidecars exist in CRI; they are kubelet ordering
+//! concepts. These are their CRI-level translations, and they are the coverage
+//! critest cannot give us: its own multi-container specs live in
+//! `pkg/validate/multi_container_linux.go`, and the `_linux.go` suffix is an
+//! implicit Go build constraint, so they are not in a darwin critest binary.
 
 use apple_containerization::broker::Method;
-use apple_containerization::oci::LinuxNamespaceType;
-use apple_containerization::pod::{ContainerConfig, NamespaceMode, Pod, PodConfig};
-use apple_containerization::testing::{Call, FakeBroker, FakeGuest};
-use apple_containerization::vmm::BlockMount;
-use apple_containerization::{BrokerRootfs, BrokerVmm};
+use apple_containerization::testing::FakeBroker;
+use apple_containerization::{
+    BrokerClient, BrokerRootfs, ContainerConfigWire, ExecOptions, PodBroker, PodConfigWire,
+};
 
-/// The infra PID the fake guest hands out; it is started first and PIDs begin
-/// at 100.
-const INFRA_PID: i32 = 100;
+const POD: &str = "pod-1";
 
-async fn broker() -> FakeBroker {
-    let guest = FakeGuest::start().await.expect("fake guest");
-    FakeBroker::start(guest).await.expect("fake broker")
+struct Harness {
+    broker: FakeBroker,
+    pods: PodBroker,
+    rootfs: BrokerRootfs,
 }
 
-fn joined_ns(
-    spec: &apple_containerization::oci::Spec,
-    type_: LinuxNamespaceType,
-) -> Option<String> {
-    spec.linux
-        .as_ref()?
-        .namespaces
-        .iter()
-        .find(|n| n.type_ == type_)
-        .map(|n| n.path.clone())
+impl Harness {
+    async fn start() -> Self {
+        let broker = FakeBroker::start().await.expect("fake broker");
+        let client = BrokerClient::new(broker.socket_path());
+        Self {
+            pods: PodBroker::new(client.clone()),
+            rootfs: BrokerRootfs::new(client),
+            broker,
+        }
+    }
+
+    /// `RunPodSandbox`: build the pod, then boot it.
+    async fn run_sandbox(&self, config: PodConfigWire) {
+        self.pods.create_pod(&config).await.expect("createPod");
+        self.pods.create(&config.id).await.expect("create");
+    }
+
+    /// `CreateContainer`: materialise the image, then add it to the sandbox.
+    async fn create_container(&self, id: &str) {
+        let block = self
+            .rootfs
+            .provision(&format!("registry.example/{id}:latest"), id)
+            .await
+            .expect("provisionRootfs");
+        self.pods
+            .add_container(POD, &ContainerConfigWire::new(id, block))
+            .await
+            .expect("addContainer");
+    }
+
+    async fn create_and_start(&self, id: &str) {
+        self.create_container(id).await;
+        self.pods
+            .start_container(POD, id)
+            .await
+            .expect("startContainer");
+    }
+
+    /// Index of the first call to `method`, or a failure naming what was seen.
+    fn first(&self, method: Method) -> usize {
+        let requests = self.broker.requests();
+        requests
+            .iter()
+            .position(|m| *m == method)
+            .unwrap_or_else(|| panic!("no {method:?} in {requests:?}"))
+    }
+
+    fn count(&self, method: Method) -> usize {
+        self.broker
+            .requests()
+            .iter()
+            .filter(|m| **m == method)
+            .count()
+    }
 }
 
 #[tokio::test]
-async fn a_pod_boots_over_the_broker_protocol() {
-    let broker = broker().await;
-    let vmm = Arc::new(BrokerVmm::connect(broker.socket_path()));
-    let pod = Pod::new("pod-1", PodConfig::default(), vmm).unwrap();
+async fn a_pod_is_built_before_it_is_booted() {
+    let h = Harness::start().await;
+    h.run_sandbox(PodConfigWire::new(POD)).await;
 
-    pod.create().await.expect("create pod over the broker");
-
-    // The broker saw the VM built, booted, and its agent dialed — in that order.
-    let requests = broker.requests();
-    let first = requests
-        .iter()
-        .position(|m| *m == Method::CreateVm)
-        .expect("createVm");
-    let start = requests
-        .iter()
-        .position(|m| *m == Method::Start)
-        .expect("start");
-    let dial = requests
-        .iter()
-        .position(|m| *m == Method::Dial)
-        .expect("dial");
-    assert!(first < start, "the VM must exist before it is started");
     assert!(
-        start < dial,
-        "the VM must be running before the agent is dialed"
+        h.first(Method::CreatePod) < h.first(Method::Create),
+        "the pod must exist before its VM is booted"
+    );
+    // The config the broker was handed is the one it must build LinuxPod from.
+    let config = h.broker.params_for(Method::CreatePod)[0]
+        .config
+        .clone()
+        .expect("createPod carries a config");
+    assert_eq!(config.id, POD);
+}
+
+#[tokio::test]
+async fn two_containers_share_one_pod_and_therefore_one_vm() {
+    let h = Harness::start().await;
+    h.run_sandbox(PodConfigWire::new(POD)).await;
+
+    h.create_and_start("app").await;
+    h.create_and_start("sidecar").await;
+
+    assert_eq!(h.count(Method::CreatePod), 1, "one microVM per pod");
+    assert_eq!(h.count(Method::AddContainer), 2);
+    assert_eq!(
+        h.pods.list_containers(POD).await.unwrap(),
+        vec!["app", "sidecar"],
+        "listContainers must preserve creation order"
+    );
+}
+
+/// The CRI translation of an **init container**: the next container is not even
+/// *created* until this one has exited, and the decision is driven by its exit
+/// code. Ordering is the whole assertion.
+#[tokio::test]
+async fn an_init_container_completes_before_the_next_is_created() {
+    let h = Harness::start().await;
+    h.run_sandbox(PodConfigWire::new(POD)).await;
+
+    // An init container is one that exits; the fake only lets you wait on a
+    // container that has said it will.
+    h.broker.set_exit_code("init", 0);
+    h.create_and_start("init").await;
+    let code = h.pods.wait_container(POD, "init").await.expect("wait");
+    assert_eq!(code, 0);
+    assert!(
+        !h.broker.running(POD).contains(&"init".to_string()),
+        "a container that has been waited on is no longer running"
     );
 
-    // And the guest was set up through the relayed vsock connection.
-    assert!(broker.guest().calls().contains(&Call::StandardSetupUp {
-        interface: "lo".to_string()
-    }));
-    assert!(broker.guest().spec_for("pause-pod-1").is_some());
+    h.create_and_start("app").await;
+
+    // The ordering that *is* the init-container contract.
+    let requests = h.broker.requests();
+    let waited = h.first(Method::WaitContainer);
+    let added_app = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| **m == Method::AddContainer)
+        .nth(1)
+        .expect("a second addContainer")
+        .0;
+    assert!(
+        waited < added_app,
+        "the init container must be reaped before the next is created: {requests:?}"
+    );
+
+    // Still one pod, and the app landed in the already-booted sandbox.
+    assert_eq!(h.count(Method::CreatePod), 1);
+    assert_eq!(
+        h.broker.hotplugged(),
+        vec!["init", "app"],
+        "every container is added after the sandbox booted, so both hotplug"
+    );
 }
 
+/// A non-zero init container must surface as a non-zero code. The kubelet drives
+/// restart policy off this, so defaulting a missing code to 0 would silently
+/// report "succeeded" — the one wrong answer.
 #[tokio::test]
-async fn two_containers_share_one_vm_and_the_pod_namespaces() {
-    let broker = broker().await;
-    let vmm = Arc::new(BrokerVmm::connect(broker.socket_path()));
-    let pod = Pod::new(
-        "pod-1",
-        PodConfig {
-            hostname: Some("my-pod".to_string()),
-            share_process_namespace: true,
-            ..Default::default()
-        },
-        vmm,
-    )
-    .unwrap();
-    pod.create().await.unwrap();
+async fn a_failing_init_container_reports_its_real_exit_code() {
+    let h = Harness::start().await;
+    h.run_sandbox(PodConfigWire::new(POD)).await;
+    h.broker.set_exit_code("init", 1);
 
-    for id in ["app", "sidecar"] {
-        pod.add_container(
-            id,
-            BlockMount::block("ext4", format!("/images/{id}.ext4")),
-            ContainerConfig {
-                pid_namespace: NamespaceMode::Pod,
-                ..Default::default()
-            },
+    h.create_and_start("init").await;
+
+    assert_eq!(h.pods.wait_container(POD, "init").await.unwrap(), 1);
+}
+
+/// The CRI translation of a **sidecar** (a restartable init container, KEP-753):
+/// the same sequence *without* the wait, so both containers run at once inside
+/// one VM. This is what the CLI-backed path structurally cannot do.
+#[tokio::test]
+async fn a_sidecar_keeps_running_while_the_next_container_starts() {
+    let h = Harness::start().await;
+    h.run_sandbox(PodConfigWire::new(POD)).await;
+
+    h.create_and_start("sidecar").await;
+    h.create_and_start("app").await;
+
+    let mut running = h.broker.running(POD);
+    running.sort();
+    assert_eq!(
+        running,
+        vec!["app", "sidecar"],
+        "both must be running concurrently in the same pod"
+    );
+    assert_eq!(h.count(Method::CreatePod), 1, "in one VM");
+    assert_eq!(
+        h.count(Method::WaitContainer),
+        0,
+        "a sidecar is precisely the case where the kubelet does not wait"
+    );
+
+    // And an exec reaches a container that is running alongside another.
+    let pid = h
+        .pods
+        .exec(
+            POD,
+            "sidecar",
+            "exec-1",
+            &ExecOptions::new(vec!["/bin/true".into()]),
         )
         .await
-        .expect("add container over the broker");
-        pod.start_container(id).await.expect("start container");
-    }
+        .expect("exec into the sidecar");
+    assert!(pid > 0, "exec must report a guest pid, got {pid}");
+}
 
-    // One VM for the pod; a hotplug per container, since the VM is already up.
-    let requests = broker.requests();
+/// `ExecSync` needs a code, not a pid. `exec` starts the process and `waitProcess`
+/// reaps it; a runtime that only reported the pid could never answer "did the
+/// command succeed?".
+#[tokio::test]
+async fn an_exec_can_be_waited_on_for_its_exit_code() {
+    let h = Harness::start().await;
+    h.run_sandbox(PodConfigWire::new(POD)).await;
+    h.create_and_start("app").await;
+    h.broker.set_exit_code("exec-1", 7);
+
+    let pid = h
+        .pods
+        .exec(
+            POD,
+            "app",
+            "exec-1",
+            &ExecOptions::new(vec!["/bin/false".into()]),
+        )
+        .await
+        .expect("exec");
+    assert!(pid > 0);
     assert_eq!(
-        requests.iter().filter(|m| **m == Method::CreateVm).count(),
-        1,
-        "one microVM per pod"
+        h.pods.wait_process(POD, "app", "exec-1").await.unwrap(),
+        7,
+        "the exec's own exit code, not the container's"
     );
-    assert_eq!(
-        requests.iter().filter(|m| **m == Method::Hotplug).count(),
-        2,
-        "each container's rootfs is hotplugged into the live VM"
-    );
-
-    // The payoff: both containers join the *same* infra namespaces.
-    let app = broker.guest().spec_for("app").expect("app spec");
-    let sidecar = broker.guest().spec_for("sidecar").expect("sidecar spec");
-    for type_ in [
-        LinuxNamespaceType::Ipc,
-        LinuxNamespaceType::Uts,
-        LinuxNamespaceType::Pid,
-    ] {
-        let a = joined_ns(&app, type_).expect("namespace present");
-        assert_eq!(
-            a,
-            format!("/proc/{INFRA_PID}/ns/{}", type_.procfs_name()),
-            "{type_:?} must join the infra namespace"
-        );
-        assert_eq!(a, joined_ns(&sidecar, type_).unwrap(), "{type_:?} shared");
-    }
-
-    // No network namespace, so the VM's netns is the pod network: one IP, shared
-    // localhost. This is what the CLI-backed path structurally cannot do.
-    assert!(joined_ns(&app, LinuxNamespaceType::Network).is_none());
-    assert!(joined_ns(&sidecar, LinuxNamespaceType::Network).is_none());
-
-    // The pod hostname lives on the infra container, which owns the UTS ns.
-    assert_eq!(
-        broker.guest().spec_for("pause-pod-1").unwrap().hostname,
-        "my-pod"
-    );
-    assert_eq!(app.hostname, "");
-
-    // Each container still has its own rootfs and cgroup.
-    assert_eq!(app.root.as_ref().unwrap().path, "/run/container/app/rootfs");
-    assert_eq!(
-        sidecar.linux.as_ref().unwrap().cgroups_path,
-        "/container/pod/pod-1/sidecar"
-    );
+    // Reaped: waiting twice is an error rather than a second phantom success.
+    assert!(h.pods.wait_process(POD, "app", "exec-1").await.is_err());
 }
 
 #[tokio::test]
-async fn each_container_gets_its_own_block_device() {
-    // The guest distinguishes containers by the device their rootfs came in on,
-    // so two hotplugs must not collide.
-    let broker = broker().await;
-    let vmm = Arc::new(BrokerVmm::connect(broker.socket_path()));
-    let pod = Pod::new("pod-1", PodConfig::default(), vmm).unwrap();
-    pod.create().await.unwrap();
+async fn an_exec_can_be_signalled_for_its_timeout() {
+    let h = Harness::start().await;
+    h.run_sandbox(PodConfigWire::new(POD)).await;
+    h.create_and_start("app").await;
+    h.pods
+        .exec(
+            POD,
+            "app",
+            "exec-1",
+            &ExecOptions::new(vec!["/bin/sleep".into()]),
+        )
+        .await
+        .expect("exec");
+
+    h.pods
+        .kill_process(POD, "app", "exec-1", 15)
+        .await
+        .expect("killProcess");
+    assert_eq!(h.broker.params_for(Method::KillProcess)[0].signal, Some(15));
+    // An unknown process must be reported, not silently accepted.
+    assert!(h.pods.kill_process(POD, "app", "nope", 15).await.is_err());
+}
+
+/// The guest keys a container's init process by the container id, so an exec
+/// reusing it would address the wrong process.
+#[tokio::test]
+async fn an_exec_id_must_differ_from_the_container_id() {
+    let h = Harness::start().await;
+    h.run_sandbox(PodConfigWire::new(POD)).await;
+    h.create_and_start("app").await;
+
+    let err = h
+        .pods
+        .exec(
+            POD,
+            "app",
+            "app",
+            &ExecOptions::new(vec!["/bin/true".into()]),
+        )
+        .await
+        .expect_err("must fail");
+    assert!(err.to_string().contains("must differ"), "got: {err}");
+}
+
+#[tokio::test]
+async fn each_container_gets_its_own_rootfs_block() {
+    // The guest distinguishes containers by the device their rootfs arrived on,
+    // so two provisions must not collide.
+    let h = Harness::start().await;
+    h.run_sandbox(PodConfigWire::new(POD)).await;
 
     for id in ["a", "b", "c"] {
-        pod.add_container(
-            id,
-            BlockMount::block("ext4", format!("/images/{id}.ext4")),
-            ContainerConfig::default(),
-        )
-        .await
-        .unwrap();
+        h.create_container(id).await;
     }
 
-    let mounted: Vec<String> = broker
-        .guest()
-        .calls()
+    let sources: Vec<String> = h
+        .broker
+        .params_for(Method::AddContainer)
         .into_iter()
-        .filter_map(|c| match c {
-            Call::Mount {
-                source,
-                destination,
-                ..
-            } if destination.starts_with("/run/container/") => Some(source),
-            _ => None,
+        .map(|p| {
+            p.container
+                .expect("addContainer carries a container")
+                .rootfs
+                .source
+                .to_string_lossy()
+                .into_owned()
         })
         .collect();
-    let unique: std::collections::HashSet<&String> = mounted.iter().collect();
+    let unique: std::collections::HashSet<&String> = sources.iter().collect();
     assert_eq!(
         unique.len(),
-        mounted.len(),
-        "each rootfs must arrive on a distinct device, got {mounted:?}"
+        sources.len(),
+        "each rootfs must be a distinct block, got {sources:?}"
     );
 }
 
 #[tokio::test]
 async fn the_broker_provisions_and_reclaims_rootfs_images() {
-    let broker = broker().await;
-    let rootfs = BrokerRootfs::new(apple_containerization::BrokerClient::new(
-        broker.socket_path(),
-    ));
+    let h = Harness::start().await;
 
-    let block = rootfs
+    let block = h
+        .rootfs
         .provision("registry.k8s.io/e2e-test-images/busybox:1.29-2", "app")
         .await
         .expect("provision");
@@ -215,47 +347,35 @@ async fn the_broker_provisions_and_reclaims_rootfs_images() {
         "the image should be materialised per container, got {block:?}"
     );
 
-    rootfs.release("app").await.expect("release");
-    assert!(broker.requests().contains(&Method::ReleaseRootfs));
+    h.rootfs.release("app").await.expect("release");
+    assert!(h.broker.requests().contains(&Method::ReleaseRootfs));
 }
 
 #[tokio::test]
-async fn stopping_the_pod_tears_the_vm_down_through_the_broker() {
-    let broker = broker().await;
-    let vmm = Arc::new(BrokerVmm::connect(broker.socket_path()));
-    let pod = Pod::new("pod-1", PodConfig::default(), vmm).unwrap();
-    pod.create().await.unwrap();
-    pod.add_container(
-        "app",
-        BlockMount::block("ext4", "/i.ext4"),
-        ContainerConfig::default(),
-    )
-    .await
-    .unwrap();
-    pod.start_container("app").await.unwrap();
+async fn stopping_the_pod_comes_after_everything_else() {
+    let h = Harness::start().await;
+    h.run_sandbox(PodConfigWire::new(POD)).await;
+    h.create_and_start("app").await;
 
-    pod.stop().await.expect("stop pod");
+    h.pods.stop_pod(POD).await.expect("stopPod");
 
-    // The container is killed in the guest, then the VM is stopped — not the
-    // other way round, or the guest would never see the signal.
-    let guest_killed =
-        broker.guest().calls().iter().any(
-            |c| matches!(c, Call::KillProcess { id, signal, .. } if id == "app" && *signal == 9),
-        );
-    assert!(guest_killed, "the container must be signalled in the guest");
     assert_eq!(
-        *broker.requests().last().unwrap(),
-        Method::Stop,
-        "the VM stop must come last"
+        *h.broker.requests().last().unwrap(),
+        Method::StopPod,
+        "the pod teardown must be last; the broker stops containers inside it"
     );
+    // Idempotent: a pod the broker has forgotten is already gone.
+    h.pods.stop_pod(POD).await.expect("stopPod is idempotent");
 }
 
 #[tokio::test]
-async fn a_broker_error_surfaces_as_a_pod_error_not_a_silent_success() {
-    // Point at a socket nothing is listening on: the pod must fail loudly.
-    let vmm = Arc::new(BrokerVmm::connect("/tmp/definitely-not-a-broker.sock"));
-    let pod = Pod::new("pod-1", PodConfig::default(), vmm).unwrap();
-    let err = pod.create().await.expect_err("must fail");
+async fn a_broker_error_surfaces_rather_than_a_silent_success() {
+    // Point at a socket nothing is listening on: the call must fail loudly.
+    let pods = PodBroker::connect("/tmp/definitely-not-a-broker.sock");
+    let err = pods
+        .create_pod(&PodConfigWire::new(POD))
+        .await
+        .expect_err("must fail");
     assert!(
         err.to_string().contains("vmm"),
         "expected a vmm error, got: {err}"
@@ -263,18 +383,101 @@ async fn a_broker_error_surfaces_as_a_pod_error_not_a_silent_success() {
 }
 
 #[tokio::test]
-async fn an_unknown_vm_id_is_reported_rather_than_ignored() {
-    let broker = broker().await;
-    let client = apple_containerization::BrokerClient::new(broker.socket_path());
-    let err = client
-        .call(
-            Method::Start,
-            apple_containerization::broker::Params {
-                vm_id: Some("never-created".to_string()),
-                ..Default::default()
-            },
-        )
+async fn an_unknown_pod_is_reported_rather_than_ignored() {
+    let h = Harness::start().await;
+    let err = h.pods.create("never-created").await.expect_err("must fail");
+    assert!(err.to_string().contains("no such pod"), "got: {err}");
+}
+
+#[tokio::test]
+async fn an_unknown_container_is_reported_rather_than_ignored() {
+    let h = Harness::start().await;
+    h.run_sandbox(PodConfigWire::new(POD)).await;
+    let err = h
+        .pods
+        .start_container(POD, "never-added")
         .await
         .expect_err("must fail");
-    assert!(err.to_string().contains("no such vm"), "got: {err}");
+    assert!(err.to_string().contains("no such container"), "got: {err}");
+}
+
+// ---------------------------------------------------------------------------
+// Against a live broker
+// ---------------------------------------------------------------------------
+
+/// Drive a real pod against a running `rusternetes-vmm`, booting an actual VM.
+///
+/// Ignored by default: it needs the broker built, signed and listening. Run with
+///
+/// ```bash
+/// bash scripts/build-vmm-broker.sh
+/// ./vmm-broker/.build/debug/rusternetes-vmm --listen /tmp/rkv/vmm.sock \
+///     --kernel "$HOME/Library/Application Support/com.apple.container/kernels/default.kernel-arm64" \
+///     --runtime-dir /tmp/rkv/vmm &
+/// VMM_SOCKET=/tmp/rkv/vmm.sock cargo test -p apple-containerization --all-features \
+///     --test broker_pod -- --ignored --nocapture
+/// ```
+///
+/// Everything above checks the protocol against a fake. This is the one that
+/// checks it against Apple's actual `LinuxPod` and `vminitd`.
+#[tokio::test]
+#[ignore = "requires a running rusternetes-vmm broker; set VMM_SOCKET"]
+async fn a_two_container_pod_boots_against_a_live_broker() {
+    let socket = std::env::var("VMM_SOCKET").expect("VMM_SOCKET must point at the broker");
+    let client = BrokerClient::new(&socket);
+    let pods = PodBroker::new(client.clone());
+    let rootfs = BrokerRootfs::new(client);
+
+    let config = PodConfigWire {
+        cpus: 2,
+        memory_in_bytes: 1024 * 1024 * 1024,
+        hostname: Some("live-pod".to_string()),
+        boot_log: Some("/tmp/rkv/live-pod-boot.log".to_string()),
+        ..PodConfigWire::new("live-pod")
+    };
+    pods.create_pod(&config).await.expect("createPod");
+    pods.create("live-pod").await.expect("boot a real pod");
+    eprintln!("pod created; the VM is up and the sandbox is running");
+
+    // An init container: run to completion, then a long-lived one alongside.
+    let image = "registry.k8s.io/e2e-test-images/busybox:1.29-2";
+    for (id, args) in [
+        (
+            "init",
+            vec!["/bin/sh".to_string(), "-c".into(), "true".into()],
+        ),
+        (
+            "app",
+            vec!["/bin/sh".to_string(), "-c".into(), "sleep 300".into()],
+        ),
+    ] {
+        let block = rootfs.provision(image, id).await.expect("provisionRootfs");
+        let mut container = ContainerConfigWire::new(id, block);
+        container.args = args;
+        pods.add_container("live-pod", &container)
+            .await
+            .expect("addContainer");
+        pods.start_container("live-pod", id)
+            .await
+            .expect("startContainer");
+        eprintln!("started {id}");
+        if id == "init" {
+            let code = pods
+                .wait_container("live-pod", "init")
+                .await
+                .expect("waitContainer");
+            assert_eq!(code, 0, "the init container must succeed");
+            eprintln!("init exited {code}");
+        }
+    }
+
+    assert!(pods
+        .list_containers("live-pod")
+        .await
+        .expect("listContainers")
+        .contains(&"app".to_string()));
+
+    let stopped = pods.stop_pod("live-pod").await;
+    eprintln!("stop: {stopped:?}");
+    stopped.expect("stop the pod");
 }

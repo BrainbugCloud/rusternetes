@@ -1,63 +1,45 @@
-//! A low-level client for Apple's Containerization sandbox protocol.
+//! A host-side client for the rusternetes VMM broker's **pod** protocol.
 //!
-//! Apple's `container` CLI runs **one microVM per container**. Kubernetes needs
-//! one sandbox per *pod*, with several containers sharing its network, IPC and
-//! (optionally) PID namespaces. The layer that makes that possible is not the
-//! CLI: it is `vminitd`, the guest agent, which serves the `SandboxContext` gRPC
-//! service on vsock port 1024 and whose process RPCs all carry a `containerID`.
-//! One VM, many containers, each with its own rootfs and OCI runtime invocation.
+//! Apple's `container` CLI runs one microVM per container. Kubernetes needs one
+//! sandbox per *pod*, with several containers sharing its network and one pod IP.
+//! Apple's `Containerization` package has the primitive for that — `LinuxPod`,
+//! one VM hosting N containers — but it is Swift, and the host-side operations it
+//! needs (owning the `VZVirtualMachine`, vsock, admitting a rootfs into a running
+//! VM, unpacking an image) are only reachable through Virtualization.framework
+//! from the process that owns the VM.
 //!
-//! This crate is the host side of that protocol, ported from Apple's
-//! Containerization Swift package (`ff44a5b`, v0.40.1):
+//! So a small Swift broker owns all of that (`vmm-broker/`), and this crate is
+//! the client half: [`PodBroker`] is the entire host-side pod surface, spoken as
+//! newline-delimited JSON over a unix socket.
 //!
-//! | module | ported from |
-//! |---|---|
-//! | [`agent`] | `Sources/Containerization/Vminitd.swift` + `VirtualMachineAgent.swift` |
-//! | [`oci`] | `Sources/ContainerizationOCI/Spec.swift` |
-//! | [`pod`] | `Sources/Containerization/LinuxPod.swift` |
-//! | [`vmm`] | `VirtualMachineManager.swift` / `VirtualMachineInstance.swift` |
-//! | [`broker`] | no upstream equivalent — see below |
-//! | [`proto`] | `Sources/Containerization/SandboxContext/SandboxContext.proto` |
+//! # What this crate used to be
 //!
-//! # What is Rust and what cannot be
+//! It was a Rust port of `LinuxPod` + `Vminitd` + the OCI spec types — ~2400
+//! lines that spoke `SandboxContext` gRPC to the guest directly and drove a dumb
+//! VM. That port duplicated working Swift, did not receive Apple's fixes, and its
+//! first live boot failed on a `LinuxPod.create()` precondition it had not
+//! replicated. The broker now calls the real `LinuxPod`, and this crate is the
+//! protocol to it.
 //!
-//! Everything inside the guest is gRPC, so it is all Rust. Four host-side
-//! operations are only available through Virtualization.framework, in the process
-//! that owns the `VZVirtualMachine`: VM lifecycle, vsock dial/listen, block
-//! hotplug and virtiofs shares. Those sit behind the [`vmm::Vmm`] trait, so the
-//! pod logic, OCI specs, namespace wiring and process lifecycle stay here. See
-//! the [`vmm`] module docs for why that boundary falls exactly there.
+//! What that leaves here is deliberately thin. Pod semantics are Apple's; the CRI
+//! translation is `apple-cri`'s. This crate is the wire between them.
 //!
 //! # Layering
 //!
 //! This crate must not depend on any `rusternetes-*` crate, nor on `cri-proto` /
-//! `cri-server`. It knows about Apple's guest protocol and nothing about CRI;
-//! `apple-cri` is what joins the two.
+//! `cri-server`. It knows the broker protocol and nothing about CRI; `apple-cri`
+//! is what joins the two.
 
-pub mod agent;
 pub mod broker;
 pub mod error;
-pub mod oci;
-pub mod pod;
-pub mod vmm;
 
-/// Generated `SandboxContext` v3 bindings.
-///
-/// From `proto/sandbox_context_v3.proto`, vendored verbatim from
-/// containerization `ff44a5b`. Regenerate by updating that file; the proto
-/// package is `com.apple.containerization.sandbox.v3`.
-pub mod proto {
-    tonic::include_proto!("com.apple.containerization.sandbox.v3");
-}
-
-/// An in-process fake guest agent and mock VMM, for testing pod semantics
-/// without a hypervisor. Enabled by the `testing` feature so `apple-cri` can use
-/// it too.
+/// A fake broker, so the CRI translation can be tested without a hypervisor.
+/// Enabled by the `testing` feature so `apple-cri` can use it too.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
-pub use agent::{Agent, AGENT_VSOCK_PORT};
-pub use broker::{BrokerClient, BrokerRootfs, BrokerVmm};
+pub use broker::{
+    AttachedFilesystem, BlockMount, BrokerClient, BrokerRootfs, ContainerConfigWire,
+    ContainerStatsWire, DnsConfigWire, ExecOptions, ImageWire, Interface, PodBroker, PodConfigWire,
+};
 pub use error::{Error, Result};
-pub use pod::{ContainerConfig, ContainerState, NamespaceMode, Pod, PodConfig, ProcessConfig};
-pub use vmm::{AttachedFilesystem, BlockMount, Interface, VmConfig, VmInstance, VmState, Vmm};
