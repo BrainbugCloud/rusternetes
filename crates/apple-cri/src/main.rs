@@ -16,8 +16,9 @@ mod images;
 mod logs;
 mod model;
 mod naming;
+mod pod_backend;
 // The pod-shaped CRI path (one microVM per pod). Not yet the default backend —
-// it needs a VMM broker for VM lifecycle, vsock and block hotplug, so nothing
+// it needs a VMM broker for VM lifecycle, vsock and rootfs attach, so nothing
 // wires it up yet. See crates/apple-cri/STATUS.md.
 #[allow(dead_code)]
 mod pod_runtime;
@@ -67,6 +68,19 @@ struct Args {
     /// Run `container system start` before serving.
     #[arg(long)]
     start_runtime: bool,
+
+    /// Which runtime path to serve.
+    ///
+    /// `cli` drives Apple's `container` binary: one microVM per *container*, the
+    /// path critest exercises today. `pod` drives the VMM broker: one microVM per
+    /// *pod*, so containers share a network namespace and one pod IP. See
+    /// STATUS.md for what the pod path still diverges on.
+    #[arg(long, default_value = "cli", value_parser = ["cli", "pod"])]
+    backend: String,
+
+    /// VMM broker socket, for `--backend pod`.
+    #[arg(long, default_value = "/var/run/rusternetes-vmm.sock")]
+    broker_socket: String,
 }
 
 /// The host architecture, in the naming Apple's `--arch` uses.
@@ -86,6 +100,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .init();
     let args = Args::parse();
+
+    if args.backend == "pod" {
+        return serve_pod_backend(args).await;
+    }
 
     let backend = Arc::new(AppleBackend::new(Config {
         binary: args.container_binary,
@@ -116,6 +134,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Re-adopt containers that outlived a previous shim process.
     backend.reconcile().await;
+
+    let streaming = cri_server::streaming::start(&args.streaming_bind, backend.clone()).await?;
+    let service = CriService::new(backend).with_streaming(streaming);
+
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("shutting down");
+    };
+    let result = cri_server::uds::serve(&args.cri_listen, service, shutdown).await;
+    cri_server::uds::cleanup(&args.cri_listen);
+    result
+}
+
+/// Serve the pod-shaped path: one microVM per pod, via the VMM broker.
+///
+/// Deliberately *not* sharing the CLI path's start-up: there is no
+/// `container system start` to run, no Apple network to create, and — see the
+/// TODO in `pod_backend` — no checkpoint store to reconcile from, so a restart
+/// starts empty rather than re-adopting anything.
+async fn serve_pod_backend(args: Args) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let root: std::path::PathBuf = args.root_dir.into();
+    let stream_dir = root.join("streams");
+    // Left over from a previous process: the sockets are dead and their paths
+    // would collide with new binds.
+    let _ = std::fs::remove_dir_all(&stream_dir);
+    std::fs::create_dir_all(&stream_dir)?;
+
+    let backend = Arc::new(pod_backend::PodBackend::new(
+        args.broker_socket.clone().into(),
+        pod_runtime::PodRuntimeConfig {
+            exec_dir: root.join("exec"),
+            ..Default::default()
+        },
+        stream_dir,
+    ));
+    tracing::info!(
+        broker = %args.broker_socket,
+        "serving the pod backend: one microVM per pod"
+    );
 
     let streaming = cri_server::streaming::start(&args.streaming_bind, backend.clone()).await?;
     let service = CriService::new(backend).with_streaming(streaming);
