@@ -82,7 +82,9 @@ final class VsockRelay: @unchecked Sendable {
             unlink(path)
             guard clientFd >= 0 else { return }
 
-            let client = FileHandle(fileDescriptor: clientFd, closeOnDealloc: true)
+            // Closed explicitly in the completion below; see handleConnection on
+            // why closeOnDealloc must not also be set.
+            let client = FileHandle(fileDescriptor: clientFd, closeOnDealloc: false)
             let guestFd = guestHandle.fileDescriptor
 
             // Two pumps, one per direction. Closing both ends when either

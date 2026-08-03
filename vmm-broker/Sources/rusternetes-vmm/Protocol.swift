@@ -10,18 +10,33 @@ import Foundation
 
 /// The methods the Rust side may call. Names are camelCase on the wire.
 enum Method: String, Codable, Sendable {
-    case createVm
-    case start
-    case stop
-    case state
-    case dial
-    case listen
-    case hotplug
-    case releaseHotplug
-    case mounts
-    case registerMounts
+    // Pod lifecycle, backed by Containerization's LinuxPod.
+    case createPod
+    case create
+    case stopPod
+    case addContainer
+    case startContainer
+    case stopContainer
+    case killContainer
+    case waitContainer
+    case listContainers
+    case exec
+    case attach
+    case resize
+    case closeStdin
+    case reopenContainerLog
+    case waitProcess
+    case killProcess
+    case statistics
+    // Images and transport.
+    case listImages
+    case imageStatus
+    case pullImage
+    case removeImage
+    case imageFsInfo
     case provisionRootfs
     case releaseRootfs
+    case dial
 }
 
 /// A block device to attach, as the Rust side describes it.
@@ -56,26 +71,105 @@ struct InterfaceWire: Codable, Sendable {
     var macAddress: String?
 }
 
-/// Mirror of Rust's `VmConfig`.
-struct VmConfigWire: Codable, Sendable {
+struct DnsConfigWire: Codable, Sendable {
+    var nameservers: [String]
+    var domain: String?
+    var searchDomains: [String]
+    var options: [String]
+}
+
+/// Pod-level configuration; mirrors `LinuxPod.Configuration`.
+struct PodConfigWire: Codable, Sendable {
     var id: String
     var cpus: UInt32
     var memoryInBytes: UInt64
     var interfaces: [InterfaceWire]
-    var nestedVirtualization: Bool
-    var mountsById: [String: [BlockMountWire]]
+    var shareProcessNamespace: Bool
+    var hostname: String?
+    var dns: DnsConfigWire?
     var bootLog: String?
+}
+
+/// Per-container configuration; mirrors `LinuxPod.ContainerConfiguration` plus
+/// the rootfs block the broker provisioned.
+struct ContainerConfigWire: Codable, Sendable {
+    var id: String
+    var rootfs: BlockMountWire
+    /// Host path for the container's CRI log file. When set, the broker writes
+    /// stdout/stderr there in the CRI format (see `LogWriter.swift`).
+    var logPath: String?
+    var args: [String]
+    var env: [String]
+    var workingDirectory: String
+    var terminal: Bool
+    /// CRI `stdin`: the container gets an attachable stdin. A process without it
+    /// must get `nil`, not an empty stream that never EOFs.
+    var stdin: Bool
+    /// CRI `stdin_once`: close the container's stdin once an attached client
+    /// detaches. See `ContainerStdio.attach`.
+    var stdinOnce: Bool
+    var uid: UInt32
+    var gid: UInt32
+    var additionalGids: [UInt32]
+    var username: String
+    var hostname: String?
+    var cpus: UInt32?
+    var memoryInBytes: UInt64?
+    var sysctl: [String: String]
+    var mounts: [AttachedFilesystemWire]
+    var maskedPaths: [String]
+    var readonlyPaths: [String]
+}
+
+/// One image in the broker's store, as CRI needs to describe it.
+struct ImageWire: Codable, Sendable {
+    var reference: String
+    var digest: String
+    var sizeBytes: UInt64
+    /// The raw OCI `User` string; CRI's uid-vs-username split is the Rust side's.
+    var user: String
+    /// The image's own process configuration.
+    ///
+    /// A CRI `ContainerConfig` routinely leaves `command`, `args`, `envs` and
+    /// `working_dir` empty and expects the image's values to apply — critest's
+    /// nginx containers do exactly that. The merge rules are CRI's, so they live
+    /// on the Rust side; these fields are what it merges against.
+    var entrypoint: [String]
+    var cmd: [String]
+    var env: [String]
+    var workingDir: String
+}
+
+struct ContainerStatsWire: Codable, Sendable {
+    var id: String
+    var memoryUsageBytes: UInt64
+    var memoryInactiveFileBytes: UInt64
+    var memoryAnonBytes: UInt64
+    var cpuUsageUsec: UInt64
 }
 
 /// Flat, all-optional parameter union: each method reads only what it needs.
 struct Params: Codable, Sendable {
-    var vmId: String?
-    var config: VmConfigWire?
+    var podId: String?
+    var config: PodConfigWire?
+    var container: ContainerConfigWire?
+    var containerId: String?
+    var containerIds: [String]?
+    var processId: String?
+    var args: [String]?
+    var env: [String]?
+    var terminal: Bool?
+    /// `exec` only: host files the process's raw output is written to.
+    var stdinPath: String?
+    var stdoutPath: String?
+    var stderrPath: String?
+    /// `exec`: stdio paths are unix sockets the caller is listening on, not files.
+    var stdioSockets: Bool?
+    var width: UInt16?
+    var height: UInt16?
+    var signal: Int32?
     var port: UInt32?
     var ownerId: String?
-    var block: BlockMountWire?
-    var rootfs: AttachedFilesystemWire?
-    var additional: [AttachedFilesystemWire]?
     var image: String?
 }
 
@@ -87,23 +181,43 @@ struct Request: Codable, Sendable {
 /// Payload of a successful reply; every field is method-specific.
 struct Reply: Codable, Sendable {
     var socketPath: String?
-    var state: String?
-    var attached: AttachedFilesystemWire?
     var block: BlockMountWire?
-    var mounts: [String: [AttachedFilesystemWire]]?
+    var containerIds: [String]?
+    var exitCode: Int32?
+    var pid: Int32?
+    var stats: [ContainerStatsWire]?
+    /// `createPod`: the address the broker allocated for the pod.
+    var ipv4: String?
+    var images: [ImageWire]?
+    var image: ImageWire?
+    /// `imageFsInfo`: the store's path and bytes used.
+    var fsPath: String?
+    var fsBytes: UInt64?
 
     init(
         socketPath: String? = nil,
-        state: String? = nil,
-        attached: AttachedFilesystemWire? = nil,
         block: BlockMountWire? = nil,
-        mounts: [String: [AttachedFilesystemWire]]? = nil
+        containerIds: [String]? = nil,
+        exitCode: Int32? = nil,
+        pid: Int32? = nil,
+        stats: [ContainerStatsWire]? = nil,
+        ipv4: String? = nil,
+        images: [ImageWire]? = nil,
+        image: ImageWire? = nil,
+        fsPath: String? = nil,
+        fsBytes: UInt64? = nil
     ) {
         self.socketPath = socketPath
-        self.state = state
-        self.attached = attached
         self.block = block
-        self.mounts = mounts
+        self.containerIds = containerIds
+        self.exitCode = exitCode
+        self.pid = pid
+        self.stats = stats
+        self.ipv4 = ipv4
+        self.images = images
+        self.image = image
+        self.fsPath = fsPath
+        self.fsBytes = fsBytes
     }
 }
 

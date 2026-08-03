@@ -24,6 +24,8 @@ let package = Package(
             name: "rusternetes-vmm",
             dependencies: [
                 .product(name: "Containerization", package: "containerization"),
+                // Reading image layers when unpacking a rootfs to a directory.
+                .product(name: "ContainerizationArchive", package: "containerization"),
                 .product(name: "ContainerizationOCI", package: "containerization"),
                 .product(name: "ContainerizationOS", package: "containerization"),
             ]
