@@ -1,7 +1,8 @@
 # Replacing the guest: kata-agent instead of LinuxPod + vminitd
 
-**Status:** investigation, 2026-08-03. No code written. Both day-one kill
-criteria are **cleared** — see §1.
+**Status:** spike step 1 **passes**, 2026-08-03. `GetGuestDetails` answers over
+the relay from a real Kata guest booted under Virtualization.framework. One
+specific blocker remains before step 2 — see §7.
 
 The proposal is a *guest* replacement, not a hypervisor one. Virtualization.framework
 stays, the broker stays, `ImageService` and `DirectoryUnpacker` stay, and the
@@ -183,14 +184,70 @@ More work, no additional capability today.
 
 ## 6. Spike, in order
 
-1. Boot Kata's aarch64 initrd under the existing broker, dial 1024, get
-   `GetGuestDetails` to answer over the relay. **One round-trip is the whole
-   feasibility question** — and §1 says both of its prerequisites already hold.
+1. ~~Boot Kata's aarch64 initrd, dial 1024, get `GetGuestDetails` to answer over
+   the relay.~~ **Done — see §7.**
 2. `CreateSandbox` + two `CreateContainer`s over the live virtiofs share, then
    assert what `LinuxPod` cannot: same IPC namespace, same UTS namespace, then
-   `RemoveContainer`.
+   `RemoveContainer`. **Blocked on §7.2.**
 3. Re-run critest. The bar is 54/54; anything less is a regression, and the
    Linux-only self-skips become the new frontier.
 
-Remaining kill criteria after §1: none identified. The risks that remain are cost
-and maintenance, not feasibility.
+---
+
+## 7. Step 1 result
+
+Run it with `rusternetes-vmm --kata-probe` (see `KataProbe.swift`) plus the
+host-side ttrpc client. Artifacts: `kata-static-4.0.0-arm64.tar.zst`,
+`vmlinux-6.18.35-200` + `kata-ubuntu-noble.initrd`.
+
+### 7.1 What worked
+
+**Kata's arm64 kernel boots under VZ**, unmodified, from kernel + initrd. The
+boot loader is replaced through `VZInstanceExtension.configureVZ`, which runs
+after `toVZ` on the finished configuration — so Containerization's hardcoded
+`VZLinuxBootLoader` and its insistence on a block rootfs are both worked around
+without a fork.
+
+**The agent serves ttrpc over the relay.** `GetGuestDetails` returned:
+
+```
+mem block size:   134217728 bytes
+agent api:        4.0.0
+storage handlers: nvdimm, scsi, ephemeral, image_guest_pull,
+                  erofs.multi-layer, overlayfs, blk, mmioblk,
+                  virtio-fs, watchable-bind, local
+```
+
+Three things that were assumptions in §1 are now measurements: the agent listens
+on **vsock 1024** so `VsockRelay` needed no change; `ttrpc-codegen 0.6` generates
+from `agent.proto` on darwin (it needs an `async-trait` dependency, or the
+generated server trait fails object-safety); and **`virtio-fs` is in the agent's
+storage handlers**, which is the rootfs delivery model §3 depends on.
+
+### 7.2 The blocker: the agent cannot run as PID 1 yet
+
+`GetGuestDetails` above was answered by an agent running as a **child** process.
+As PID 1 — which is how a real deployment boots it — the agent fails during early
+init and the VM disappears.
+
+The failure is invisible by construction, which is worth knowing before anyone
+else debugs it:
+
+* `main()` calls `reboot(RB_POWER_OFF)` on any `real_main` error when
+  `init_mode` (`src/agent/src/main.rs:354`), so the guest vanishes rather than
+  reporting.
+* The early logger writes into a pipe that `create_logger_task` only starts
+  draining at `main.rs:231` — *after* `general_mount` and `init_agent_as_init`.
+  Anything that fails before that is written and then lost.
+* The agent logs to stdout by default and PID 1 has no stdout, so the boot log
+  ends at `Run /init as init process` and says nothing.
+
+Replaying `init_agent_as_init`'s steps by hand in the guest (`cgroup2` mount,
+`/dev/ptmx` remove + symlink, `setsid`, `/etc/hostname`) shows **all of them
+succeeding**, so the fault is elsewhere in that path — likely `general_mount` or
+`cgroups_mount`. Narrowing it needs either a debug build of the agent or an
+incremental bisect against a clean guest; the diagnostic wrapper used here
+pre-mounts filesystems and so contaminates the test.
+
+This is a tractable bug, not a new kill criterion — but it is unresolved, and
+step 2 cannot start until the agent survives its own init.

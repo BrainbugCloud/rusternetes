@@ -33,6 +33,12 @@ struct Options {
     /// guest — the mechanism a VZ hotplug provider would rest on. See
     /// ShareMutationProbe.swift.
     var shareMutationProbe = false
+    /// Step 1 of the kata-guest spike: boot Kata's kernel + initrd and relay the
+    /// agent's vsock port. See KataProbe.swift.
+    var kataProbe = false
+    var kataKernel: String?
+    var kataInitrd: String?
+    var kataSocket: String?
 
     static func parse(_ argv: [String]) throws -> Options {
         var options = Options()
@@ -65,6 +71,10 @@ struct Options {
                 options.podRangeSize = n
             case "--selftest": options.selftest = true
             case "--share-mutation-probe": options.shareMutationProbe = true
+            case "--kata-probe": options.kataProbe = true
+            case "--kata-kernel": options.kataKernel = try value()
+            case "--kata-initrd": options.kataInitrd = try value()
+            case "--kata-socket": options.kataSocket = try value()
             case "-h", "--help":
                 print(
                     """
@@ -84,6 +94,11 @@ struct Options {
                       --share-mutation-probe
                                             check whether a live virtiofs share can be
                                             swapped under a mounted guest, and exit
+                      --kata-probe          boot a Kata guest and relay its agent socket
+                      --kata-kernel <path>  Kata's uncompressed arm64 kernel (vmlinux-*)
+                      --kata-initrd <path>  kata-containers-initrd.img
+                      --kata-socket <path>  where to expose the agent
+                                            (default <runtime-dir>/kata-agent.sock)
 
                     Protocol: newline-delimited JSON, one request per connection.
                     See crates/apple-containerization/src/broker.rs.
@@ -328,6 +343,21 @@ do {
         images: images,
         network: network
     )
+
+    if options.kataProbe {
+        guard let kataKernel = options.kataKernel, let kataInitrd = options.kataInitrd else {
+            throw BrokerError.badRequest("--kata-probe requires --kata-kernel and --kata-initrd")
+        }
+        try runKataProbe(
+            manager: manager,
+            runtimeDir: runtimeDir,
+            kernel: kataKernel,
+            initrd: kataInitrd,
+            socketPath: options.kataSocket
+                ?? runtimeDir.appendingPathComponent("kata-agent.sock").path
+        )
+        exit(0)
+    }
 
     if options.shareMutationProbe {
         let ok = try runBlocking {
