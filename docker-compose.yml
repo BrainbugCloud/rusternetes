@@ -151,6 +151,12 @@ services:
       # Legacy environment variable - still supported for backward compatibility
       # IMPORTANT: Must be an absolute path
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
+    # Explicit DNS servers — the GHA runner's /etc/resolv.conf points at 127.0.0.53
+    # (systemd-resolved stub) which is unreachable from inside a container, causing
+    # image pull failures with "dial tcp: lookup registry-1.docker.io: i/o timeout".
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     # Default command uses CLI flags (recommended for Docker Compose)
     # DNS IP matches the pinned ClusterIP in bootstrap-cluster.yaml
     command: ["--node-name", "node-1", "--etcd-servers", "http://etcd:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
@@ -178,6 +184,9 @@ services:
       - DOCKER_HOST=unix:///var/run/docker.sock
       - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     command: ["--node-name", "node-2", "--etcd-servers", "http://etcd:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10251", "--sync-interval", "3"]
 
   # Kube-proxy - network proxy
