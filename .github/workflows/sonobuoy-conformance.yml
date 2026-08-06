@@ -84,7 +84,7 @@ jobs:
     name: Rusternetes (${{ inputs.mode }}) K8s v1.36.1
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ inputs.mode == 'quick' && 60 || 360 }}
+    timeout-minutes: ${{ inputs.mode == 'quick' && 120 || 480 }}
     env:
       K8S_VERSION: v1.36.1
       SONOBUOY_VER: v0.57.5
@@ -126,6 +126,8 @@ jobs:
         run: |
           export KUBELET_VOLUMES_PATH=${{ github.workspace }}/.rusternetes/volumes
           mkdir -p "$KUBELET_VOLUMES_PATH"
+          # Enable debug logging in the kubelet so we can diagnose pod readiness issues.
+          export RUST_LOG=debug
           # Single kubelet — skip kubelet2 to reduce Docker daemon pressure on 2-vCPU runners.
           sudo -E docker compose -f docker-compose.yml up -d etcd api-server scheduler controller-manager kubelet kube-proxy
 
@@ -189,6 +191,56 @@ jobs:
           echo "=== Docker ps ==="
           sudo docker ps -a 2>&1 || true
 
+      - name: Wait for pods to be ready
+        timeout-minutes: 10
+        run: |
+          export KUBECONFIG=~/rk-kubeconfig
+          echo "Waiting up to 10 minutes for CoreDNS pod to become Ready..."
+          READY=0
+          for i in $(seq 1 120); do
+            PHASE=$(kubectl get pod coredns -n kube-system -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+            READY_CNT=$(kubectl get pod coredns -n kube-system -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
+            echo "  ($i/120) CoreDNS phase=$PHASE ready=$READY_CNT"
+            if [ "$PHASE" = "Running" ] && [ "$READY_CNT" = "true" ]; then
+              echo "CoreDNS is Ready!"
+              READY=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$READY" != "1" ]; then
+            echo "ERROR: CoreDNS did not become Ready within 10 minutes."
+            echo "=== kubectl describe pod coredns -n kube-system ==="
+            kubectl describe pod coredns -n kube-system 2>&1 || true
+            echo ""
+            echo "=== kubectl get pods -A -o wide ==="
+            kubectl get pods -A -o wide 2>&1 || true
+            echo ""
+            echo "=== kubectl get events -A --sort-by=.lastTimestamp | tail -40 ==="
+            kubectl get events -A --sort-by=.lastTimestamp 2>&1 | tail -40 || true
+            echo ""
+            echo "=== All Docker containers (including pause/app containers) ==="
+            sudo docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' 2>&1 || true
+            echo ""
+            echo "=== Kubelet logs (last 300 lines) ==="
+            sudo docker logs --tail 300 rusternetes-kubelet 2>&1 || true
+            echo ""
+            echo "=== CoreDNS app container logs (if exists) ==="
+            sudo docker logs --tail 100 coredns_coredns 2>&1 || echo "No coredns_coredns container"
+            echo ""
+            echo "=== coredns_pause container logs (if exists) ==="
+            sudo docker logs --tail 50 coredns_pause 2>&1 || echo "No coredns_pause container"
+            echo ""
+            echo "=== docker inspect coredns_pause (if exists) ==="
+            sudo docker inspect coredns_pause 2>&1 | head -80 || echo "No coredns_pause container"
+            echo ""
+            echo "=== docker inspect coredns_coredns (if exists) ==="
+            sudo docker inspect coredns_coredns 2>&1 | head -80 || echo "No coredns_coredns container"
+            exit 1
+          fi
+          echo "=== All pods after readiness ==="
+          kubectl get pods -A -o wide
+
       - name: Run Sonobuoy (${{ inputs.mode }})
         env:
           SONOBUOY_MODE: ${{ inputs.mode == 'quick' && 'quick' || 'certified-conformance' }}
@@ -220,6 +272,15 @@ jobs:
                    rusternetes-controller-manager rusternetes-kubelet \
                    rusternetes-kube-proxy; do
             echo "===== $c =====" >> cluster-logs.txt
+            sudo docker logs "$c" >> cluster-logs.txt 2>&1 || true
+            echo "" >> cluster-logs.txt
+          done
+          # Also capture pause and app containers created by the kubelet
+          echo "===== Kubelet-managed containers (pause + app) =====" >> cluster-logs.txt
+          sudo docker ps -a --format '{{.Names}}' >> cluster-logs.txt 2>&1 || true
+          echo "" >> cluster-logs.txt
+          for c in $(sudo docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '(pause|coredns|sonobuoy|e2e)' || true); do
+            echo "----- $c -----" >> cluster-logs.txt
             sudo docker logs "$c" >> cluster-logs.txt 2>&1 || true
             echo "" >> cluster-logs.txt
           done
