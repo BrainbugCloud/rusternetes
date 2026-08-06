@@ -31,7 +31,12 @@ jobs:
 
       - name: Get commit SHA
         id: submodule-sha
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          # Key the image cache on Rust source + Dockerfiles, not the full commit SHA.
+          # This way workflow-only changes reuse cached images (saves ~24min per run).
+          SOURCE_HASH=$(find crates/ Dockerfile.* Cargo.toml Cargo.lock -type f -exec sha256sum {} + 2>/dev/null | sha256sum | cut -c1-16)
+          echo "sha=$SOURCE_HASH" >> "$GITHUB_OUTPUT"
+          echo "Source hash: $SOURCE_HASH"
 
       - name: Cache container images by submodule SHA
         id: image-cache
@@ -216,15 +221,26 @@ jobs:
           sudo docker ps -a 2>&1 || true
 
       - name: Wait for pods to be ready
-        timeout-minutes: 10
+        timeout-minutes: 5
         run: |
           export KUBECONFIG=~/rk-kubeconfig
-          echo "Waiting up to 10 minutes for CoreDNS pod to become Ready..."
+          # Early diagnostic snapshot — before any waiting
+          echo "=== EARLY: Docker containers ==="
+          timeout 10 sudo docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' 2>&1 || true
+          echo "=== EARLY: kubectl get pods -A ==="
+          timeout 10 kubectl get pods -A -o wide 2>&1 || echo "kubectl get pods failed/hung"
+          echo "=== EARLY: kubectl get nodes ==="
+          timeout 10 kubectl get nodes -o wide 2>&1 || echo "kubectl get nodes failed/hung"
+          echo "=== EARLY: Kubelet logs (last 100 lines) ==="
+          timeout 10 sudo docker logs --tail 100 rusternetes-kubelet 2>&1 || echo "No kubelet logs"
+          echo ""
+
+          echo "Waiting up to 3 minutes for CoreDNS pod to become Ready..."
           READY=0
-          for i in $(seq 1 120); do
-            PHASE=$(kubectl get pod coredns -n kube-system -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
-            READY_CNT=$(kubectl get pod coredns -n kube-system -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
-            echo "  ($i/120) CoreDNS phase=$PHASE ready=$READY_CNT"
+          for i in $(seq 1 36); do
+            PHASE=$(timeout 5 kubectl get pod coredns -n kube-system -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+            READY_CNT=$(timeout 5 kubectl get pod coredns -n kube-system -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
+            echo "  ($i/36) CoreDNS phase=$PHASE ready=$READY_CNT"
             if [ "$PHASE" = "Running" ] && [ "$READY_CNT" = "true" ]; then
               echo "CoreDNS is Ready!"
               READY=1
@@ -233,37 +249,51 @@ jobs:
             sleep 5
           done
           if [ "$READY" != "1" ]; then
-            echo "ERROR: CoreDNS did not become Ready within 10 minutes."
+            echo "ERROR: CoreDNS did not become Ready within 3 minutes."
             echo "=== kubectl describe pod coredns -n kube-system ==="
-            kubectl describe pod coredns -n kube-system 2>&1 || true
+            timeout 10 kubectl describe pod coredns -n kube-system 2>&1 || true
             echo ""
             echo "=== kubectl get pods -A -o wide ==="
-            kubectl get pods -A -o wide 2>&1 || true
+            timeout 10 kubectl get pods -A -o wide 2>&1 || true
             echo ""
             echo "=== kubectl get events -A --sort-by=.lastTimestamp | tail -40 ==="
-            kubectl get events -A --sort-by=.lastTimestamp 2>&1 | tail -40 || true
+            timeout 10 kubectl get events -A --sort-by=.lastTimestamp 2>&1 | tail -40 || true
             echo ""
             echo "=== All Docker containers (including pause/app containers) ==="
-            sudo docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' 2>&1 || true
+            timeout 10 sudo docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' 2>&1 || true
             echo ""
             echo "=== Kubelet logs (last 300 lines) ==="
-            sudo docker logs --tail 300 rusternetes-kubelet 2>&1 || true
+            timeout 15 sudo docker logs --tail 300 rusternetes-kubelet 2>&1 || true
+            echo ""
+            echo "=== Kubelet2 logs (last 100 lines) ==="
+            timeout 10 sudo docker logs --tail 100 rusternetes-kubelet2 2>&1 || true
+            echo ""
+            echo "=== Scheduler logs (last 100 lines) ==="
+            timeout 10 sudo docker logs --tail 100 rusternetes-scheduler 2>&1 || true
+            echo ""
+            echo "=== Controller-manager logs (last 100 lines) ==="
+            timeout 10 sudo docker logs --tail 100 rusternetes-controller-manager 2>&1 || true
             echo ""
             echo "=== CoreDNS app container logs (if exists) ==="
-            sudo docker logs --tail 100 coredns_coredns 2>&1 || echo "No coredns_coredns container"
+            timeout 10 sudo docker logs --tail 100 coredns_coredns 2>&1 || echo "No coredns_coredns container"
             echo ""
             echo "=== coredns_pause container logs (if exists) ==="
-            sudo docker logs --tail 50 coredns_pause 2>&1 || echo "No coredns_pause container"
+            timeout 10 sudo docker logs --tail 50 coredns_pause 2>&1 || echo "No coredns_pause container"
             echo ""
             echo "=== docker inspect coredns_pause (if exists) ==="
-            sudo docker inspect coredns_pause 2>&1 | head -80 || echo "No coredns_pause container"
+            timeout 10 sudo docker inspect coredns_pause 2>&1 | head -80 || echo "No coredns_pause container"
             echo ""
             echo "=== docker inspect coredns_coredns (if exists) ==="
-            sudo docker inspect coredns_coredns 2>&1 | head -80 || echo "No coredns_coredns container"
-            exit 1
+            timeout 10 sudo docker inspect coredns_coredns 2>&1 | head -80 || echo "No coredns_coredns container"
+            echo ""
+            echo "=== API server logs (last 50 lines) ==="
+            timeout 10 sudo docker logs --tail 50 rusternetes-api-server 2>&1 || true
+            # Do NOT exit 1 — continue to sonobuoy step which will also fail and produce artifacts
+            echo "WARNING: Continuing despite pods not ready — sonobuoy will likely fail"
+          else
+            echo "=== All pods after readiness ==="
+            timeout 10 kubectl get pods -A -o wide 2>&1 || true
           fi
-          echo "=== All pods after readiness ==="
-          kubectl get pods -A -o wide
 
       - name: Run Sonobuoy (${{ inputs.mode }})
         env:
