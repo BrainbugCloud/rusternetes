@@ -1,0 +1,250 @@
+name: Sonobuoy Conformance
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Test mode
+        type: choice
+        default: quick
+        options:
+          - quick
+          - full
+
+# Bump versions together:
+#   K8S_VERSION   → sonobuoy --kubernetes-version
+#   SONOBUOY_VER  → sonobuoy CLI + container image
+
+jobs:
+  build:
+    name: Build rusternetes
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      DOCKER_HOST: unix:///var/run/docker.sock
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clone rhino adjacent to repo (workspace build context)
+        run: git clone --depth 1 https://github.com/calfonso/rhino.git ../rhino
+
+      - name: Get commit SHA
+        id: submodule-sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache container images by submodule SHA
+        id: image-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/rusternetes-images.tar
+          key: rusternetes-images-${{ runner.os }}-${{ steps.submodule-sha.outputs.sha }}
+          restore-keys: |
+            rusternetes-images-${{ runner.os }}-
+
+      - name: Build container images
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        run: |
+          export KUBELET_VOLUMES_PATH=${{ github.workspace }}/.rusternetes/volumes
+          mkdir -p "$KUBELET_VOLUMES_PATH"
+          # Use 'docker build' — correctly tags each service's image independently.
+          set -e
+          for svc in api-server scheduler controller-manager kubelet kube-proxy; do
+            echo "=== Building rusternetes-${svc} ==="
+            sudo docker build -f "Dockerfile.${svc}" -t "rusternetes-${svc}:latest" .
+          done
+          # kubelet2 shares Dockerfile.kubelet but needs its own tag
+          sudo docker tag rusternetes-kubelet:latest rusternetes-kubelet2:latest
+          echo "=== Built images ==="
+          sudo docker images | grep rusternetes
+
+      - name: Save container images to tarball
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        run: |
+          # Save all rusternetes-* images plus the etcd base image
+          images=$(sudo docker images --format '{{.Repository}}:{{.Tag}}' | grep -E '(rusternetes-|quay.io/coreos/etcd)' || true)
+          if [ -z "$images" ]; then
+            echo "No rusternetes images found! Listing all images for debugging:"
+            sudo docker images
+            exit 1
+          fi
+          echo "Saving images: $images"
+          sudo docker save -o /tmp/rusternetes-images.tar $images
+          sudo chmod 644 /tmp/rusternetes-images.tar
+          ls -lh /tmp/rusternetes-images.tar
+
+      - name: Upload images artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rusternetes-images
+          path: /tmp/rusternetes-images.tar
+          retention-days: 1
+
+  conformance:
+    name: Rusternetes (${{ inputs.mode }}) K8s v1.36.1
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.mode == 'quick' && 60 || 360 }}
+    env:
+      K8S_VERSION: v1.36.1
+      SONOBUOY_VER: v0.57.5
+      KUBELET_VOLUMES_PATH: ${{ github.workspace }}/.rusternetes/volumes
+      CONTAINER_RUNTIME: docker
+      DOCKER_HOST: unix:///var/run/docker.sock
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download container images
+        uses: actions/download-artifact@v4
+        with:
+          name: rusternetes-images
+          path: /tmp/
+
+      - name: Load container images
+        run: |
+          sudo docker load -i /tmp/rusternetes-images.tar
+          sudo docker images | grep rusternetes
+
+      - name: Install kubectl
+        run: |
+          curl -sSL "https://dl.k8s.io/release/$(curl -sSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
+            | sudo tee /usr/local/bin/kubectl > /dev/null
+          sudo chmod +x /usr/local/bin/kubectl
+
+      - name: Install Sonobuoy
+        run: |
+          curl -sSL "https://github.com/vmware-tanzu/sonobuoy/releases/download/${SONOBUOY_VER}/sonobuoy_${SONOBUOY_VER#v}_linux_amd64.tar.gz" | sudo tar xz -C /usr/local/bin sonobuoy
+          sonobuoy version --short
+
+      - name: Generate certs
+        run: |
+          bash scripts/generate-certs.sh
+
+      - name: Start rusternetes cluster
+        run: |
+          export KUBELET_VOLUMES_PATH=${{ github.workspace }}/.rusternetes/volumes
+          mkdir -p "$KUBELET_VOLUMES_PATH"
+          # Single kubelet — skip kubelet2 to reduce Docker daemon pressure on 2-vCPU runners.
+          sudo -E docker compose -f docker-compose.yml up -d etcd api-server scheduler controller-manager kubelet kube-proxy
+
+      - name: Wait for API server
+        timeout-minutes: 5
+        run: |
+          for i in $(seq 1 60); do
+            code=$(curl -sk --max-time 3 -o /dev/null -w '%{http_code}' https://127.0.0.1:6443/healthz || echo 000)
+            [ "$code" = "200" ] && break
+            echo "Waiting for API server... ($i/60) status=$code"
+            sleep 2
+          done
+          if [ "$code" != "200" ]; then
+            echo "API server never became healthy"
+            echo "=== docker ps -a ==="
+            sudo docker ps -a || true
+            echo "=== rusternetes-api-server logs ==="
+            sudo docker logs rusternetes-api-server 2>&1 || true
+            exit 1
+          fi
+
+      - name: Create kubeconfig for bootstrap
+        run: |
+          echo -n 'YXBpVmVyc2lvbjogdjEKa2luZDogQ29uZmlnCmNsdXN0ZXJzOiBbe25hbWU6IHJrLCBjbHVzdGVyOiB7c2VydmVyOiAiaHR0cHM6Ly8xMjcuMC4wLjE6NjQ0MyIsIGluc2VjdXJlLXNraXAtdGxzLXZlcmlmeTogdHJ1ZX19XQpjb250ZXh0czogW3tuYW1lOiByaywgY29udGV4dDoge2NsdXN0ZXI6IHJrLCB1c2VyOiBya319XQpjdXJyZW50LWNvbnRleHQ6IHJrCnVzZXJzOiBbe25hbWU6IHJrLCB1c2VyOiB7dG9rZW46IGR1bW15fX1dCg==' | base64 -d > ~/rk-kubeconfig
+
+      - name: Bootstrap cluster
+        run: |
+          export KUBECONFIG=~/rk-kubeconfig
+          bash scripts/bootstrap-cluster.sh docker
+          kubectl get nodes
+          kubectl get pods -A
+
+      - name: Diagnose CoreDNS if not running
+        if: always()
+        run: |
+          export KUBECONFIG=~/rk-kubeconfig
+          echo "=== CoreDNS pod describe ==="
+          kubectl describe pod coredns -n kube-system || echo "No coredns pod found"
+          echo ""
+          echo "=== CoreDNS logs ==="
+          kubectl logs coredns -n kube-system --tail=100 || echo "No logs available"
+          echo ""
+          echo "=== All pods in kube-system ==="
+          kubectl get pods -n kube-system -o wide
+          echo ""
+          echo "=== Events in kube-system ==="
+          kubectl get events -n kube-system --sort-by='.lastTimestamp' | tail -20
+
+      - name: Pre-Sonobuoy diagnostics
+        run: |
+          export KUBECONFIG=~/rk-kubeconfig
+          echo "=== Pods (all namespaces) ==="
+          kubectl get pods -A -o wide
+          echo ""
+          echo "=== Nodes ==="
+          kubectl describe nodes 2>&1 || true
+          echo ""
+          echo "=== Docker container stats ==="
+          sudo docker stats --no-stream 2>&1 || true
+          echo ""
+          echo "=== Docker ps ==="
+          sudo docker ps -a 2>&1 || true
+
+      - name: Run Sonobuoy (${{ inputs.mode }})
+        env:
+          SONOBUOY_MODE: ${{ inputs.mode == 'quick' && 'quick' || 'certified-conformance' }}
+          WAIT_MINUTES: ${{ inputs.mode == 'quick' && '20' || '240' }}
+        run: |
+          export KUBECONFIG=~/rk-kubeconfig
+          sonobuoy run \
+            --mode="$SONOBUOY_MODE" \
+            --kubernetes-version="$K8S_VERSION" \
+            --sonobuoy-image=sonobuoy/sonobuoy:${SONOBUOY_VER} \
+            --wait="$WAIT_MINUTES" \
+            --plugin-env=e2e.E2E_USE_GO_RUNNER=false
+
+      - name: Collect results
+        if: always()
+        run: |
+          export KUBECONFIG=~/rk-kubeconfig
+          sonobuoy status || true
+          sonobuoy logs > sonobuoy-logs.txt 2>&1 || echo "No logs" > sonobuoy-logs.txt
+          sonobuoy retrieve -f results.tar.gz || true
+          if [ -f results.tar.gz ]; then
+            sonobuoy results results.tar.gz || true
+          fi
+
+      - name: Collect cluster logs
+        if: always()
+        run: |
+          for c in rusternetes-etcd rusternetes-api-server rusternetes-scheduler \
+                   rusternetes-controller-manager rusternetes-kubelet \
+                   rusternetes-kube-proxy; do
+            echo "===== $c =====" >> cluster-logs.txt
+            sudo docker logs "$c" >> cluster-logs.txt 2>&1 || true
+            echo "" >> cluster-logs.txt
+          done
+          sudo docker ps -a >> cluster-logs.txt 2>&1 || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rusternetes-smoke-results
+          path: |
+            results.tar.gz
+            sonobuoy-logs.txt
+          retention-days: 7
+
+      - name: Upload cluster logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rusternetes-cluster-logs
+          path: cluster-logs.txt
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo docker compose -f docker-compose.yml down -v 2>/dev/null || true
+          sudo docker network rm rusternetes-network 2>/dev/null || true
