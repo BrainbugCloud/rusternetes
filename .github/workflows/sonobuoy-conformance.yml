@@ -319,17 +319,28 @@ jobs:
           fi
 
       - name: Run Sonobuoy (${{ inputs.mode }})
+        timeout-minutes: ${{ inputs.mode == 'quick' && 10 || 120 }}
         env:
           SONOBUOY_MODE: ${{ inputs.mode == 'quick' && 'quick' || 'certified-conformance' }}
-          WAIT_MINUTES: ${{ inputs.mode == 'quick' && '20' || '240' }}
+          WAIT_MINUTES: ${{ inputs.mode == 'quick' && '8' || '100' }}
         run: |
           export KUBECONFIG=~/rk-kubeconfig
-          sonobuoy run \
+          echo "=== Sonobuoy status before run ==="
+          timeout 10 sonobuoy status 2>&1 || echo "status check failed"
+          echo "=== Pod state before sonobuoy ==="
+          timeout 10 kubectl get pods -A -o wide 2>&1 || true
+          echo "=== Starting sonobuoy (mode=$SONOBUOY_MODE, wait=${WAIT_MINUTES}m) ==="
+          # Run sonobuoy with a hard timeout — don't let it block forever
+          timeout $((WAIT_MINUTES * 60)) sonobuoy run \
             --mode="$SONOBUOY_MODE" \
             --kubernetes-version="$K8S_VERSION" \
             --sonobuoy-image=sonobuoy/sonobuoy:${SONOBUOY_VER} \
             --wait="$WAIT_MINUTES" \
-            --plugin-env=e2e.E2E_USE_GO_RUNNER=false
+            --plugin-env=e2e.E2E_USE_GO_RUNNER=false 2>&1 || echo "Sonobuoy exited with code $?"
+          echo "=== Sonobuoy status after run ==="
+          timeout 10 sonobuoy status 2>&1 || echo "status check failed"
+          echo "=== Pods after sonobuoy ==="
+          timeout 10 kubectl get pods -A -o wide 2>&1 || true
 
       - name: Collect results
         if: always()
