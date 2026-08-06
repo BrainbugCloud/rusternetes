@@ -47,11 +47,35 @@ jobs:
         run: |
           export KUBELET_VOLUMES_PATH=${{ github.workspace }}/.rusternetes/volumes
           mkdir -p "$KUBELET_VOLUMES_PATH"
-          # Use 'docker build' — correctly tags each service's image independently.
           set -e
+
+          # Docker Hub's auth/registry endpoints intermittently return 5xx, which
+          # aborts a fresh `docker build` at the "load metadata for <base image>"
+          # step (observed: 500 from auth.docker.io/token for rust:latest). Pre-pull
+          # the base images with retries so the build's metadata resolution hits the
+          # local cache instead of the flaky registry, and retry each build too.
+          retry() {
+            local n=0 max=5 delay=15
+            until "$@"; do
+              n=$((n + 1))
+              if [ "$n" -ge "$max" ]; then
+                echo "Command failed after $n attempts: $*"
+                return 1
+              fi
+              echo "Attempt $n/$max failed: $* — retrying in ${delay}s..."
+              sleep "$delay"
+            done
+          }
+
+          echo "=== Pre-pulling base images (with retries, best-effort) ==="
+          for base in rust:latest debian:sid-slim node:26-slim; do
+            retry sudo docker pull "$base" || echo "Pre-pull of $base failed; build retry will cover it"
+          done
+
+          # Use 'docker build' — correctly tags each service's image independently.
           for svc in api-server scheduler controller-manager kubelet kube-proxy; do
             echo "=== Building rusternetes-${svc} ==="
-            sudo docker build -f "Dockerfile.${svc}" -t "rusternetes-${svc}:latest" .
+            retry sudo docker build -f "Dockerfile.${svc}" -t "rusternetes-${svc}:latest" .
           done
           # kubelet2 shares Dockerfile.kubelet but needs its own tag
           sudo docker tag rusternetes-kubelet:latest rusternetes-kubelet2:latest
