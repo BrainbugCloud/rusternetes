@@ -330,40 +330,13 @@ jobs:
           echo "=== Pod state before sonobuoy ==="
           timeout 10 kubectl get pods -A -o wide 2>&1 || true
           echo "=== Starting sonobuoy (mode=$SONOBUOY_MODE, wait=${WAIT_MINUTES}m) ==="
-          # Run sonobuoy in background, then poll — avoid `--wait` which can hang
-          # forever if the aggregator pod stays Pending. We start it, poll status,
-          # and kill it after the timeout.
+          # Run sonobuoy with --wait (foreground, blocking)
           sonobuoy run \
             --mode="$SONOBUOY_MODE" \
             --kubernetes-version="$K8S_VERSION" \
             --sonobuoy-image=sonobuoy/sonobuoy:${SONOBUOY_VER} \
-            --plugin-env=e2e.E2E_USE_GO_RUNNER=false \
-            --skip-preflight &
-          SONO_PID=$!
-          echo "Sonobuoy started with PID $SONO_PID"
-          # Poll for completion up to WAIT_MINUTES
-          DEADLINE=$((SECONDS + WAIT_MINUTES * 60))
-          while [ $SECONDS -lt $DEADLINE ]; do
-            if ! kill -0 $SONO_PID 2>/dev/null; then
-              echo "Sonobuoy process exited"
-              break
-            fi
-            STATUS=$(timeout 10 sonobuoy status 2>&1 || echo "status-check-failed")
-            echo "  [$((DEADLINE - SECONDS))s remaining] $STATUS"
-            # Check if sonobuoy reports completed
-            echo "$STATUS" | grep -qi "completed\|passed\|failed" && {
-              echo "Sonobuoy reports completion"
-              kill $SONO_PID 2>/dev/null || true
-              break
-            }
-            sleep 30
-          done
-          # Kill sonobuoy if still running
-          if kill -0 $SONO_PID 2>/dev/null; then
-            echo "Sonobuoy still running after ${WAIT_MINUTES}m — killing"
-            kill -9 $SONO_PID 2>/dev/null || true
-            sleep 2
-          fi
+            --wait="$WAIT_MINUTES" \
+            --plugin-env=e2e.E2E_USE_GO_RUNNER=false 2>&1 || echo "Sonobuoy exited with code $?"
           echo "=== Sonobuoy status after run ==="
           timeout 10 sonobuoy status 2>&1 || echo "status check failed"
           echo "=== Pods after sonobuoy ==="
