@@ -1189,7 +1189,12 @@ pub struct PodCondition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub last_transition_time: Option<chrono::DateTime<chrono::Utc>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1232,7 +1237,12 @@ pub struct PodStatus {
     pub qos_class: Option<String>,
 
     /// Time at which the pod was acknowledged by the kubelet
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "crate::time::k8s_time::serialize",
+        deserialize_with = "crate::time::k8s_time::deserialize"
+    )]
     pub start_time: Option<chrono::DateTime<chrono::Utc>>,
 
     /// Pod-level conditions (Ready, ContainersReady, Initialized, PodScheduled)
@@ -1359,15 +1369,33 @@ pub enum ContainerState {
         message: Option<String>,
     },
     Running {
-        started_at: Option<String>,
+        #[serde(
+            skip_serializing_if = "Option::is_none",
+            default,
+            serialize_with = "crate::time::k8s_time::serialize",
+            deserialize_with = "crate::time::k8s_time::deserialize"
+        )]
+        started_at: Option<chrono::DateTime<chrono::Utc>>,
     },
     Terminated {
         exit_code: i32,
         signal: Option<i32>,
         reason: Option<String>,
         message: Option<String>,
-        started_at: Option<String>,
-        finished_at: Option<String>,
+        #[serde(
+            skip_serializing_if = "Option::is_none",
+            default,
+            serialize_with = "crate::time::k8s_time::serialize",
+            deserialize_with = "crate::time::k8s_time::deserialize"
+        )]
+        started_at: Option<chrono::DateTime<chrono::Utc>>,
+        #[serde(
+            skip_serializing_if = "Option::is_none",
+            default,
+            serialize_with = "crate::time::k8s_time::serialize",
+            deserialize_with = "crate::time::k8s_time::deserialize"
+        )]
+        finished_at: Option<chrono::DateTime<chrono::Utc>>,
         container_id: Option<String>,
     },
 }
@@ -2026,7 +2054,7 @@ mod tests {
                 ready: true,
                 restart_count: 0,
                 state: Some(ContainerState::Running {
-                    started_at: Some("2024-01-01T00:00:00Z".to_string()),
+                    started_at: Some("2024-01-01T00:00:00Z".parse().unwrap()),
                 }),
                 last_state: None,
                 image: Some("nginx:latest".to_string()),
@@ -2576,7 +2604,7 @@ mod tests {
                     ready: true,
                     restart_count: 0,
                     state: Some(ContainerState::Running {
-                        started_at: Some("2024-01-01T00:00:00Z".to_string()),
+                        started_at: Some("2024-01-01T00:00:00Z".parse().unwrap()),
                     }),
                     last_state: None,
                     image: Some("nginx".to_string()),
